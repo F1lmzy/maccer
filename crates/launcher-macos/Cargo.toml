@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+launcher-core = { path = "../launcher-core" }
+libc = "0.2"
 url = "2"
 plist = "1"
 global-hotkey = "0.8"

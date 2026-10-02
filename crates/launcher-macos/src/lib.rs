@@ -3,6 +3,8 @@
 mod applications;
 mod hotkey;
 mod platform;
+pub mod process;
+pub mod spotlight;
 
 pub use applications::{Application, discover_applications, discover_in};
 pub use hotkey::{GlobalHotkey, is_activation_event, validate_hotkey};

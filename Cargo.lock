@@ -3095,6 +3095,7 @@ dependencies = [
  "launcher-ui",
  "provider-apps",
  "provider-calculator",
+ "provider-files",
  "provider-web",
  "serde",
  "serde_json",
@@ -3124,6 +3125,8 @@ dependencies = [
  "block2",
  "dispatch2",
  "global-hotkey",
+ "launcher-core",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4382,6 +4385,16 @@ dependencies = [
  "launcher-core",
  "launcher-macos",
  "meval",
+ "serde_json",
+]
+
+[[package]]
+name = "provider-files"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "launcher-core",
+ "launcher-macos",
  "serde_json",
 ]
 

@@ -32,6 +32,7 @@ pub struct ProvidersConfig {
     pub apps: ProviderConfig,
     pub calculator: ProviderConfig,
     pub web: ProviderConfig,
+    pub files: ProviderConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,6 +86,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             apps: ProviderOverrides,
             calculator: ProviderOverrides,
             web: ProviderOverrides,
+            files: ProviderOverrides,
         }
         let raw = Raw::deserialize(deserializer)?;
         let defaults = ProvidersConfig::default();
@@ -92,6 +94,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             apps: raw.apps.apply(defaults.apps),
             calculator: raw.calculator.apply(defaults.calculator),
             web: raw.web.apply(defaults.web),
+            files: raw.files.apply(defaults.files),
         })
     }
 }
@@ -121,6 +124,13 @@ impl Default for ProvidersConfig {
                 priority: 90,
                 default_search: false,
                 max_results: 1,
+            },
+            files: ProviderConfig {
+                enabled: true,
+                prefix: Some("/".into()),
+                priority: 80,
+                default_search: true,
+                max_results: 8,
             },
             web: ProviderConfig {
                 enabled: true,
@@ -162,6 +172,7 @@ impl Config {
             ("apps", &self.providers.apps),
             ("calculator", &self.providers.calculator),
             ("web", &self.providers.web),
+            ("files", &self.providers.files),
         ];
         for (name, provider) in providers.iter().copied() {
             if !(1..=100).contains(&provider.max_results) {

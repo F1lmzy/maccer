@@ -93,6 +93,14 @@ fn main() -> Result<()> {
         )?),
         config.providers.web.clone(),
     )?;
+    registry.register(
+        Arc::new(provider_files::FileProvider::new(
+            Arc::new(launcher_macos::spotlight::Spotlight),
+            Arc::new(NativePlatform),
+            dirs::home_dir().context("finding home directory for file scope")?,
+        )),
+        config.providers.files.clone(),
+    )?;
     let registry = Arc::new(registry);
     let history_file = history_path()?;
     if let Some(parent) = history_file.parent() {

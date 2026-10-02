@@ -17,6 +17,7 @@ launcher-ui = { path = "../launcher-ui" }
 provider-apps = { path = "../provider-apps" }
 provider-calculator = { path = "../provider-calculator" }
 provider-web = { path = "../provider-web" }
+provider-files = { path = "../provider-files" }
 gpui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

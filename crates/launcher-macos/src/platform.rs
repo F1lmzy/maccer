@@ -10,12 +10,34 @@ pub trait Platform: Send + Sync {
     fn reveal_in_finder(&self, path: &Path) -> Result<()>;
     fn open_url(&self, url: &str) -> Result<()>;
     fn copy_text(&self, text: &str) -> Result<()>;
+    fn open_path(&self, path: &Path) -> Result<()> {
+        self.launch_application(path)
+    }
+    fn quick_look(&self, _path: &Path) -> Result<()> {
+        bail!("Quick Look is unavailable on this platform")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativePlatform;
 
 impl Platform for NativePlatform {
+    fn quick_look(&self, path: &Path) -> Result<()> {
+        if !path.is_absolute() || !path.exists() {
+            bail!("Quick Look requires an existing absolute path");
+        }
+        let mut child = Command::new("/usr/bin/qlmanage")
+            .arg("-p")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("starting Quick Look")?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
     fn launch_application(&self, path: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
