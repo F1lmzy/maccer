@@ -1,0 +1,28 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maccer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+launcher-core = { path = "../launcher-core" }
+launcher-macos = { path = "../launcher-macos" }
+launcher-ui = { path = "../launcher-ui" }
+provider-apps = { path = "../provider-apps" }
+provider-calculator = { path = "../provider-calculator" }
+provider-web = { path = "../provider-web" }
+gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+global-hotkey.workspace = true
+clap = { version = "4", features = ["derive"] }
+dirs = "6"

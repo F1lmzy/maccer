@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/launcher-core",
+    "crates/launcher-macos",
+    "crates/launcher-ui",
+    "crates/provider-apps",
+    "crates/provider-calculator",
+    "crates/provider-web",
+    "crates/launcher",
+]
+
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+nucleo-matcher = "=0.3.1"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+async-channel = "2"
+global-hotkey = "0.8"

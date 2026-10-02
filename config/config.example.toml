@@ -1,0 +1,47 @@
+[launcher]
+hotkey = "alt-space"
+width = 680
+max_results = 8
+
+[providers.apps]
+enabled = true
+prefix = "/apps"
+priority = 100
+default_search = true
+max_results = 10
+
+[providers.calculator]
+enabled = true
+prefix = "="
+priority = 90
+default_search = false
+max_results = 1
+
+[providers.web]
+enabled = true
+prefix = "?"
+priority = -100
+default_search = true
+max_results = 2
+
+[web]
+default_engine = "google"
+
+# Omit the [[web.engines]] tables to keep the built-in Google and DuckDuckGo
+# engines. Defining any engine replaces the whole built-in list, and
+# default_engine must match one of the configured engine ids.
+#
+# [[web.engines]]
+# id = "google"
+# name = "Google"
+# url = "https://www.google.com/search?q={query}"
+#
+# [[web.engines]]
+# id = "duckduckgo"
+# name = "DuckDuckGo"
+# url = "https://duckduckgo.com/?q={query}"
+#
+# [[web.engines]]
+# id = "docs"
+# name = "Rust Docs"
+# url = "https://doc.rust-lang.org/std/?search={query}"
