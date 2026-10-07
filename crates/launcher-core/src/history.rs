@@ -45,7 +45,8 @@ impl HistoryStore {
         )?;
         Ok(())
     }
-    pub(crate) fn snapshot_for(
+    /// Batch usage for a candidate pool, allowing providers to rank before truncation.
+    pub fn snapshot_for(
         &self,
         items: &[crate::Item],
     ) -> Result<HashMap<(String, String), UsageStats>> {
@@ -64,26 +65,33 @@ impl HistoryStore {
                 unique.insert(key.clone()).then_some(key)
             })
             .collect();
-        let pairs = vec!["(?, ?)"; keys.len()].join(", ");
-        let sql = format!(
-            "SELECT provider, item, COUNT(*), MAX(timestamp) FROM usage_events WHERE (provider, item) IN ({pairs}) GROUP BY provider, item"
-        );
-        let params: Vec<&str> = keys
-            .iter()
-            .flat_map(|(provider, item)| [provider.as_str(), item.as_str()])
-            .collect();
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok((
-                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                UsageStats {
-                    count: row.get::<_, i64>(2)?.max(0) as u64,
-                    last_used: row.get(3)?,
-                },
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
-            .map_err(Into::into)
+        let mut result = HashMap::new();
+        // Large file indexes can exceed SQLite's parameter limit. Each identity
+        // appears in exactly one chunk, so aggregation remains exact.
+        for keys in keys.chunks(400) {
+            let pairs = vec!["(?, ?)"; keys.len()].join(", ");
+            let sql = format!(
+                "SELECT provider, item, COUNT(*), MAX(timestamp) FROM usage_events WHERE (provider, item) IN ({pairs}) GROUP BY provider, item"
+            );
+            let params = keys
+                .iter()
+                .flat_map(|(provider, item)| [provider.as_str(), item.as_str()]);
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    UsageStats {
+                        count: row.get::<_, i64>(2)?.max(0) as u64,
+                        last_used: row.get(3)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (key, stats) = row?;
+                result.insert(key, stats);
+            }
+        }
+        Ok(result)
     }
 
     pub fn stats(&self, provider: &ProviderId, item: &ItemId) -> Result<UsageStats> {

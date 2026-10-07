@@ -8,6 +8,7 @@ members = [
     "crates/provider-calculator",
     "crates/provider-web",
     "crates/provider-files",
+    "crates/provider-shell",
     "crates/launcher",
 ]
 

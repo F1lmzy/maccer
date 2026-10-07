@@ -46,14 +46,67 @@ pub enum ActionOutcome {
     Close,
     KeepOpen(String),
     SetQuery(String),
+    Output { title: String, text: String },
+}
+
+/// Lazy selected-item preview. PNG bytes are size-bounded by the provider.
+#[derive(Clone, Debug)]
+pub enum Preview {
+    Text { text: String, truncated: bool },
+    Image { png: Vec<u8> },
+    Info(String),
 }
 
 pub trait Provider: Send + Sync {
+    /// Changes when background data changes, so an open query can refresh.
+    fn revision(&self) -> u64 {
+        0
+    }
+    /// Loading or degraded-backend message shown alongside available results.
+    fn status(&self) -> Option<String> {
+        None
+    }
+    fn supports_preview(&self, _item: &Item) -> bool {
+        false
+    }
+    fn preview_revision(&self, _item: &Item) -> u64 {
+        self.revision()
+    }
+    fn supports_drag(&self, _item: &Item) -> bool {
+        false
+    }
+    fn preview(&self, _item: &Item, _cancellation: &CancellationToken) -> Result<Option<Preview>> {
+        Ok(None)
+    }
+    /// Called synchronously on the UI thread during a mouse drag event.
+    fn begin_drag(&self, _item: &Item) -> Result<()> {
+        bail!("dragging is not supported by this provider")
+    }
     fn id(&self) -> ProviderId;
     fn name(&self) -> &str;
+    /// Prefix-only providers must never participate in mixed search, regardless of config.
+    fn requires_explicit_scope(&self) -> bool {
+        false
+    }
+    /// Sensitive providers can opt out of persisted query/activation history.
+    fn records_usage(&self) -> bool {
+        true
+    }
     fn search(&self, query: &SearchQuery, ctx: &SearchContext) -> Result<Vec<Item>>;
     fn actions(&self, item: &Item) -> Vec<Action>;
     fn activate(&self, item: &Item, action: &Action) -> Result<ActionOutcome>;
+    /// Long-running actions should override this and cooperate with cancellation.
+    fn activate_with_cancellation(
+        &self,
+        item: &Item,
+        action: &Action,
+        cancellation: &CancellationToken,
+    ) -> Result<ActionOutcome> {
+        if cancellation.is_cancelled() {
+            bail!("action cancelled");
+        }
+        self.activate(item, action)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

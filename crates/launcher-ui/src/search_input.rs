@@ -428,7 +428,7 @@ impl Element for SearchInputElement {
     ) -> InputPrepaint {
         let input = self.input.read(cx);
         let content = if input.content.is_empty() {
-            SharedString::from("Search apps and providers")
+            SharedString::from("Search…")
         } else {
             input.content.clone()
         };
@@ -600,11 +600,11 @@ impl Render for SearchInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .line_height(px(28.))
-            .text_size(px(20.))
+            .line_height(px(22.))
+            .text_size(px(16.))
             .child(
                 div()
-                    .h(px(36.))
+                    .h(px(30.))
                     .w_full()
                     .overflow_x_hidden()
                     .px_1()

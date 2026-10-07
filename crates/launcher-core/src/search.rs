@@ -64,7 +64,11 @@ impl SearchCoordinator {
                 .registry
                 .providers
                 .values()
-                .filter(|p| p.config.enabled && p.config.default_search)
+                .filter(|p| {
+                    p.config.enabled
+                        && p.config.default_search
+                        && !p.provider.requires_explicit_scope()
+                })
                 .cloned()
                 .collect(),
             QueryMode::Provider(id) => self
@@ -152,8 +156,12 @@ impl SearchCoordinator {
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("provider panicked")));
                     if !token.is_cancelled() {
-                        let _ =
-                            tx.send_blocking((registered.provider.id(), registered.config, result));
+                        let _ = tx.send_blocking((
+                            registered.provider.id(),
+                            registered.config,
+                            result,
+                            registered.provider.status(),
+                        ));
                     }
                 });
             }
@@ -167,8 +175,14 @@ impl SearchCoordinator {
                     break;
                 }
                 match updates_rx.try_recv() {
-                    Ok((provider, config, result)) => {
+                    Ok((provider, config, result, status)) => {
                         finished += 1;
+                        if let Some(message) = status {
+                            errors.push(ProviderFailure {
+                                provider: provider.clone(),
+                                message,
+                            });
+                        }
                         match result {
                             Ok(mut found) => {
                                 found.truncate(config.max_results);

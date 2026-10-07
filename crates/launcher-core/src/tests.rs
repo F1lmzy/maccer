@@ -8,6 +8,54 @@ struct TestProvider {
     fails: bool,
 }
 
+struct ExplicitProvider;
+impl Provider for ExplicitProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId("explicit".into())
+    }
+    fn name(&self) -> &str {
+        "Explicit"
+    }
+    fn requires_explicit_scope(&self) -> bool {
+        true
+    }
+    fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+        Ok(vec![item("explicit", "command", "command")])
+    }
+    fn actions(&self, _: &Item) -> Vec<Action> {
+        vec![]
+    }
+    fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+        Ok(ActionOutcome::Close)
+    }
+}
+
+#[test]
+fn explicit_providers_cannot_enter_mixed_search_even_if_misconfigured() {
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(Arc::new(ExplicitProvider), config(Some(">"), true, true, 1))
+        .unwrap();
+    let coordinator = SearchCoordinator::new(
+        Arc::new(registry),
+        Arc::new(HistoryStore::in_memory().unwrap()),
+        8,
+    );
+    let mixed = coordinator
+        .start("command".into())
+        .receiver
+        .recv_blocking()
+        .unwrap();
+    assert!(mixed.complete);
+    assert!(mixed.items.is_empty());
+    let explicit = coordinator
+        .start("> command".into())
+        .receiver
+        .recv_blocking()
+        .unwrap();
+    assert_eq!(explicit.items.len(), 1);
+}
+
 struct DelayProvider {
     id: &'static str,
     delay: Duration,
@@ -308,6 +356,20 @@ fn ranking_uses_fuzzy_match_provider_priority_and_usage() {
     );
     assert_eq!(items[0].provider, ProviderId("apps".into()));
     assert!(items[0].score > items[1].score);
+}
+
+#[test]
+fn exact_application_name_outranks_fuzzy_results_and_score_boosts() {
+    let mut boosted = item("web", "web", "Search with Aerospace Tools");
+    boosted.score = 10_000.0;
+    let mut items = vec![boosted, item("apps", "aerospace", "AeroSpace")];
+    crate::ranking::rank(
+        &mut items,
+        "aerospace",
+        &std::collections::HashMap::from([("web".to_owned(), 1_000)]),
+        &Default::default(),
+    );
+    assert_eq!(items[0].id, ItemId("aerospace".into()));
 }
 
 #[test]

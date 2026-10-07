@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
+    tracing::debug!(show_on_start = args.show, "launcher starting");
     let config_file = config_path(args.config.as_deref())?;
     if args.config.is_some() && !config_file.is_file() {
         bail!(
@@ -55,6 +56,9 @@ fn main() -> Result<()> {
         defaults.validate()?;
         defaults
     };
+    if config.files.use_zoxide || config.files.use_fzf {
+        tracing::warn!("files.use_zoxide/use_fzf are ignored; the files provider now uses fd");
+    }
     let applications = discover_applications().context("scanning installed applications")?;
     if args.check {
         println!(
@@ -67,6 +71,12 @@ fn main() -> Result<()> {
         );
         println!("applications indexed: {}", applications.len());
         println!("hotkey: {}", config.launcher.hotkey);
+        if config.providers.files.enabled {
+            println!(
+                "files backend: fd ({})",
+                launcher_macos::fd_index::FdIndex::executable()?.display()
+            );
+        }
         return Ok(());
     }
     if !cfg!(target_os = "macos") {
@@ -75,6 +85,11 @@ fn main() -> Result<()> {
         );
     }
 
+    let history_file = history_path()?;
+    if let Some(parent) = history_file.parent() {
+        std::fs::create_dir_all(parent).context("creating history directory")?;
+    }
+    let history = Arc::new(HistoryStore::open(&history_file).context("opening usage history")?);
     let platform = Arc::new(NativePlatform);
     let mut registry = ProviderRegistry::new();
     registry.register(
@@ -93,20 +108,40 @@ fn main() -> Result<()> {
         )?),
         config.providers.web.clone(),
     )?;
+    if config.providers.files.enabled {
+        let cache = dirs::cache_dir()
+            .context("finding files cache directory")?
+            .join("maccer/files.sqlite3");
+        let mut files_config = config.files.fd_config()?;
+        // Internal SQLite/WAL writes must not feed back into live indexing.
+        if let Some(parent) = history_file.parent() {
+            files_config.excluded.push(parent.to_path_buf());
+        }
+        let index = launcher_macos::fd_index::FdIndex::open(files_config, &cache)?;
+        index.start();
+        registry.register(
+            Arc::new(
+                provider_files::FileProvider::new(
+                    index,
+                    Arc::new(NativePlatform),
+                    dirs::home_dir().context("finding home directory for file scope")?,
+                )
+                .with_roots(config.files.expanded_roots()?)
+                .with_ignored_previews(config.files.expanded_ignored_previews()?)
+                .with_history(history.clone()),
+            ),
+            config.providers.files.clone(),
+        )?;
+    }
     registry.register(
-        Arc::new(provider_files::FileProvider::new(
-            Arc::new(launcher_macos::spotlight::Spotlight),
+        Arc::new(provider_shell::ShellProvider::new(
             Arc::new(NativePlatform),
-            dirs::home_dir().context("finding home directory for file scope")?,
-        )),
-        config.providers.files.clone(),
+            config.shell.commands.clone(),
+            dirs::home_dir().context("finding shell working directory")?,
+        )?),
+        config.providers.shell.clone(),
     )?;
     let registry = Arc::new(registry);
-    let history_file = history_path()?;
-    if let Some(parent) = history_file.parent() {
-        std::fs::create_dir_all(parent).context("creating history directory")?;
-    }
-    let history = Arc::new(HistoryStore::open(&history_file).context("opening usage history")?);
     let coordinator = Arc::new(SearchCoordinator::new(
         registry,
         history.clone(),
@@ -123,6 +158,11 @@ fn main() -> Result<()> {
             Ok(hotkey) => hotkey,
             Err(error) => fail_startup(error.context("registering global hotkey")),
         };
+        tracing::debug!(
+            shortcut = %config.launcher.hotkey,
+            hotkey_id = hotkey.id(),
+            "launcher shortcut registered"
+        );
         let window = match launcher_ui::open_launcher(
             coordinator,
             history,
@@ -146,11 +186,19 @@ fn main() -> Result<()> {
             loop {
                 match global_hotkey::GlobalHotKeyEvent::receiver().recv() {
                     Ok(event) if is_activation_event(&event, hotkey_id) => {
+                        tracing::debug!(hotkey_id, "launcher shortcut pressed");
                         if events_tx.send_blocking(()).is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
+                    Ok(event) => {
+                        tracing::debug!(
+                            event_id = event.id,
+                            state = ?event.state,
+                            hotkey_id,
+                            "ignoring non-activation shortcut event"
+                        );
+                    }
                     Err(error) => {
                         tracing::error!(%error, "global hotkey event channel closed");
                         break;
@@ -158,9 +206,11 @@ fn main() -> Result<()> {
                 }
             }
         });
+        tracing::debug!("launcher ready; listening for shortcut events");
         cx.spawn(async move |cx| {
             let _hotkey = hotkey;
             while events_rx.recv().await.is_ok() {
+                tracing::debug!("handling launcher shortcut");
                 // `cx.update` and `WindowHandle::update` each return a `Result`, so the
                 // nested call yields `Result<Result<_, _>>`. Flatten it, otherwise an inner
                 // window error is silently swallowed and the loop keeps the hotkey alive.
@@ -170,7 +220,7 @@ fn main() -> Result<()> {
                     })
                     .and_then(|result| result)
                 {
-                    tracing::debug!(%error, "launcher window is no longer available");
+                    tracing::error!(%error, "launcher shortcut cannot update window");
                     break;
                 }
             }

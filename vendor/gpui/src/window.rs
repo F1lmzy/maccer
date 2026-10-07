@@ -1694,6 +1694,13 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Requests a content resize and centers the entire frame on its current display.
+    /// Supported on macOS and the test platform; other platforms return an error.
+    /// On macOS this is scheduled on the foreground executor, like `resize`.
+    pub fn resize_centered(&mut self, size: Size<Pixels>) -> anyhow::Result<()> {
+        self.platform_window.resize_centered(size)
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()

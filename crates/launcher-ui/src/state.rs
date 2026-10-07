@@ -4,6 +4,7 @@ use launcher_core::{Action, Item, Selection};
 pub(crate) enum Screen {
     Search,
     Actions,
+    Output,
 }
 
 #[derive(Default)]
@@ -14,9 +15,11 @@ pub(crate) struct LauncherState {
     pub query: String,
     pub items: Vec<Item>,
     pub generation: u64,
+    pub searching: bool,
+    selection_explicit: bool,
 }
 
-pub(crate) const MAX_VISIBLE_RESULTS: usize = 8;
+pub(crate) const MAX_VISIBLE_RESULTS: usize = 6;
 
 pub(crate) fn result_limit(max_results: usize) -> usize {
     max_results.max(1)
@@ -48,8 +51,9 @@ pub(crate) fn should_hide_after_deactivation(
 impl LauncherState {
     pub fn replace_query(&mut self, query: String) {
         self.query = query;
-        self.items.clear();
-        self.selection.reconcile(&self.items);
+        // Keep the last suggestions visible while their replacements are loading.
+        self.searching = true;
+        self.selection_explicit = false;
         self.screen = Some(Screen::Search);
     }
 
@@ -57,15 +61,49 @@ impl LauncherState {
         if generation != self.generation {
             return false;
         }
+        if self.searching || !self.selection_explicit {
+            self.selection = Selection::default();
+        }
+        self.searching = false;
         self.items = items;
         self.selection.reconcile(&self.items);
         true
     }
 
-    pub fn enter_actions(&mut self, actions: &[Action]) -> bool {
-        if self.selection.current(&self.items).is_none() || actions.is_empty() {
+    pub fn apply_search_update(
+        &mut self,
+        generation: u64,
+        items: Vec<Item>,
+        complete: bool,
+    ) -> bool {
+        // A fast provider with no matches must not blank slower providers' suggestions.
+        if items.is_empty() && !complete {
             return false;
         }
+        self.apply_results(generation, items)
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.searching || self.items.is_empty() {
+            return;
+        }
+        self.selection_explicit = true;
+        self.selection.move_by(&self.items, delta);
+    }
+
+    pub fn select_item(&mut self, item: &Item) {
+        if self.searching {
+            return;
+        }
+        self.selection_explicit = true;
+        self.selection.reconcile(std::slice::from_ref(item));
+    }
+
+    pub fn enter_actions(&mut self, actions: &[Action]) -> bool {
+        if self.searching || self.selection.current(&self.items).is_none() || actions.is_empty() {
+            return false;
+        }
+        self.selection_explicit = true;
         self.action_index = 0;
         self.screen = Some(Screen::Actions);
         true
@@ -73,7 +111,7 @@ impl LauncherState {
 
     pub fn escape(&mut self) -> EscapeResult {
         match self.screen {
-            Some(Screen::Actions) => {
+            Some(Screen::Actions | Screen::Output) => {
                 self.screen = Some(Screen::Search);
                 EscapeResult::Back
             }
@@ -112,15 +150,102 @@ mod tests {
     }
 
     #[test]
+    fn automatic_selection_tracks_the_top_streamed_result() {
+        let mut state = LauncherState {
+            generation: 7,
+            ..Default::default()
+        };
+        state.replace_query("aerospace".into());
+        let mut google = item("google");
+        google.provider = ProviderId("web".into());
+        assert!(state.apply_search_update(7, vec![google.clone()], false));
+        assert_eq!(
+            state.selection.current(&state.items).unwrap().id.0,
+            "google"
+        );
+        assert!(state.apply_search_update(7, vec![item("AeroSpace"), google], true));
+        assert_eq!(
+            selected_result_index(&state.items, &state.selection),
+            Some(0)
+        );
+        assert_eq!(
+            state.selection.current(&state.items).unwrap().id.0,
+            "AeroSpace"
+        );
+    }
+
+    #[test]
     fn selection_stays_with_item_when_streamed_results_reorder() {
         let mut state = LauncherState {
             generation: 7,
             ..Default::default()
         };
         assert!(state.apply_results(7, vec![item("a"), item("b")]));
-        state.selection.move_by(&state.items, 1);
-        assert!(state.apply_results(7, vec![item("b"), item("a")]));
+        state.move_selection(1);
+        assert!(state.apply_results(7, vec![item("new-top"), item("a"), item("b")]));
         assert_eq!(state.selection.current(&state.items).unwrap().id.0, "b");
+    }
+
+    #[test]
+    fn clicked_selection_is_preserved_until_the_query_changes() {
+        let mut state = LauncherState {
+            generation: 7,
+            ..Default::default()
+        };
+        state.apply_search_update(7, vec![item("google")], false);
+        state.select_item(&item("google"));
+        state.apply_search_update(7, vec![item("AeroSpace"), item("google")], true);
+        assert_eq!(
+            state.selection.current(&state.items).unwrap().id.0,
+            "google"
+        );
+        state.replace_query("safari".into());
+        state.generation = 8;
+        state.apply_search_update(8, vec![item("google")], false);
+        state.apply_search_update(8, vec![item("Safari"), item("google")], true);
+        assert_eq!(
+            state.selection.current(&state.items).unwrap().id.0,
+            "Safari"
+        );
+    }
+
+    #[test]
+    fn query_edits_keep_suggestions_until_replacement_results_arrive() {
+        let mut state = LauncherState {
+            generation: 1,
+            ..Default::default()
+        };
+        state.apply_results(1, vec![item("old")]);
+        state.replace_query("new".into());
+        assert_eq!(state.items.len(), 1, "typing must not blank the list");
+        assert_eq!(state.items[0].id.0, "old");
+        state.generation = 2;
+        state.apply_results(2, vec![item("new")]);
+        assert_eq!(state.items[0].id.0, "new");
+        state.apply_results(2, vec![]);
+        assert!(
+            state.items.is_empty(),
+            "a finished empty search must clear old results"
+        );
+    }
+
+    #[test]
+    fn empty_partial_batches_do_not_blank_pending_suggestions() {
+        let mut state = LauncherState {
+            generation: 1,
+            ..Default::default()
+        };
+        state.apply_results(1, vec![item("old")]);
+        state.replace_query("new".into());
+        state.generation = 2;
+        assert!(!state.apply_search_update(2, vec![], false));
+        assert_eq!(state.items[0].id.0, "old");
+        assert!(state.searching);
+        assert!(!state.apply_search_update(1, vec![item("stale")], true));
+        assert!(state.searching);
+        assert!(state.apply_search_update(2, vec![], true));
+        assert!(state.items.is_empty());
+        assert!(!state.searching);
     }
 
     #[test]
@@ -145,7 +270,7 @@ mod tests {
     fn results_above_viewport_remain_selectable_and_scroll_to_the_selected_row() {
         let items: Vec<_> = (0..12).map(|i| item(&i.to_string())).collect();
         assert_eq!(result_limit(50), 50);
-        assert_eq!(visible_result_count(items.len()), 8);
+        assert_eq!(visible_result_count(items.len()), MAX_VISIBLE_RESULTS);
 
         let mut selection = Selection::default();
         selection.reconcile(&items);

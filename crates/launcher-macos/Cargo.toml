@@ -8,6 +8,11 @@ license.workspace = true
 anyhow.workspace = true
 launcher-core = { path = "../launcher-core" }
 libc = "0.2"
+notify = "8"
+regex = "1"
+unicode-normalization = "0.1"
+rusqlite.workspace = true
+tempfile = "3"
 url = "2"
 plist = "1"
 global-hotkey = "0.8"
@@ -16,5 +21,6 @@ objc2-app-kit = { version = "=0.3.2", features = ["NSWorkspace", "NSPasteboard",
 objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSAutoreleasePool", "NSProcessInfo", "NSString", "NSURL"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 block2 = "0.6"
 dispatch2 = "=0.3.1"

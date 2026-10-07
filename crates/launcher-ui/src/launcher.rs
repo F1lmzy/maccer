@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, Render, ScrollStrategy,
-    Subscription, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, actions, div, prelude::*, px, size, uniform_list,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, Render, ScrollHandle,
+    ScrollStrategy, Subscription, UniformListScrollHandle, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, prelude::*, px, size,
+    uniform_list,
 };
 use launcher_core::{
-    Action, ActionId, ActionOutcome, CancellationToken, HistoryStore, Item, SearchCoordinator,
-    UsageEvent,
+    Action, ActionId, ActionOutcome, CancellationToken, HistoryStore, Item, Preview,
+    SearchCoordinator, UsageEvent,
 };
 
 use crate::{
@@ -29,10 +30,17 @@ actions!(
         OpenActions,
         ProviderPicker,
         NextAction,
+        CopyOutput,
+        TogglePreview,
         Quit,
         Escape
     ]
 );
+
+const ROW_HEIGHT: f32 = 44.;
+const PREVIEW_WIDTH: f32 = 280.;
+const FOOTER_HEIGHT: f32 = 22.;
+const MAX_WINDOW_HEIGHT: f32 = 400.;
 
 pub struct LauncherOptions {
     pub width: f32,
@@ -50,11 +58,22 @@ pub struct Launcher {
     action_item: Option<Item>,
     activation_serial: u64,
     activation_in_flight: Option<u64>,
+    activation_cancellation: Option<CancellationToken>,
     search_cancellation: Option<CancellationToken>,
     error: Option<String>,
+    output: Option<(String, String)>,
+    output_scroll: ScrollHandle,
     list_scroll: UniformListScrollHandle,
     activation_subscription: Option<Subscription>,
     was_active: bool,
+    preview_key: Option<(String, String, u64)>,
+    preview: Option<Preview>,
+    preview_image: Option<Arc<gpui::Image>>,
+    preview_cancellation: Option<CancellationToken>,
+    preview_started: Option<std::time::Instant>,
+    preview_scroll: ScrollHandle,
+    preview_enabled: bool,
+    drag_start: Option<(Item, gpui::Point<gpui::Pixels>)>,
 }
 
 pub fn open_launcher(
@@ -75,6 +94,8 @@ pub fn open_launcher(
         KeyBinding::new("cmd-p", ProviderPicker, Some("Launcher")),
         KeyBinding::new("tab", NextAction, Some("Launcher")),
         KeyBinding::new("escape", Escape, Some("Launcher")),
+        KeyBinding::new("cmd-c", CopyOutput, Some("LauncherOutput")),
+        KeyBinding::new("cmd-shift-p", TogglePreview, Some("Launcher")),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -107,18 +128,67 @@ pub fn open_launcher(
                     action_item: None,
                     activation_serial: 0,
                     activation_in_flight: None,
+                    activation_cancellation: None,
                     search_cancellation: None,
                     error: None,
+                    output: None,
+                    output_scroll: ScrollHandle::new(),
                     list_scroll: UniformListScrollHandle::new(),
                     activation_subscription: None,
                     was_active: false,
+                    preview_key: None,
+                    preview: None,
+                    preview_image: None,
+                    preview_cancellation: None,
+                    preview_started: None,
+                    preview_scroll: ScrollHandle::new(),
+                    preview_enabled: true,
+                    drag_start: None,
                 });
+                let refresh = launcher.downgrade();
+                let mut revisions: Vec<(String, u64)> = Vec::new();
+                cx.spawn(async move |cx| {
+                    loop {
+                        gpui::Timer::after(std::time::Duration::from_millis(500)).await;
+                        if refresh
+                            .update(cx, |this, cx| {
+                                let current: Vec<_> = this
+                                    .coordinator
+                                    .registry
+                                    .descriptors()
+                                    .iter()
+                                    .filter_map(|d| {
+                                        this.coordinator
+                                            .registry
+                                            .get(&d.id)
+                                            .map(|p| (d.id.0.clone(), p.revision()))
+                                    })
+                                    .collect();
+                                if current != revisions {
+                                    revisions = current;
+                                    if this.state.screen == Some(Screen::Search) {
+                                        this.start_search(cx);
+                                    }
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
                 let weak = launcher.downgrade();
                 cx.spawn(async move |cx| {
-                    while let Ok(event) = input_rx.recv().await {
+                    while let Ok(mut event) = input_rx.recv().await {
+                        while let Ok(latest) = input_rx.try_recv() {
+                            event = latest;
+                        }
                         let result = weak.update(cx, |this, cx| {
                             let SearchInputEvent::Changed(query) = event;
-                            this.replace_query(query, cx);
+                            // The editor already holds this edit. Do not echo queued text
+                            // back and reset the caret or IME composition.
+                            this.query_changed(query, cx);
                             this.start_search(cx);
                             cx.notify();
                         });
@@ -168,6 +238,9 @@ impl Launcher {
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.screen = Some(Screen::Search);
         self.was_active = false;
+        self.clear_preview(cx);
+        self.state.items.clear();
+        self.state.selection.reconcile(&self.state.items);
         self.replace_query(String::new(), cx);
         cx.activate(true);
         window.activate_window();
@@ -179,6 +252,9 @@ impl Launcher {
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.state.screen = None;
+        self.clear_preview(cx);
+        self.drag_start = None;
+        self.output = None;
         self.was_active = false;
         self.state.generation = self.state.generation.wrapping_add(1);
         if let Some(cancellation) = self.search_cancellation.take() {
@@ -192,15 +268,260 @@ impl Launcher {
     }
 
     fn replace_query(&mut self, query: String, cx: &mut Context<Self>) {
-        self.state.replace_query(query.clone());
-        self.actions.clear();
-        self.action_item = None;
-        self.invalidate_activation();
+        self.query_changed(query.clone(), cx);
         self.search_input
             .update(cx, |input, cx| input.set_text(query, cx));
     }
 
+    fn query_changed(&mut self, query: String, _: &mut Context<Self>) {
+        self.drag_start = None;
+        self.output = None;
+        self.state.replace_query(query);
+        self.actions.clear();
+        self.action_item = None;
+        self.invalidate_activation();
+    }
+
+    fn clear_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(token) = self.preview_cancellation.take() {
+            token.cancel();
+        }
+        if let Some(image) = self.preview_image.take() {
+            gpui::ImageSource::from(image).remove_asset(cx);
+        }
+        self.preview_key = None;
+        self.preview = None;
+        self.preview_started = None;
+        self.preview_scroll.set_offset(Default::default());
+    }
+    fn has_preview(&self) -> bool {
+        self.preview_enabled
+            && self.state.screen == Some(Screen::Search)
+            && self.preview_key.is_some()
+    }
+    fn effective_width(&self) -> f32 {
+        if self.has_preview() {
+            (self.options.width + PREVIEW_WIDTH).min(1200.)
+        } else {
+            self.options.width
+        }
+    }
+    fn on_toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
+        self.preview_enabled = !self.preview_enabled;
+        self.clear_preview(cx);
+        cx.notify();
+    }
+    fn refresh_preview(&mut self, cx: &mut Context<Self>) {
+        if self.state.searching {
+            return;
+        }
+        let selected = if self.preview_enabled && self.state.screen == Some(Screen::Search) {
+            self.state.selection.current(&self.state.items).cloned()
+        } else {
+            None
+        };
+        let selected = selected.and_then(|item| {
+            self.coordinator
+                .registry
+                .get(&item.provider)
+                .filter(|p| p.supports_preview(&item))
+                .map(|p| (item, p))
+        });
+        let Some((item, provider)) = selected else {
+            if self.preview_key.is_some() {
+                self.clear_preview(cx);
+            }
+            return;
+        };
+        let key = (
+            item.provider.0.clone(),
+            item.id.0.clone(),
+            provider.preview_revision(&item),
+        );
+        if self.preview_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.clear_preview(cx);
+        self.preview_key = Some(key.clone());
+        let token = CancellationToken::default();
+        self.preview_cancellation = Some(token.clone());
+        let started = std::time::Instant::now();
+        self.preview_started = Some(started);
+        tracing::debug!(provider = %key.0, revision = key.2, "preview requested");
+        self.watch_preview_deadline(key.clone(), token.clone(), cx);
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            // A short debounce avoids starting decodes for rows crossed quickly.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            if token.is_cancelled() {
+                return;
+            }
+            let worker_token = token.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tracing::debug!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "preview worker started"
+                    );
+                    let result = provider.preview(&item, &worker_token);
+                    tracing::debug!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        success = result.is_ok(),
+                        "preview worker completed"
+                    );
+                    result
+                })
+                .await;
+            if token.is_cancelled() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.apply_preview(&key, result, cx);
+            });
+        })
+        .detach();
+    }
+    fn watch_preview_deadline(
+        &self,
+        key: (String, String, u64),
+        token: CancellationToken,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if token.is_cancelled()
+                    || this.preview_key.as_ref() != Some(&key)
+                    || this.preview.is_some()
+                {
+                    return;
+                }
+                // Explain the delay without cancelling valid slow work (PDFs
+                // retain their backend deadline). A late result may still display
+                // and populate the cache; selection changes still cancel it.
+                tracing::warn!(provider = %key.0, "preview loading is slow");
+                this.apply_preview(
+                    &key,
+                    Ok(Some(Preview::Info(
+                        "Preview is taking too long. Use Quick Look.".into(),
+                    ))),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn apply_preview(
+        &mut self,
+        key: &(String, String, u64),
+        result: Result<Option<Preview>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview_key.as_ref() != Some(key) {
+            return;
+        }
+        tracing::debug!(
+            elapsed_ms = self
+                .preview_started
+                .map(|start| start.elapsed().as_millis() as u64),
+            "preview applied to UI"
+        );
+        self.preview = match result {
+            Ok(Some(Preview::Image { png })) => {
+                self.preview_image = Some(Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    png,
+                )));
+                Some(Preview::Image { png: vec![] })
+            }
+            Ok(preview) => preview.or_else(|| Some(Preview::Info("No preview available".into()))),
+            Err(error) => Some(Preview::Info(format!("Preview unavailable: {error}"))),
+        };
+        cx.notify();
+    }
+    fn preview_panel(&self, height: f32) -> gpui::Stateful<gpui::Div> {
+        let mut panel = div()
+            .id("file-preview")
+            .debug_selector(|| "file-preview".into())
+            .w(px(PREVIEW_WIDTH))
+            .h(px(height))
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(theme().border)
+            .p_3()
+            .overflow_y_scroll()
+            .track_scroll(&self.preview_scroll)
+            .text_sm();
+        match &self.preview {
+            Some(Preview::Text { text, truncated }) => {
+                panel = panel.child(div().font_family("monospace").child(text.clone()));
+                if *truncated {
+                    panel = panel.child(
+                        div()
+                            .pt_2()
+                            .text_color(theme().muted)
+                            .child("First 64 KiB shown. Use Quick Look for the full file."),
+                    );
+                }
+            }
+            Some(Preview::Image { .. }) => {
+                if let Some(image) = &self.preview_image {
+                    panel = panel.child(
+                        gpui::img(image.clone())
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .w_full()
+                            .h(px(height - 24.)),
+                    );
+                }
+            }
+            Some(Preview::Info(message)) => {
+                panel = panel.child(message.clone());
+            }
+            None => {
+                panel = panel.child("Loading preview…");
+            }
+        }
+        panel
+    }
+    fn on_drag_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging()
+            || self.state.screen != Some(Screen::Search)
+            || self.activation_in_flight.is_some()
+            || self.state.searching
+        {
+            self.drag_start = None;
+            return;
+        }
+        let Some((_, start)) = &self.drag_start else {
+            return;
+        };
+        if (event.position.x - start.x).abs() + (event.position.y - start.y).abs() < px(8.) {
+            return;
+        }
+        let (item, _) = self.drag_start.take().unwrap();
+        if let Some(provider) = self.coordinator.registry.get(&item.provider)
+            && provider.supports_drag(&item)
+            && let Err(error) = provider.begin_drag(&item)
+        {
+            self.error = Some(format!("Could not drag file: {error}"));
+            cx.notify();
+        }
+    }
     fn invalidate_activation(&mut self) {
+        if let Some(cancellation) = self.activation_cancellation.take() {
+            cancellation.cancel();
+        }
         self.activation_serial = self.activation_serial.wrapping_add(1);
         self.activation_in_flight = None;
     }
@@ -223,7 +544,7 @@ impl Launcher {
                 let complete = update.complete;
                 let result = this.update(cx, |this, cx| {
                     items.truncate(result_limit(this.options.max_results));
-                    if this.state.apply_results(generation, items) {
+                    if this.state.apply_search_update(generation, items, complete) {
                         this.error = errors.first().map(|failure| failure.message.clone());
                         if this.state.screen != Some(Screen::Actions) {
                             this.refresh_actions();
@@ -273,23 +594,52 @@ impl Launcher {
     }
 
     fn resize_window(&self, window: &mut Window) {
-        let row_count = if self.state.screen == Some(Screen::Actions) {
-            self.actions.len().min(8)
+        let mut row_count = if self.state.screen == Some(Screen::Actions) {
+            visible_result_count(self.actions.len())
         } else {
             visible_result_count(self.state.items.len())
         };
-        let error_height = usize::from(self.error.is_some()) * 24;
-        let height = (106 + row_count * 48 + error_height).clamp(148, 560) as f32;
-        let desired = size(px(self.options.width), px(height));
-        let current = window.bounds().size;
-        if (current.width - desired.width).abs() > px(1.)
-            || (current.height - desired.height).abs() > px(1.)
-        {
-            window.resize(desired);
+        if self.has_preview() {
+            row_count = row_count.max(5);
+        }
+        let error_height = if self.error.is_some()
+            && self.state.screen == Some(Screen::Search)
+            && !self.state.items.is_empty()
+        { 24. } else { 0. };
+        let height = if self.state.screen == Some(Screen::Output) {
+            364.
+        } else if row_count == 0 {
+            120.
+        } else {
+            // 2px outer border + 52px input + 8px list padding + 22px status.
+            84. + row_count as f32 * ROW_HEIGHT + error_height
+        }
+        .clamp(120., MAX_WINDOW_HEIGHT);
+        let desired = size(px(self.effective_width()), px(height));
+        // Resizing alone keeps the old left edge, so the preview pushes the
+        // entire popup to the right. Move and resize its frame together instead.
+        if window.resize_centered(desired).is_err() {
+            // Portable fallback for platforms where positioning is unavailable.
+            let current = window.bounds().size;
+            if (current.width - desired.width).abs() > px(1.)
+                || (current.height - desired.height).abs() > px(1.)
+            {
+                window.resize(desired);
+            }
         }
     }
 
     fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.searching && self.state.screen == Some(Screen::Search) {
+            return;
+        }
+        if self.state.screen == Some(Screen::Output) {
+            let mut offset = self.output_scroll.offset();
+            offset.y -= px(delta as f32 * 48.0);
+            self.output_scroll.set_offset(offset);
+            cx.notify();
+            return;
+        }
         if self.state.screen == Some(Screen::Actions) {
             if !self.actions.is_empty() {
                 let len = self.actions.len() as isize;
@@ -297,7 +647,7 @@ impl Launcher {
                     (self.state.action_index as isize + delta).rem_euclid(len) as usize;
             }
         } else {
-            self.state.selection.move_by(&self.state.items, delta);
+            self.state.move_selection(delta);
             self.refresh_actions();
             self.keep_selection_visible();
         }
@@ -312,15 +662,28 @@ impl Launcher {
         self.move_selection(1, window, cx);
     }
 
+    fn on_copy_output(&mut self, _: &CopyOutput, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, text)) = &self.output {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        }
+    }
+
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activation_in_flight.is_some() {
+            self.invalidate_activation();
+            self.error = Some("Action cancelled.".into());
+            cx.notify();
+            return;
+        }
         match self.state.escape() {
             EscapeResult::Back => {
+                self.output = None;
+                window.focus(&self.search_input.read(cx).focus_handle(cx));
                 self.action_item = None;
                 self.refresh_actions();
             }
             EscapeResult::Cleared => {
-                self.search_input
-                    .update(cx, |input, cx| input.set_text(String::new(), cx));
+                self.replace_query(String::new(), cx);
                 self.start_search(cx);
             }
             EscapeResult::Hide => self.hide(cx),
@@ -330,6 +693,9 @@ impl Launcher {
     }
 
     fn on_actions(&mut self, _: &OpenActions, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.screen == Some(Screen::Output) || self.state.searching {
+            return;
+        }
         self.refresh_actions();
         self.action_item = self.state.selection.current(&self.state.items).cloned();
         self.state.enter_actions(&self.actions);
@@ -338,6 +704,9 @@ impl Launcher {
     }
 
     fn on_next_action(&mut self, _: &NextAction, _: &mut Window, cx: &mut Context<Self>) {
+        if self.state.screen == Some(Screen::Output) || self.state.searching {
+            return;
+        }
         if self.state.screen == Some(Screen::Actions) {
             if !self.actions.is_empty() {
                 self.state.action_index = (self.state.action_index + 1) % self.actions.len();
@@ -373,6 +742,9 @@ impl Launcher {
     }
 
     fn on_confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if self.state.screen == Some(Screen::Output) || self.state.searching {
+            return;
+        }
         if self.state.screen == Some(Screen::Actions) {
             if let (Some(item), Some(action)) = (
                 self.action_item.clone(),
@@ -406,6 +778,10 @@ impl Launcher {
         self.activation_serial = self.activation_serial.wrapping_add(1);
         let activation_serial = self.activation_serial;
         self.activation_in_flight = Some(activation_serial);
+        let cancellation = CancellationToken::default();
+        self.activation_cancellation = Some(cancellation.clone());
+        self.error = None;
+        cx.notify();
         let history = self.history.clone();
         let query = self.state.query.clone();
         let this = cx.entity().downgrade();
@@ -413,18 +789,23 @@ impl Launcher {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    provider.activate(&item, &action).inspect(|_| {
-                        let _ = history.record(&UsageEvent {
-                            query,
-                            provider: item.provider.clone(),
-                            item: item.id.clone(),
-                            action: action.id.clone(),
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64,
-                        });
-                    })
+                    provider
+                        .activate_with_cancellation(&item, &action, &cancellation)
+                        .inspect(|_| {
+                            if !provider.records_usage() {
+                                return;
+                            }
+                            let _ = history.record(&UsageEvent {
+                                query,
+                                provider: item.provider.clone(),
+                                item: item.id.clone(),
+                                action: action.id.clone(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64,
+                            });
+                        })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -435,11 +816,19 @@ impl Launcher {
                     return;
                 }
                 this.activation_in_flight = None;
+                this.activation_cancellation = None;
                 match result {
                     Ok(outcome) => match outcome {
                         ActionOutcome::Close => this.hide(cx),
                         ActionOutcome::KeepOpen(message) => {
                             this.error = Some(message);
+                            cx.notify();
+                        }
+                        ActionOutcome::Output { title, text } => {
+                            this.output = Some((title, text));
+                            this.output_scroll.set_offset(Default::default());
+                            this.state.screen = Some(Screen::Output);
+                            this.error = None;
                             cx.notify();
                         }
                         ActionOutcome::SetQuery(query) => {
@@ -466,9 +855,21 @@ impl Focusable for Launcher {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_preview(cx);
+        if self.preview.is_some() {
+            if let Some(started) = self.preview_started.take() {
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "preview ready frame rendered"
+                );
+            }
+        }
         self.resize_window(window);
         let theme = theme();
         let state = self.state.screen.clone();
+        if state == Some(Screen::Output) {
+            window.focus(&self.focus_handle);
+        }
         let selected = self
             .state
             .selection
@@ -478,7 +879,11 @@ impl Render for Launcher {
         let actions = self.actions.clone();
         let action_index = self.state.action_index;
         let mut root = div()
-            .key_context("Launcher")
+            .key_context(if state == Some(Screen::Output) {
+                "Launcher LauncherOutput"
+            } else {
+                "Launcher"
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_move_up))
             .on_action(cx.listener(Self::on_move_down))
@@ -487,37 +892,83 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::on_provider_picker))
             .on_action(cx.listener(Self::on_next_action))
             .on_action(cx.listener(Self::on_escape))
+            .on_action(cx.listener(Self::on_copy_output))
+            .on_action(cx.listener(Self::on_toggle_preview))
+            .on_mouse_move(cx.listener(Self::on_drag_move))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.drag_start = None;
+                }),
+            )
+            .debug_selector(|| "launcher-container".into())
             .flex()
             .flex_col()
-            .w(px(self.options.width))
-            .max_h(px(560.))
+            .w(px(self.effective_width()))
+            .h_full()
+            .max_h(px(MAX_WINDOW_HEIGHT))
+            .overflow_hidden()
             .rounded(px(12.))
+            .font_family("monospace")
+            .text_size(px(14.))
+            .line_height(px(18.))
             .border_1()
             .border_color(theme.border)
             .bg(theme.background)
             .text_color(theme.foreground)
-            .shadow_lg()
-            .child(div().px_5().py_4().child(self.search_input.clone()));
+            .child(
+                div()
+                    .h(px(52.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .py(px(10.))
+                    .border_b_1()
+                    .border_color(theme.divider)
+                    .child(self.search_input.clone()),
+            );
 
         if state.is_some() {
-            if state == Some(Screen::Actions) {
-                root = root.child(div().mx_4().h(px(1.)).bg(theme.border));
-                for (index, action) in actions.iter().enumerate() {
+            if state == Some(Screen::Output) {
+                if let Some((title, text)) = &self.output {
+                    root = root
+                        .child(div().px_3().h(px(28.)).child(title.clone()))
+                        .child(
+                            div()
+                                .id("command-output")
+                                .mx_3()
+                                .h(px(260.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.output_scroll)
+                                .font_family("monospace")
+                                .text_sm()
+                                .child(text.clone()),
+                        );
+                }
+            } else if state == Some(Screen::Actions) {
+                for (index, action) in actions
+                    .iter()
+                    .enumerate()
+                    .skip(action_index.saturating_sub(crate::state::MAX_VISIBLE_RESULTS - 1))
+                    .take(crate::state::MAX_VISIBLE_RESULTS)
+                {
                     let selected = index == action_index;
                     root = root.child(
                         div()
-                            .mx_2()
-                            .my(px(2.))
-                            .px_3()
-                            .py_2()
+                            .debug_selector(|| format!("action-{index}"))
                             .rounded(px(6.))
+                            .mx_2()
+                            .h(px(ROW_HEIGHT))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .px_3()
                             .bg(if selected {
                                 theme.selected
                             } else {
                                 theme.background
                             })
                             .text_color(if selected {
-                                theme.foreground
+                                theme.selected_foreground
                             } else {
                                 theme.muted
                             })
@@ -527,55 +978,107 @@ impl Render for Launcher {
             } else if items.is_empty() {
                 root = root.child(
                     div()
-                        .px_5()
-                        .pb_4()
-                        .text_sm()
+                        .px_3()
+                        .h(px(44.))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.))
                         .text_color(theme.muted)
-                        .child(self.error.clone().unwrap_or_else(|| "No results".into())),
+                        .child(self.error.clone().unwrap_or_else(|| {
+                            if self.state.searching {
+                                "Searching…"
+                            } else {
+                                "No results"
+                            }
+                            .into()
+                        })),
                 );
             } else {
                 if let Some(error) = &self.error {
                     root = root.child(
                         div()
-                            .px_5()
-                            .pb_2()
-                            .text_sm()
+                            .px_3()
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
                             .text_color(theme.muted)
                             .child(error.clone()),
                     );
                 }
-                let visible_count = visible_result_count(items.len());
+                let visible_count =
+                    visible_result_count(items.len()).max(if self.has_preview() { 5 } else { 1 });
                 let row_theme = theme.clone();
                 let selected_for_rows = selected.clone();
-                root = root.child(
-                    uniform_list("launcher-results", items.len(), move |range, _, _| {
-                        range
-                            .map(|index| {
-                                let item = &items[index];
-                                let is_selected =
-                                    selected_for_rows.as_ref().is_some_and(|(p, id)| {
-                                        p == &item.provider.0 && id == &item.id.0
+                let rows_view = cx.entity().downgrade();
+                let list = uniform_list("launcher-results", items.len(), move |range, _, _| {
+                    range
+                        .map(|index| {
+                            let item = &items[index];
+                            let is_selected = selected_for_rows
+                                .as_ref()
+                                .is_some_and(|(p, id)| p == &item.provider.0 && id == &item.id.0);
+                            let view = rows_view.clone();
+                            let item_for_click = item.clone();
+                            div()
+                                .w_full()
+                                .px_2()
+                                .child(result_row(item, is_selected, &row_theme).h_full())
+                                .h(px(ROW_HEIGHT))
+                                .id(("result-row", index))
+                                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.state.searching {
+                                            return;
+                                        }
+                                        this.state.select_item(&item_for_click);
+                                        this.refresh_actions();
+                                        this.drag_start =
+                                            Some((item_for_click.clone(), event.position));
+                                        window.focus(&this.search_input.read(cx).focus_handle(cx));
+                                        if event.click_count == 2 {
+                                            this.on_confirm(&Confirm, window, cx);
+                                        }
+                                        cx.notify();
                                     });
-                                result_row(item, is_selected, &row_theme).h(px(48.))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .h(px(visible_count as f32 * 48.))
-                    .track_scroll(self.list_scroll.clone()),
-                );
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .h(px(visible_count as f32 * ROW_HEIGHT))
+                .flex_shrink_0()
+                .track_scroll(self.list_scroll.clone())
+                .flex_1();
+                let mut body = div().flex().w_full().py_1().flex_shrink_0().child(list);
+                if self.has_preview() {
+                    body = body.child(self.preview_panel(visible_count as f32 * ROW_HEIGHT));
+                }
+                root = root.child(body);
             }
             root = root.child(
                 div()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .px_4()
-                    .py_2()
-                    .text_xs()
+                    .h(px(FOOTER_HEIGHT))
+                    .flex_shrink_0()
+                    .mt_auto()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .text_size(px(10.))
+                    .line_height(px(14.))
                     .text_color(theme.muted)
-                    .child(if state == Some(Screen::Actions) {
-                        "↵ Run action    Esc Back"
+                    .child(if state == Some(Screen::Output) {
+                        "⌘C Copy · Esc Back".to_string()
+                    } else if self.state.searching {
+                        "Searching…".to_string()
+                    } else if self.activation_in_flight.is_some() {
+                        "Running… · Esc Cancel".to_string()
+                    } else if state == Some(Screen::Actions) {
+                        "↵ Run · Esc Back".to_string()
                     } else {
-                        "↵ Open    ⌘↵ Actions    ⌘P Providers    Esc Close"
+                        let position =
+                            selected_result_index(&self.state.items, &self.state.selection)
+                                .map_or(0, |index| index + 1);
+                        format!("{position}/{}", self.state.items.len())
                     }),
             );
         }
@@ -589,10 +1092,17 @@ fn result_row(item: &Item, selected: bool, theme: &crate::theme::Theme) -> gpui:
         .clone()
         .unwrap_or_else(|| item.provider.0.clone());
     div()
-        .mx_2()
+        .debug_selector(|| format!("suggestion-{}", item.id.0))
+        .w_full()
+        .min_w_0()
         .px_3()
-        .py_2()
-        .rounded(px(7.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .text_color(if selected {
+            theme.selected_foreground
+        } else {
+            theme.foreground
+        })
         .bg(if selected {
             theme.selected
         } else {
@@ -600,12 +1110,651 @@ fn result_row(item: &Item, selected: bool, theme: &crate::theme::Theme) -> gpui:
         })
         .flex()
         .flex_col()
+        .justify_center()
         .gap(px(2.))
-        .child(div().text_size(px(15.)).child(item.title.clone()))
         .child(
             div()
+                .debug_selector(|| format!("suggestion-title-{}", item.id.0))
+                .text_size(px(14.))
+                .line_height(px(18.))
+                .flex_shrink_0()
+                .truncate()
+                .child(item.title.clone()),
+        )
+        .child(
+            div()
+                .debug_selector(|| format!("suggestion-type-{}", item.id.0))
                 .text_size(px(11.))
-                .text_color(theme.muted)
+                .line_height(px(14.))
+                .flex_shrink_0()
+                .truncate()
+                .text_color(if selected {
+                    theme.selected_muted
+                } else {
+                    theme.muted
+                })
                 .child(secondary),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        AvailableSpace, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point,
+    };
+    use launcher_core::{
+        ItemId, Provider, ProviderId, ProviderRegistry, SearchContext, SearchQuery,
+    };
+
+    fn test_window(cx: &TestAppContext, registry: ProviderRegistry) -> WindowHandle<Launcher> {
+        let history = Arc::new(HistoryStore::in_memory().unwrap());
+        let coordinator = Arc::new(SearchCoordinator::new(
+            Arc::new(registry),
+            history.clone(),
+            50,
+        ));
+        cx.update(|cx| {
+            open_launcher(
+                coordinator,
+                history,
+                LauncherOptions {
+                    width: 680.0,
+                    max_results: 50,
+                },
+                cx,
+            )
+            .unwrap()
+        })
+    }
+
+    #[gpui::test]
+    fn preview_and_result_resizes_keep_the_whole_launcher_centered(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        cx.update(|cx| window.update(cx, |launcher, window, cx| {
+            let center = window.display(cx).unwrap().bounds().center();
+            launcher.state.screen = Some(Screen::Search);
+            for (count, preview) in [(0, false), (1, true), (8, true), (3, false), (50, true), (0, false)] {
+                launcher.state.items = (0..count).map(|i| Item {
+                    id: ItemId(i.to_string()), provider: ProviderId("files".into()),
+                    title: "Result".into(), subtitle: None, keywords: vec![], icon: None,
+                    score: 0., payload: serde_json::Value::Null,
+                }).collect();
+                launcher.preview_key = preview.then(|| ("files".into(), "image".into(), 0));
+                launcher.resize_window(window);
+                assert_eq!(window.bounds().center(), center,
+                    "entire launcher must stay centered when preview={preview}, results={count}");
+                assert_eq!(window.bounds().size.width, px(if preview { 960. } else { 680. }));
+            }
+            launcher.state.screen = Some(Screen::Output);
+            launcher.resize_window(window);
+            assert_eq!(window.bounds().center(), center);
+        }).unwrap());
+    }
+
+    #[gpui::test]
+    fn suggestions_fill_the_container_without_clipping(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let view = window.root(cx).unwrap();
+        for count in [1, 3, 8] {
+            cx.update(|cx| {
+                window
+                    .update(cx, |launcher, window, _| {
+                        launcher.options.width = 480.;
+                        launcher.state.screen = Some(Screen::Search);
+                        launcher.state.items =
+                            (0..count)
+                                .map(|i| {
+                                    Item {
+                    id: ItemId(i.to_string()), provider: ProviderId("apps".into()),
+                    title: "Alacritty Terminal — Résumé gypj with a long application name".into(),
+                    subtitle: Some("Application — gypj".into()), keywords: vec![], icon: None,
+                    score: 0., payload: serde_json::Value::Null,
+                }
+                                })
+                                .collect();
+                        launcher.state.selection.reconcile(&launcher.state.items);
+                        launcher.resize_window(window);
+                    })
+                    .unwrap()
+            });
+            let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+            let mut visual = VisualTestContext::from_window(*window, cx);
+            visual.simulate_resize(bounds.size);
+            visual.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(bounds.size.width),
+                    AvailableSpace::Definite(bounds.size.height),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+            let container = visual.debug_bounds("launcher-container").unwrap();
+            let first = visual.debug_bounds("suggestion-0").unwrap();
+            assert!(
+                (container.size.height - bounds.size.height).abs() <= px(1.),
+                "container should fill window: {container:?}, window: {bounds:?}"
+            );
+            assert!(
+                (first.size.width - (container.size.width - px(18.))).abs() <= px(1.),
+                "suggestions should fill width with 8px margins: {first:?}, {container:?}"
+            );
+            let last = match count {
+                1 => "suggestion-0",
+                3 => "suggestion-2",
+                _ => "suggestion-5",
+            };
+            let last = visual.debug_bounds(last).unwrap();
+            assert_eq!(last.size.height, px(ROW_HEIGHT));
+            assert!(
+                last.bottom() <= container.bottom() - px(FOOTER_HEIGHT),
+                "footer must not clip suggestions"
+            );
+            for (selector, min_height) in [("suggestion-title-0", 18.), ("suggestion-type-0", 14.)]
+            {
+                let text = visual.debug_bounds(selector).unwrap();
+                assert!(
+                    text.size.height >= px(min_height),
+                    "line box must fit the glyphs: {text:?}"
+                );
+                assert!(
+                    text.top() >= first.top() + px(2.) && text.bottom() <= first.bottom() - px(2.),
+                    "title/type must fit inside the row without clipping: {text:?}, {first:?}"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn compact_empty_and_action_screens_fit_the_window(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let view = window.root(cx).unwrap();
+        cx.update(|cx| window.update(cx, |launcher, window, _| {
+            launcher.options.width = 480.;
+            launcher.state.screen = Some(Screen::Search);
+            launcher.error = Some("No results".into());
+            launcher.resize_window(window);
+            assert_eq!(window.bounds().size, size(px(480.), px(120.)));
+            launcher.state.screen = Some(Screen::Actions);
+            launcher.actions = (0..12).map(|index| Action {
+                id: ActionId(index.to_string()), title: format!("Action {index}"),
+            }).collect();
+            launcher.state.action_index = 11;
+            launcher.resize_window(window);
+            assert_eq!(window.bounds().size, size(px(480.), px(348.)));
+        }).unwrap());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(480.), px(348.)));
+        visual.draw(point(px(0.), px(0.)), size(
+            AvailableSpace::Definite(px(480.)), AvailableSpace::Definite(px(348.)),
+        ), |_, _| view.clone().into_any_element());
+        let container = visual.debug_bounds("launcher-container").unwrap();
+        let selected = visual.debug_bounds("action-11").unwrap();
+        assert!(selected.top() >= container.top() + px(52.));
+        assert!(selected.bottom() <= container.bottom() - px(FOOTER_HEIGHT));
+        assert!(visual.debug_bounds("action-0").is_none(), "earlier actions scroll out of view");
+    }
+
+    #[gpui::test]
+    fn stale_preview_does_not_replace_current_selection(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        cx.update(|cx| window.update(cx, |launcher, _, cx| {
+            let current = ("files".into(), "new-file".into(), 2);
+            launcher.preview_key = Some(current.clone());
+            launcher.apply_preview(&("files".into(), "old-file".into(), 1), Ok(Some(Preview::Info("stale".into()))), cx);
+            assert!(launcher.preview.is_none());
+            launcher.apply_preview(&current, Ok(Some(Preview::Text { text: "current 🦀".into(), truncated: false })), cx);
+            assert!(matches!(&launcher.preview, Some(Preview::Text { text, .. }) if text == "current 🦀"));
+            let token = CancellationToken::default();
+            launcher.preview_cancellation = Some(token.clone());
+            launcher.clear_preview(cx);
+            assert!(token.is_cancelled() && launcher.preview_key.is_none());
+        }).unwrap());
+    }
+    #[gpui::test]
+    fn stalled_preview_reports_delay_without_overwriting_ready_or_newer_previews(
+        cx: &mut TestAppContext,
+    ) {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                Arc::new(PreviewDragProvider(Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))),
+                launcher_core::ProviderConfig::default(),
+            )
+            .unwrap();
+        let window = test_window(cx, registry);
+        let key = ("preview-test".into(), "slow".into(), 0);
+        let token = CancellationToken::default();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher
+                        .coordinator
+                        .registry
+                        .get(&ProviderId("preview-test".into()))
+                        .expect("test preview provider");
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = vec![Item {
+                        id: ItemId("slow".into()),
+                        provider: ProviderId("preview-test".into()),
+                        title: "Slow preview".into(),
+                        subtitle: None,
+                        keywords: vec![],
+                        icon: None,
+                        score: 0.,
+                        payload: serde_json::Value::Null,
+                    }];
+                    launcher.state.selection.reconcile(&launcher.state.items);
+                    launcher.preview_key = Some(key.clone());
+                    launcher.preview_cancellation = Some(token.clone());
+                    launcher.watch_preview_deadline(key.clone(), token.clone(), cx);
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(1999));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| assert!(launcher.preview.is_none()))
+                .unwrap()
+        });
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        cx.update(|cx| window.update(cx, |launcher, _, cx| {
+            assert!(!token.is_cancelled(), "valid slow work should still complete and cache");
+            assert!(matches!(&launcher.preview, Some(Preview::Info(message)) if message.contains("taking too long")));
+            launcher.apply_preview(&key, Ok(Some(Preview::Info("late but valid".into()))), cx);
+            assert!(matches!(&launcher.preview, Some(Preview::Info(message)) if message == "late but valid"));
+            launcher.clear_preview(cx);
+            // A completed preview must not be replaced by its old deadline.
+            let ready = CancellationToken::default();
+            launcher.preview_key = Some(key.clone());
+            launcher.watch_preview_deadline(key.clone(), ready, cx);
+            launcher.apply_preview(&key, Ok(Some(Preview::Info("ready".into()))), cx);
+        }).unwrap());
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|cx| window.update(cx, |launcher, _, cx| {
+            assert!(matches!(&launcher.preview, Some(Preview::Info(message)) if message == "ready"));
+            launcher.clear_preview(cx);
+            // A stale deadline must not cancel a newer request.
+            let old = CancellationToken::default();
+            launcher.preview_key = Some(key.clone());
+            launcher.watch_preview_deadline(key, old, cx);
+            launcher.state.items[0].id = ItemId("new".into());
+            launcher.state.selection.reconcile(&launcher.state.items);
+            launcher.preview_key = Some(("preview-test".into(), "new".into(), 0));
+        }).unwrap());
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert!(launcher.preview.is_none());
+                    assert_eq!(launcher.preview_key.as_ref().unwrap().1, "new");
+                })
+                .unwrap()
+        });
+    }
+
+    struct PreviewDragProvider(Arc<std::sync::atomic::AtomicUsize>);
+    impl Provider for PreviewDragProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId("preview-test".into())
+        }
+        fn name(&self) -> &str {
+            "Preview test"
+        }
+        fn supports_preview(&self, _: &Item) -> bool {
+            true
+        }
+        fn supports_drag(&self, _: &Item) -> bool {
+            true
+        }
+        fn begin_drag(&self, _: &Item) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+            Ok(vec![])
+        }
+        fn actions(&self, _: &Item) -> Vec<Action> {
+            vec![]
+        }
+        fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+            Ok(ActionOutcome::Close)
+        }
+    }
+    #[gpui::test]
+    fn file_preview_scrolls_and_drag_starts_once_after_threshold(cx: &mut TestAppContext) {
+        let drags = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                Arc::new(PreviewDragProvider(drags.clone())),
+                launcher_core::ProviderConfig::default(),
+            )
+            .unwrap();
+        let window = test_window(cx, registry);
+        let view = window.root(cx).unwrap();
+        let item = Item {
+            id: ItemId("fixture".into()),
+            provider: ProviderId("preview-test".into()),
+            title: "notes.txt".into(),
+            subtitle: None,
+            keywords: vec![],
+            icon: None,
+            score: 0.,
+            payload: serde_json::Value::Null,
+        };
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = vec![item.clone()];
+                    launcher.state.selection.reconcile(&launcher.state.items);
+                    launcher.preview_key = Some((item.provider.0.clone(), item.id.0.clone(), 0));
+                    launcher.preview = Some(Preview::Text {
+                        text: "Unicode 🦀 preview line\n".repeat(300),
+                        truncated: false,
+                    });
+                    launcher.drag_start = Some((item, point(px(100.), px(100.))));
+                    for x in [101., 110., 120.] {
+                        launcher.on_drag_move(
+                            &gpui::MouseMoveEvent {
+                                position: point(px(x), px(100.)),
+                                pressed_button: Some(gpui::MouseButton::Left),
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    assert_eq!(drags.load(std::sync::atomic::Ordering::SeqCst), 1);
+                })
+                .unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let draw = |visual: &mut VisualTestContext| {
+            visual.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(1040.)),
+                    AvailableSpace::Definite(px(400.)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            )
+        };
+        draw(&mut visual);
+        // TestPlatform::resize does not dispatch the native resize callback.
+        visual.simulate_resize(size(px(1040.), px(400.)));
+        draw(&mut visual);
+        assert!(visual.debug_bounds("file-preview").is_some());
+        visual.simulate_event(ScrollWheelEvent {
+            position: point(px(900.), px(180.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-500.))),
+            ..Default::default()
+        });
+        draw(&mut visual);
+        cx.read(|cx| assert!(view.read(cx).preview_scroll.offset().y < px(0.)));
+    }
+    struct OutputProvider;
+    impl Provider for OutputProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId("output-test".into())
+        }
+        fn name(&self) -> &str {
+            "Output test"
+        }
+        fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+            Ok(vec![])
+        }
+        fn actions(&self, _: &Item) -> Vec<Action> {
+            vec![Action {
+                id: ActionId("execute".into()),
+                title: "Execute".into(),
+            }]
+        }
+        fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+            Ok(ActionOutcome::KeepOpen("unexpected repeat".into()))
+        }
+    }
+
+    #[gpui::test]
+    fn output_screen_scrolls_and_copies_the_actual_text(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let view = window.root(cx).unwrap();
+        let text = (0..120)
+            .map(|line| format!("Unicode output 🦀 line {line}\n"))
+            .collect::<String>();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    launcher.state.screen = Some(Screen::Output);
+                    launcher.output = Some(("Test output".into(), text.clone()));
+                })
+                .unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let draw = |visual: &mut VisualTestContext| {
+            visual.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(680.)),
+                    AvailableSpace::Definite(px(460.)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+        };
+        draw(&mut visual);
+        visual.dispatch_action(MoveDown);
+        draw(&mut visual);
+        cx.read(|cx| assert!(view.read(cx).output_scroll.offset().y < px(0.)));
+        visual.dispatch_action(CopyOutput);
+        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), text);
+    }
+
+    #[gpui::test]
+    fn output_confirmation_does_not_repeat_the_hidden_command(cx: &mut TestAppContext) {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                Arc::new(OutputProvider),
+                launcher_core::ProviderConfig::default(),
+            )
+            .unwrap();
+        let window = test_window(cx, registry);
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.state.screen = Some(Screen::Output);
+                    launcher.state.items = vec![Item {
+                        id: ItemId("command".into()),
+                        provider: ProviderId("output-test".into()),
+                        title: "Command".into(),
+                        subtitle: None,
+                        keywords: vec![],
+                        icon: None,
+                        score: 0.0,
+                        payload: serde_json::json!({}),
+                    }];
+                    launcher.state.selection.reconcile(&launcher.state.items);
+                    launcher.refresh_actions();
+                    launcher.on_confirm(&Confirm, window, cx);
+                    assert!(
+                        launcher.activation_in_flight.is_none(),
+                        "Enter on output must not repeat execution"
+                    );
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn pending_query_keeps_window_bounds_and_blocks_old_actions(cx: &mut TestAppContext) {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                Arc::new(OutputProvider),
+                launcher_core::ProviderConfig::default(),
+            )
+            .unwrap();
+        let window = test_window(cx, registry);
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.apply_results(
+                        0,
+                        vec![Item {
+                            id: ItemId("old".into()),
+                            provider: ProviderId("output-test".into()),
+                            title: "Old suggestion".into(),
+                            subtitle: None,
+                            keywords: vec![],
+                            icon: None,
+                            score: 0.,
+                            payload: serde_json::Value::Null,
+                        }],
+                    );
+                    let mut second = launcher.state.items[0].clone();
+                    second.id = ItemId("second".into());
+                    launcher.state.items.push(second);
+                    launcher.resize_window(window);
+                    let before = window.bounds().size;
+                    launcher.replace_query("new".into(), cx);
+                    launcher.resize_window(window);
+                    assert_eq!(window.bounds().size, before);
+                    let selection =
+                        selected_result_index(&launcher.state.items, &launcher.state.selection);
+                    launcher.on_move_down(&MoveDown, window, cx);
+                    assert_eq!(
+                        selected_result_index(&launcher.state.items, &launcher.state.selection),
+                        selection
+                    );
+                    launcher.on_confirm(&Confirm, window, cx);
+                    launcher.on_next_action(&NextAction, window, cx);
+                    launcher.on_actions(&OpenActions, window, cx);
+                    assert!(launcher.activation_in_flight.is_none());
+                    assert_eq!(launcher.state.screen, Some(Screen::Search));
+                    assert!(launcher.state.searching);
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn query_edits_and_escape_cancel_long_running_actions(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        for mode in 0..2 {
+            let token = CancellationToken::default();
+            cx.update(|cx| {
+                window
+                    .update(cx, |launcher, window, cx| {
+                        launcher.activation_cancellation = Some(token.clone());
+                        launcher.activation_in_flight = Some(1);
+                        launcher.state.screen = Some(Screen::Search);
+                        match mode {
+                            0 => launcher.replace_query("different query".into(), cx),
+                            _ => launcher.on_escape(&Escape, window, cx),
+                        }
+                        assert!(token.is_cancelled());
+                        assert!(launcher.activation_in_flight.is_none());
+                    })
+                    .unwrap()
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn full_launcher_list_supports_wheel_and_keyboard_scrolling_beyond_eight_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let history = Arc::new(HistoryStore::in_memory().unwrap());
+        let coordinator = Arc::new(SearchCoordinator::new(
+            Arc::new(ProviderRegistry::new()),
+            history.clone(),
+            50,
+        ));
+        let window = cx.update(|cx| {
+            open_launcher(
+                coordinator,
+                history,
+                LauncherOptions {
+                    width: 680.0,
+                    max_results: 50,
+                },
+                cx,
+            )
+            .unwrap()
+        });
+        let view = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = (0..50)
+                        .map(|i| Item {
+                            id: ItemId(i.to_string()),
+                            provider: ProviderId("files".into()),
+                            title: format!("report-{i:02}.pdf"),
+                            subtitle: None,
+                            keywords: vec![],
+                            icon: None,
+                            score: 0.0,
+                            payload: serde_json::json!({}),
+                        })
+                        .collect();
+                    launcher.state.selection.reconcile(&launcher.state.items);
+                    window.focus(&launcher.search_input.read(cx).focus_handle(cx));
+                })
+                .unwrap()
+        });
+        let scroll = cx.read(|cx| view.read(cx).list_scroll.clone());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let draw = |visual: &mut VisualTestContext| {
+            visual.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(680.)),
+                    AvailableSpace::Definite(px(560.)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+        };
+        draw(&mut visual);
+        visual.simulate_event(ScrollWheelEvent {
+            position: point(px(340.), px(200.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            ..Default::default()
+        });
+        draw(&mut visual);
+        assert!(
+            scroll.0.borrow().base_handle.offset().y <= px(-384.),
+            "wheel must reach beyond the first eight rows"
+        );
+        for _ in 0..49 {
+            visual.dispatch_action(MoveDown);
+        }
+        draw(&mut visual);
+        cx.read(|cx| {
+            assert_eq!(
+                selected_result_index(&view.read(cx).state.items, &view.read(cx).state.selection),
+                Some(49)
+            )
+        });
+        assert!(
+            scroll.0.borrow().base_handle.offset().y < px(-1500.),
+            "keyboard selection must keep the final row visible"
+        );
+    }
 }

@@ -22,6 +22,9 @@ pub fn discover_applications() -> Result<Vec<Application>> {
         PathBuf::from("/Applications"),
         PathBuf::from("/System/Applications"),
         PathBuf::from("/System/Applications/Utilities"),
+        // Finder is outside the application directories. Include its bundle
+        // explicitly rather than exposing internal CoreServices helper apps.
+        PathBuf::from("/System/Library/CoreServices/Finder.app"),
     ];
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(PathBuf::from(home).join("Applications"));
@@ -29,11 +32,20 @@ pub fn discover_applications() -> Result<Vec<Application>> {
     discover_in(&roots)
 }
 
-/// Scan roots without descending into an application's bundle contents.
+/// Scan directories or explicit app bundles without descending into bundle contents.
 pub fn discover_in(roots: &[PathBuf]) -> Result<Vec<Application>> {
     let mut found = Vec::new();
     for root in roots {
         if !root.is_dir() {
+            continue;
+        }
+        if root
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        {
+            if let Some(app) = read_application(root) {
+                found.push(app);
+            }
             continue;
         }
         let mut remaining_entries = 30_000;
@@ -177,6 +189,40 @@ mod tests {
         assert_eq!(apps[0].display_name, "Editor");
         assert_eq!(apps[0].executable_name.as_deref(), Some("editor"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_explicit_finder_bundle_without_scanning_core_services() {
+        let root = fixture();
+        for name in ["Finder", "InternalHelper"] {
+            let contents = root.join(format!("CoreServices/{name}.app/Contents"));
+            fs::create_dir_all(&contents).unwrap();
+            plist::to_file_xml(
+                contents.join("Info.plist"),
+                &Value::Dictionary(plist::Dictionary::from_iter([(
+                    "CFBundleName",
+                    Value::String(name.into()),
+                )])),
+            )
+            .unwrap();
+        }
+        let finder = root.join("CoreServices/Finder.app");
+        let apps = discover_in(&[finder.clone(), finder, root.join("missing.app")]).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].display_name, "Finder");
+        assert_eq!(apps[0].path, root.join("CoreServices/Finder.app"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn standard_discovery_includes_finder() {
+        let apps = discover_applications().unwrap();
+        assert!(
+            apps.iter()
+                .any(|app| app.bundle_id.as_deref() == Some("com.apple.finder")
+                    && app.path == Path::new("/System/Library/CoreServices/Finder.app"))
+        );
     }
 
     #[test]

@@ -133,6 +133,12 @@ impl PlatformWindow for TestWindow {
         lock.bounds.size = size;
     }
 
+    fn resize_centered(&mut self, size: Size<Pixels>) -> anyhow::Result<()> {
+        let mut lock = self.0.lock();
+        lock.bounds = Bounds::centered_at(lock.display.bounds().center(), size);
+        Ok(())
+    }
+
     fn scale_factor(&self) -> f32 {
         2.0
     }

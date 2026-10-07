@@ -105,9 +105,15 @@ impl Provider for ApplicationProvider {
                 scored.push(item);
             }
         }
+        // Keep exact names before truncation; the coordinator cannot recover
+        // an application discarded by this provider's result limit.
+        let exact_query = query.text.trim().to_lowercase();
         scored.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
+            let a_exact = !exact_query.is_empty() && a.title.trim().to_lowercase() == exact_query;
+            let b_exact = !exact_query.is_empty() && b.title.trim().to_lowercase() == exact_query;
+            b_exact
+                .cmp(&a_exact)
+                .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| a.title.cmp(&b.title))
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
@@ -227,6 +233,28 @@ mod tests {
             "apps:com.apple.safari"
         );
     }
+    #[test]
+    fn exact_application_name_is_kept_when_results_are_limited() {
+        let p = ApplicationProvider::new(
+            vec![
+                app("Aerospace Tools", "org.aerospace.tools"),
+                app("AeroSpace", "org.aerospace"),
+            ],
+            Arc::new(FakePlatform::default()),
+        );
+        let found = p
+            .search(
+                &SearchQuery {
+                    raw: "aerospace".into(),
+                    text: "aerospace".into(),
+                },
+                &ctx(1),
+            )
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "AeroSpace");
+    }
+
     #[test]
     fn observes_cancelled_search_before_scanning() {
         let p = ApplicationProvider::new(

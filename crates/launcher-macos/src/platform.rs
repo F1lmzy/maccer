@@ -10,6 +10,13 @@ pub trait Platform: Send + Sync {
     fn reveal_in_finder(&self, path: &Path) -> Result<()>;
     fn open_url(&self, url: &str) -> Result<()>;
     fn copy_text(&self, text: &str) -> Result<()>;
+    fn copy_file(&self, _path: &Path) -> Result<()> {
+        bail!("file copying is unavailable on this platform")
+    }
+    /// Must run on the main thread while processing a mouse drag event.
+    fn begin_file_drag(&self, _path: &Path) -> Result<()> {
+        bail!("native dragging is unavailable on this platform")
+    }
     fn open_path(&self, path: &Path) -> Result<()> {
         self.launch_application(path)
     }
@@ -22,6 +29,18 @@ pub trait Platform: Send + Sync {
 pub struct NativePlatform;
 
 impl Platform for NativePlatform {
+    fn copy_file(&self, path: &Path) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let path = path.to_path_buf();
+            run_on_main(move || crate::file_transfer::copy(&path))
+        }
+        #[cfg(not(target_os = "macos"))]
+        crate::file_transfer::copy(path)
+    }
+    fn begin_file_drag(&self, path: &Path) -> Result<()> {
+        crate::file_transfer::drag(path)
+    }
     fn quick_look(&self, path: &Path) -> Result<()> {
         if !path.is_absolute() || !path.exists() {
             bail!("Quick Look requires an existing absolute path");

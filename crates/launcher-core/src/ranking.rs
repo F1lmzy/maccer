@@ -38,9 +38,13 @@ pub(crate) fn rank(
                     1.0 / (1.0 + age_days / 30.0)
                 });
     }
+    let exact_query = query.trim().to_lowercase();
     items.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
+        let a_exact = !exact_query.is_empty() && a.title.trim().to_lowercase() == exact_query;
+        let b_exact = !exact_query.is_empty() && b.title.trim().to_lowercase() == exact_query;
+        b_exact
+            .cmp(&a_exact)
+            .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| a.title.cmp(&b.title))
             .then_with(|| a.provider.0.cmp(&b.provider.0))
             .then_with(|| a.id.0.cmp(&b.id.0))

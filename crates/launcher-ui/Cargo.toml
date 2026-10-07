@@ -8,6 +8,10 @@ license.workspace = true
 gpui.workspace = true
 launcher-core = { path = "../launcher-core" }
 anyhow.workspace = true
+tracing.workspace = true
 async-channel.workspace = true
 serde_json.workspace = true
 unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

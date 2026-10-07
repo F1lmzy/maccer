@@ -982,6 +982,46 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
+    fn resize_centered(&mut self, size: Size<Pixels>) -> anyhow::Result<()> {
+        // AppKit may synchronously reenter GPUI via move/resize callbacks.
+        // Copy the handle and release the window mutex before touching AppKit.
+        let (native_window, executor) = {
+            let state = self.0.lock();
+            (state.native_window, state.executor.clone())
+        };
+        executor.spawn(async move {
+            unsafe {
+                let mut screen = NSWindow::screen(native_window);
+                if screen == nil {
+                    screen = NSScreen::mainScreen(nil);
+                }
+                if screen == nil {
+                    return;
+                }
+                let screen_frame = NSScreen::frame(screen);
+                let content = NSRect::new(NSPoint::new(0., 0.), NSSize::new(
+                    size.width.0 as f64, size.height.0 as f64,
+                ));
+                let mut frame = native_window.frameRectForContentRect_(content);
+                // Use Cocoa's own screen coordinates, including negative monitor
+                // origins. This avoids mixing GPUI's top-left and Cocoa's bottom-left.
+                frame.origin.x = screen_frame.origin.x + (screen_frame.size.width - frame.size.width) / 2.;
+                frame.origin.y = screen_frame.origin.y + (screen_frame.size.height - frame.size.height) / 2.;
+                let current = NSWindow::frame(native_window);
+                if (current.origin.x - frame.origin.x).abs() > 0.01
+                    || (current.origin.y - frame.origin.y).abs() > 0.01
+                    || (current.size.width - frame.size.width).abs() > 0.01
+                    || (current.size.height - frame.size.height).abs() > 0.01
+                {
+                    // Position and size change together, without an intermediate
+                    // frame anchored on the old left edge.
+                    native_window.setFrame_display_(frame, YES);
+                }
+            }
+        }).detach();
+        Ok(())
+    }
+
     fn merge_all_windows(&self) {
         let native_window = self.0.lock().native_window;
         unsafe extern "C" fn merge_windows_async(context: *mut std::ffi::c_void) {

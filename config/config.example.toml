@@ -1,7 +1,8 @@
 [launcher]
 hotkey = "alt-space"
-width = 680
-max_results = 8
+width = 480
+# Keep up to 50 results; the window shows six rows at a time.
+max_results = 50
 
 [providers.apps]
 enabled = true
@@ -16,6 +17,43 @@ prefix = "="
 priority = 90
 default_search = false
 max_results = 1
+
+[providers.files]
+enabled = true
+prefix = "/"
+priority = 80
+default_search = false
+max_results = 50
+
+# Requires fd: brew install fd. Files and folders are indexed in the background.
+# fd respects .gitignore/.ignore/.fdignore and skips hidden entries by default.
+# roots is accepted as an alias for search_dirs. No built-in folder boosts apply.
+[files]
+search_dirs = ["~"]
+exclude_paths = []
+# Regular expressions, matching full absolute paths, as in Elephant Files.
+ignored_dirs = []
+# Example: ignored_dirs = ["/Library/(Caches|Logs)/", "/Documents/Private/"]
+# Disable previews for sensitive directories without hiding their search results.
+ignore_previews = []
+# Live updates after debounced filesystem changes. Unlike Elephant's default,
+# maccer enables watching. Set false and use the Refresh File Index action instead.
+watch = true
+
+[providers.shell]
+enabled = true
+prefix = ">"
+priority = 70
+# Shell never participates in mixed search, even if this is set to true.
+default_search = false
+max_results = 10
+
+# Commands run only after an explicit selection and confirmation. Execution uses
+# /bin/sh in your home directory, with a 30s deadline and 64 KiB per output stream.
+[[shell.commands]]
+name = "Show working directory"
+keywords = ["cwd", "pwd"]
+command = "pwd"
 
 [providers.web]
 enabled = true
