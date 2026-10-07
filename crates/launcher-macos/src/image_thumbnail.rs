@@ -64,6 +64,7 @@ unsafe extern "C" {
         index: usize,
         options: CFTypeRef,
     ) -> CFTypeRef;
+    fn CGImageSourceCreateWithData(data: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceCreateWithURL(url: CFURLRef, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceCreateThumbnailAtIndex(
         source: CFTypeRef,
@@ -80,23 +81,27 @@ unsafe extern "C" {
     fn CGImageDestinationFinalize(destination: CFTypeRef) -> bool;
 }
 
-pub(crate) fn thumbnail(path: &Path, token: &CancellationToken) -> Result<Vec<u8>> {
-    static DECODERS: DecodeSlots = DecodeSlots(AtomicUsize::new(0));
-    let _permit = DECODERS.acquire(token)?;
-    let url = CFURL::from_path(path, false).context("creating preview file URL")?;
+const PREVIEW_MAX_PIXEL_SIZE: i32 = 800;
+const PREVIEW_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ICON_MAX_PIXEL_SIZE: i32 = 64;
+const ICON_MAX_BYTES: usize = 256 * 1024;
+
+/// Decodes one image from `source` and re-encodes it as a PNG thumbnail.
+///
+/// # Safety
+///
+/// `source` must be a live `CGImageSource` object.
+unsafe fn png_thumbnail(
+    source: &CFType,
+    token: &CancellationToken,
+    max_pixel_size: i32,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     // SAFETY: all native objects below follow CF create/get ownership rules,
     // remain alive through their calls, and are released by their Rust wrappers.
     // ImageIO functions are used on this worker only, never across an await.
     unsafe {
         let key = |value| CFString::wrap_under_get_rule(value);
-        let source_options = CFDictionary::from_CFType_pairs(&[(
-            key(kCGImageSourceShouldCache),
-            CFBoolean::false_value().as_CFType(),
-        )]);
-        let source_ref =
-            CGImageSourceCreateWithURL(url.as_concrete_TypeRef(), source_options.as_CFTypeRef());
-        ensure!(!source_ref.is_null(), "unsupported image preview");
-        let source = CFType::wrap_under_create_rule(source_ref);
         let properties_ref =
             CGImageSourceCopyPropertiesAtIndex(source.as_CFTypeRef(), 0, ptr::null());
         ensure!(!properties_ref.is_null(), "reading image dimensions failed");
@@ -104,7 +109,7 @@ pub(crate) fn thumbnail(path: &Path, token: &CancellationToken) -> Result<Vec<u8
             CFDictionary::<CFString, CFType>::wrap_under_create_rule(properties_ref.cast());
         let dimension = |name| {
             properties
-                .find(&key(name))
+                .find(key(name))
                 .and_then(|value| value.downcast::<CFNumber>())
                 .and_then(|value| value.to_i64())
         };
@@ -130,7 +135,7 @@ pub(crate) fn thumbnail(path: &Path, token: &CancellationToken) -> Result<Vec<u8
             ),
             (
                 key(kCGImageSourceThumbnailMaxPixelSize),
-                CFNumber::from(800i32).as_CFType(),
+                CFNumber::from(max_pixel_size).as_CFType(),
             ),
         ]);
         let image_ref =
@@ -160,8 +165,50 @@ pub(crate) fn thumbnail(path: &Path, token: &CancellationToken) -> Result<Vec<u8
             "encoding thumbnail failed"
         );
         ensure!(!token.is_cancelled(), "preview cancelled");
-        ensure!(data.len() <= 4 * 1024 * 1024, "oversized preview thumbnail");
+        ensure!(
+            data.len() as usize <= max_bytes,
+            "oversized preview thumbnail"
+        );
         Ok(data.bytes().to_vec())
+    }
+}
+
+pub(crate) fn thumbnail(path: &Path, token: &CancellationToken) -> Result<Vec<u8>> {
+    static DECODERS: DecodeSlots = DecodeSlots(AtomicUsize::new(0));
+    let _permit = DECODERS.acquire(token)?;
+    let url = CFURL::from_path(path, false).context("creating preview file URL")?;
+    // SAFETY: native objects follow CF create/get ownership rules and stay alive
+    // through their calls; ImageIO runs on this worker thread only.
+    unsafe {
+        let key = |value| CFString::wrap_under_get_rule(value);
+        let source_options = CFDictionary::from_CFType_pairs(&[(
+            key(kCGImageSourceShouldCache),
+            CFBoolean::false_value().as_CFType(),
+        )]);
+        let source_ref =
+            CGImageSourceCreateWithURL(url.as_concrete_TypeRef(), source_options.as_CFTypeRef());
+        ensure!(!source_ref.is_null(), "unsupported image preview");
+        let source = CFType::wrap_under_create_rule(source_ref);
+        png_thumbnail(&source, token, PREVIEW_MAX_PIXEL_SIZE, PREVIEW_MAX_BYTES)
+    }
+}
+
+/// Renders in-memory image data (for example an `NSImage` TIFF representation)
+/// as a PNG icon no larger than 64x64.
+pub(crate) fn icon_thumbnail(image_data: &[u8]) -> Result<Vec<u8>> {
+    let data = CFData::from_buffer(image_data);
+    // SAFETY: `data` owns a valid CFData; the created source is released by
+    // `source`; ImageIO runs on this thread only.
+    unsafe {
+        let source_ref = CGImageSourceCreateWithData(data.as_CFTypeRef(), ptr::null());
+        ensure!(!source_ref.is_null(), "unsupported icon image");
+        let source = CFType::wrap_under_create_rule(source_ref);
+        png_thumbnail(
+            &source,
+            &CancellationToken::default(),
+            ICON_MAX_PIXEL_SIZE,
+            ICON_MAX_BYTES,
+        )
     }
 }
 

@@ -5,11 +5,17 @@ use launcher_core::{
 };
 use launcher_macos::{Application, Platform};
 use nucleo_matcher::{
-    Config, Matcher,
+    Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde_json::json;
 use std::sync::Arc;
+
+struct SearchableApplication {
+    item: Item,
+    haystack: Utf32String,
+    exact_title: String,
+}
 
 const ID: &str = "apps";
 const OPEN: &str = "open";
@@ -18,13 +24,29 @@ const REVEAL: &str = "reveal";
 pub struct ApplicationProvider {
     applications: Vec<Application>,
     platform: Arc<dyn Platform>,
+    index: Vec<SearchableApplication>,
 }
 
 impl ApplicationProvider {
     pub fn new(applications: Vec<Application>, platform: Arc<dyn Platform>) -> Self {
+        let index = applications
+            .iter()
+            .map(|app| {
+                let item = Self::item(app);
+                let haystack =
+                    Utf32String::from(format!("{} {}", item.title, item.keywords.join(" ")));
+                let exact_title = item.title.trim().to_lowercase();
+                SearchableApplication {
+                    item,
+                    haystack,
+                    exact_title,
+                }
+            })
+            .collect();
         Self {
             applications,
             platform,
+            index,
         }
     }
 
@@ -47,11 +69,8 @@ impl ApplicationProvider {
             title: app.display_name.clone(),
             subtitle: Some("Application".into()),
             keywords,
-            // .icns is metadata, not a GPUI image. Leave rendering to a later icon-loader slice.
-            icon: app
-                .icon_path
-                .as_ref()
-                .map(|_| IconDescriptor::Text("Application".into())),
+            // The UI loads and caches icons independently of search completion.
+            icon: Some(IconDescriptor::ApplicationBundle(app.path.clone())),
             score: 0.0,
             payload: json!({"path": app.path}),
         }
@@ -89,36 +108,35 @@ impl Provider for ApplicationProvider {
         let pattern = Pattern::parse(&query.text, CaseMatching::Ignore, Normalization::Smart);
         let mut matcher = Matcher::new(Config::DEFAULT);
         let mut scored = Vec::new();
-        for app in &self.applications {
+        for app in &self.index {
             if ctx.cancellation.is_cancelled() {
                 return Ok(Vec::new());
             }
-            let item = Self::item(app);
-            let haystack = format!("{} {}", item.title, item.keywords.join(" "));
-            let mut chars = Vec::new();
-            if let Some(score) = pattern.score(
-                nucleo_matcher::Utf32Str::new(&haystack, &mut chars),
-                &mut matcher,
-            ) {
-                let mut item = item;
-                item.score = f64::from(score);
-                scored.push(item);
+            if let Some(score) = pattern.score(app.haystack.slice(..), &mut matcher) {
+                scored.push((app, score));
             }
         }
         // Keep exact names before truncation; the coordinator cannot recover
         // an application discarded by this provider's result limit.
         let exact_query = query.text.trim().to_lowercase();
-        scored.sort_by(|a, b| {
-            let a_exact = !exact_query.is_empty() && a.title.trim().to_lowercase() == exact_query;
-            let b_exact = !exact_query.is_empty() && b.title.trim().to_lowercase() == exact_query;
+        scored.sort_by(|(a, a_score), (b, b_score)| {
+            let a_exact = !exact_query.is_empty() && a.exact_title == exact_query;
+            let b_exact = !exact_query.is_empty() && b.exact_title == exact_query;
             b_exact
                 .cmp(&a_exact)
-                .then_with(|| b.score.total_cmp(&a.score))
-                .then_with(|| a.title.cmp(&b.title))
-                .then_with(|| a.id.0.cmp(&b.id.0))
+                .then_with(|| b_score.cmp(a_score))
+                .then_with(|| a.item.title.cmp(&b.item.title))
+                .then_with(|| a.item.id.0.cmp(&b.item.id.0))
         });
-        scored.truncate(ctx.limit);
-        Ok(scored)
+        Ok(scored
+            .into_iter()
+            .take(ctx.limit)
+            .map(|(app, score)| {
+                let mut item = app.item.clone();
+                item.score = f64::from(score);
+                item
+            })
+            .collect())
     }
 
     fn actions(&self, item: &Item) -> Vec<Action> {
@@ -190,6 +208,40 @@ mod tests {
             limit,
         }
     }
+    #[test]
+    fn search_returns_lazy_bundle_icons_without_icon_file_metadata() {
+        let mut finder = app("Finder", "com.apple.finder");
+        finder.path = "/System/Library/CoreServices/Finder.app".into();
+        let p = ApplicationProvider::new(vec![finder], Arc::new(FakePlatform::default()));
+        let first = p.search(&SearchQuery::default(), &ctx(1)).unwrap();
+        let second = p.search(&SearchQuery::default(), &ctx(1)).unwrap();
+        let Some(IconDescriptor::ApplicationBundle(path)) = &first[0].icon else {
+            panic!("search must return a bundle descriptor, not decode an icon");
+        };
+        assert_eq!(path, Path::new("/System/Library/CoreServices/Finder.app"));
+        assert!(
+            matches!(&second[0].icon, Some(IconDescriptor::ApplicationBundle(cached)) if cached == path)
+        );
+        let encoded = serde_json::to_vec(&first[0]).unwrap();
+        let decoded: Item = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            matches!(&decoded.icon, Some(IconDescriptor::ApplicationBundle(decoded)) if decoded == path)
+        );
+    }
+
+    #[test]
+    fn missing_icon_does_not_remove_application_results() {
+        let p = ApplicationProvider::new(
+            vec![app("Missing", "dev.maccer.missing")],
+            Arc::new(FakePlatform::default()),
+        );
+        let found = p.search(&SearchQuery::default(), &ctx(1)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(
+            matches!(&found[0].icon, Some(IconDescriptor::ApplicationBundle(path)) if path == Path::new("/Applications/Missing.app"))
+        );
+    }
+
     #[test]
     fn finds_by_name_bundle_and_executable_and_limits_after_ranking() {
         let p = ApplicationProvider::new(

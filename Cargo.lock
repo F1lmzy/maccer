@@ -3245,6 +3245,7 @@ dependencies = [
  "async-channel 2.5.0",
  "gpui",
  "launcher-core",
+ "launcher-macos",
  "serde_json",
  "tracing",
  "unicode-segmentation",

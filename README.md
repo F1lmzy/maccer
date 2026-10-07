@@ -34,6 +34,19 @@ Configuration is read from `~/.config/maccer/config.toml`. Start from [`config/c
 
 Usage history is stored at `~/Library/Application Support/maccer/history.sqlite3`. maccer records an activation only after the action succeeds; each record includes the query text, the provider and item identifiers, the action, and a timestamp. Ranking uses per-item activation counts plus a bounded recency bonus. The database never leaves the machine; delete the file to clear history. Set `RUST_LOG=debug` for diagnostics. Hotkey conflicts are reported to stderr; change `[launcher].hotkey` and rerun.
 
+### Application search and icons
+
+Application metadata and fuzzy-match strings are indexed once at startup. Each query matches in memory and clones only the ranked results; it does no filesystem access or native icon extraction.
+
+Results carry `IconDescriptor::ApplicationBundle` paths. The GUI displays results immediately with placeholders, then resolves Finder icons on a single background worker, choosing the next icon from the current ranked results after each load. Images and failed lookups are cached until restart. PNGs are at most 64 pixels per side and 256 KiB; asset-catalog icons and `.icns` resources are supported. Icon loading never delays search completion.
+
+See [application-search measurements and upstream comparisons](docs/application-search.md). To measure discovery, cold/warm matching, and coordinator result delivery without opening a window:
+
+```sh
+cargo run -p launcher --example app_search_bench -- safari
+cargo run -p launcher --example app_search_bench -- a
+```
+
 ### File search
 
 The files provider follows [Elephant Files](https://github.com/abenz1267/elephant/tree/master/internal/providers/files), using `fd` to discover files and folders in the background. It searches full paths, so project/directory names work as well as filenames. Files appear only with the `/` prefix; ordinary searches and the empty launcher view do not include files, even if an older configuration enables `default_search` for files. Type `/` alone to browse recent files. `/ ~/Documents rpt pdf` narrows a query to an existing indexed directory. Configured roots default to your home directory.
@@ -65,7 +78,7 @@ Shell command text and activations are excluded from SQLite history. The launche
 Included:
 
 - Resident floating launcher window and global hotkey.
-- Application discovery, open, and reveal in Finder (via NSWorkspace).
+- Application discovery, native icons, open, and reveal in Finder (via NSWorkspace).
 - Fuzzy application/file search, calculator, and configurable web search providers.
 - fd-indexed file/folder discovery, live updates, text/image/PDF previews, native file/path copying and external dragging.
 - Explicit shell execution, named custom commands, bounded output and cancellation.
@@ -76,7 +89,6 @@ Included:
 Not included yet:
 
 - Clipboard history and emoji/symbols.
-- Application icon rendering.
 - Login item, menu bar item, settings GUI.
 - Multi-monitor placement and theme reload.
 - Plugin protocol, accessibility review, code signing/notarization, automatic updates.

@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use gpui::{
@@ -74,6 +78,11 @@ pub struct Launcher {
     preview_scroll: ScrollHandle,
     preview_enabled: bool,
     drag_start: Option<(Item, gpui::Point<gpui::Pixels>)>,
+    icon_cache: HashMap<PathBuf, Arc<gpui::Image>>,
+    icon_failed: HashSet<PathBuf>,
+    /// The one bundle whose native icon is currently being resolved. At most
+    /// one load runs at a time so keystrokes cannot stack overlapping decodes.
+    icon_loading: Option<PathBuf>,
 }
 
 pub fn open_launcher(
@@ -144,6 +153,9 @@ pub fn open_launcher(
                     preview_scroll: ScrollHandle::new(),
                     preview_enabled: true,
                     drag_start: None,
+                    icon_cache: HashMap::new(),
+                    icon_failed: HashSet::new(),
+                    icon_loading: None,
                 });
                 let refresh = launcher.downgrade();
                 let mut revisions: Vec<(String, u64)> = Vec::new();
@@ -253,6 +265,8 @@ impl Launcher {
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.state.screen = None;
         self.clear_preview(cx);
+        // An in-flight icon load is left to finish and be cached; scheduling the
+        // next one is gated on the launcher being visible again.
         self.drag_start = None;
         self.output = None;
         self.was_active = false;
@@ -549,6 +563,7 @@ impl Launcher {
                         if this.state.screen != Some(Screen::Actions) {
                             this.refresh_actions();
                         }
+                        this.schedule_icon_loads(cx);
                         this.keep_selection_visible();
                         cx.notify();
                     }
@@ -559,6 +574,63 @@ impl Launcher {
             }
         })
         .detach();
+    }
+
+    /// Starts at most one background icon load at a time. When it finishes, the
+    /// next highest-ranked uncached bundle is chosen from the *current* results,
+    /// so a stale queue cannot starve what is on screen. Hiding the launcher
+    /// gates new loads without discarding the in-flight result.
+    fn schedule_icon_loads(&mut self, cx: &mut Context<Self>) {
+        if self.state.screen.is_none() {
+            return;
+        }
+        let Some(path) = self.next_icon_to_load() else {
+            return;
+        };
+        self.icon_loading = Some(path.clone());
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let load_path = path.clone();
+            // Native decode and PNG hashing both run off the UI thread.
+            let image = cx
+                .background_executor()
+                .spawn(async move {
+                    launcher_macos::application_icon(&load_path)
+                        .map(|png| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.icon_loading = None;
+                match image {
+                    Some(image) => {
+                        this.icon_cache.insert(path, image);
+                    }
+                    None => {
+                        this.icon_failed.insert(path);
+                    }
+                }
+                cx.notify();
+                this.schedule_icon_loads(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Highest-ranked bundle in the current results that still needs an icon and
+    /// that no in-flight load already covers.
+    fn next_icon_to_load(&self) -> Option<PathBuf> {
+        if self.icon_loading.is_some() {
+            return None;
+        }
+        self.state.items.iter().find_map(|item| {
+            let Some(launcher_core::IconDescriptor::ApplicationBundle(path)) = &item.icon else {
+                return None;
+            };
+            if self.icon_cache.contains_key(path) || self.icon_failed.contains(path) {
+                return None;
+            }
+            Some(path.clone())
+        })
     }
 
     fn refresh_actions(&mut self) {
@@ -605,7 +677,11 @@ impl Launcher {
         let error_height = if self.error.is_some()
             && self.state.screen == Some(Screen::Search)
             && !self.state.items.is_empty()
-        { 24. } else { 0. };
+        {
+            24.
+        } else {
+            0.
+        };
         let height = if self.state.screen == Some(Screen::Output) {
             364.
         } else if row_count == 0 {
@@ -1011,6 +1087,16 @@ impl Render for Launcher {
                 let row_theme = theme.clone();
                 let selected_for_rows = selected.clone();
                 let rows_view = cx.entity().downgrade();
+                // Resolved bundle icons are cloned as cheap `Arc`s; rendering must
+                // not re-encode PNG bytes for every frame.
+                let mut icon_images: HashMap<PathBuf, Arc<gpui::Image>> = HashMap::new();
+                for item in &items {
+                    if let Some(launcher_core::IconDescriptor::ApplicationBundle(path)) = &item.icon
+                        && let Some(image) = self.icon_cache.get(path)
+                    {
+                        icon_images.insert(path.clone(), image.clone());
+                    }
+                }
                 let list = uniform_list("launcher-results", items.len(), move |range, _, _| {
                     range
                         .map(|index| {
@@ -1020,10 +1106,16 @@ impl Render for Launcher {
                                 .is_some_and(|(p, id)| p == &item.provider.0 && id == &item.id.0);
                             let view = rows_view.clone();
                             let item_for_click = item.clone();
+                            let image = match &item.icon {
+                                Some(launcher_core::IconDescriptor::ApplicationBundle(path)) => {
+                                    icon_images.get(path).cloned()
+                                }
+                                _ => None,
+                            };
                             div()
                                 .w_full()
                                 .px_2()
-                                .child(result_row(item, is_selected, &row_theme).h_full())
+                                .child(result_row(item, is_selected, &row_theme, image).h_full())
                                 .h(px(ROW_HEIGHT))
                                 .id(("result-row", index))
                                 .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
@@ -1086,11 +1178,48 @@ impl Render for Launcher {
     }
 }
 
-fn result_row(item: &Item, selected: bool, theme: &crate::theme::Theme) -> gpui::Div {
+fn result_row(
+    item: &Item,
+    selected: bool,
+    theme: &crate::theme::Theme,
+    image: Option<Arc<gpui::Image>>,
+) -> gpui::Div {
     let secondary = item
         .subtitle
         .clone()
         .unwrap_or_else(|| item.provider.0.clone());
+    let icon = if let Some(image) = image {
+        Some(
+            gpui::img(image)
+                .size(px(28.))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+        )
+    } else {
+        match &item.icon {
+            Some(launcher_core::IconDescriptor::Png(png)) => Some(
+                gpui::img(Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    png.to_vec(),
+                )))
+                .size(px(28.))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            ),
+            _ if item.provider.0 == "apps" => Some(div().child("□").into_any_element()),
+            _ => None,
+        }
+    };
+    let icon_slot = icon.map(|icon| {
+        div()
+            .debug_selector(|| format!("suggestion-icon-{}", item.id.0))
+            .size(px(28.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon)
+    });
     div()
         .debug_selector(|| format!("suggestion-{}", item.id.0))
         .w_full()
@@ -1109,31 +1238,40 @@ fn result_row(item: &Item, selected: bool, theme: &crate::theme::Theme) -> gpui:
             theme.background
         })
         .flex()
-        .flex_col()
-        .justify_center()
-        .gap(px(2.))
+        .items_center()
+        .gap(px(8.))
+        .children(icon_slot)
         .child(
             div()
-                .debug_selector(|| format!("suggestion-title-{}", item.id.0))
-                .text_size(px(14.))
-                .line_height(px(18.))
-                .flex_shrink_0()
-                .truncate()
-                .child(item.title.clone()),
-        )
-        .child(
-            div()
-                .debug_selector(|| format!("suggestion-type-{}", item.id.0))
-                .text_size(px(11.))
-                .line_height(px(14.))
-                .flex_shrink_0()
-                .truncate()
-                .text_color(if selected {
-                    theme.selected_muted
-                } else {
-                    theme.muted
-                })
-                .child(secondary),
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .debug_selector(|| format!("suggestion-title-{}", item.id.0))
+                        .text_size(px(14.))
+                        .line_height(px(18.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .child(item.title.clone()),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| format!("suggestion-type-{}", item.id.0))
+                        .text_size(px(11.))
+                        .line_height(px(14.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_color(if selected {
+                            theme.selected_muted
+                        } else {
+                            theme.muted
+                        })
+                        .child(secondary),
+                ),
         )
 }
 
@@ -1202,17 +1340,27 @@ mod tests {
                     .update(cx, |launcher, window, _| {
                         launcher.options.width = 480.;
                         launcher.state.screen = Some(Screen::Search);
-                        launcher.state.items =
-                            (0..count)
-                                .map(|i| {
-                                    Item {
-                    id: ItemId(i.to_string()), provider: ProviderId("apps".into()),
-                    title: "Alacritty Terminal — Résumé gypj with a long application name".into(),
-                    subtitle: Some("Application — gypj".into()), keywords: vec![], icon: None,
-                    score: 0., payload: serde_json::Value::Null,
-                }
-                                })
-                                .collect();
+                        launcher.state.items = (0..count)
+                            .map(|i| Item {
+                                id: ItemId(i.to_string()),
+                                provider: ProviderId("apps".into()),
+                                title:
+                                    "Alacritty Terminal — Résumé gypj with a long application name"
+                                        .into(),
+                                subtitle: Some("Application — gypj".into()),
+                                keywords: vec![],
+                                icon: (i == 0).then(|| {
+                                    launcher_core::IconDescriptor::Png(Arc::from(
+                                        include_bytes!(
+                                            "../../launcher-macos/tests/fixtures/pixel.png"
+                                        )
+                                        .as_slice(),
+                                    ))
+                                }),
+                                score: 0.,
+                                payload: serde_json::Value::Null,
+                            })
+                            .collect();
                         launcher.state.selection.reconcile(&launcher.state.items);
                         launcher.resize_window(window);
                     })
@@ -1231,6 +1379,19 @@ mod tests {
             );
             let container = visual.debug_bounds("launcher-container").unwrap();
             let first = visual.debug_bounds("suggestion-0").unwrap();
+            let icon = visual
+                .debug_bounds("suggestion-icon-0")
+                .expect("application icon slot");
+            assert_eq!(icon.size, size(px(28.), px(28.)));
+            assert!(icon.top() >= first.top() && icon.bottom() <= first.bottom());
+            let title = visual.debug_bounds("suggestion-title-0").unwrap();
+            assert!(title.left() >= icon.right() + px(8.));
+            if count > 1 {
+                let fallback = visual
+                    .debug_bounds("suggestion-icon-1")
+                    .expect("missing icon fallback");
+                assert_eq!(fallback.size, icon.size);
+            }
             assert!(
                 (container.size.height - bounds.size.height).abs() <= px(1.),
                 "container should fill window: {container:?}, window: {bounds:?}"
@@ -1265,34 +1426,179 @@ mod tests {
         }
     }
 
+    fn app_bundle_item(id: &str, path: &std::path::Path) -> Item {
+        Item {
+            id: ItemId(id.into()),
+            provider: ProviderId("apps".into()),
+            title: id.into(),
+            subtitle: None,
+            keywords: vec![],
+            icon: Some(launcher_core::IconDescriptor::ApplicationBundle(
+                path.to_path_buf(),
+            )),
+            score: 0.,
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    fn icon_image() -> Arc<gpui::Image> {
+        Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../launcher-macos/tests/fixtures/pixel.png").to_vec(),
+        ))
+    }
+
+    #[gpui::test]
+    fn next_icon_to_load_picks_highest_current_result_and_skips_cached(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
+        let safari = PathBuf::from("/Applications/Safari.app");
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    launcher.state.items = vec![
+                        app_bundle_item("finder", &finder),
+                        app_bundle_item("safari", &safari),
+                    ];
+                    // The highest-ranked uncached bundle wins.
+                    assert_eq!(
+                        launcher.next_icon_to_load().as_deref(),
+                        Some(finder.as_path())
+                    );
+                    // One in-flight load suppresses any further scheduling.
+                    launcher.icon_loading = Some(finder.clone());
+                    assert!(launcher.next_icon_to_load().is_none());
+                    // Once resolved, the next current result is chosen.
+                    launcher.icon_loading = None;
+                    launcher.icon_cache.insert(finder.clone(), icon_image());
+                    assert_eq!(
+                        launcher.next_icon_to_load().as_deref(),
+                        Some(safari.as_path())
+                    );
+                    // Failed bundles are never retried.
+                    launcher.icon_failed.insert(safari.clone());
+                    assert!(launcher.next_icon_to_load().is_none());
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn icon_loads_run_one_at_a_time_and_recompute_from_current_results(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
+        let safari = PathBuf::from("/Applications/Safari.app");
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = vec![app_bundle_item("finder", &finder)];
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
+                    // A second call must not launch a parallel decode.
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
+                    // New results neither cancel nor overlap the running load.
+                    launcher.state.items = vec![app_bundle_item("safari", &safari)];
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
+                    // Simulated completion: the next load is recomputed from the
+                    // current results (Safari), not the stale list.
+                    launcher.icon_loading = None;
+                    launcher.icon_cache.insert(finder.clone(), icon_image());
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.as_deref(), Some(safari.as_path()));
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn hidden_launcher_stops_scheduling_icon_loads(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.state.screen = None;
+                    launcher.state.items = vec![app_bundle_item("finder", &finder)];
+                    launcher.schedule_icon_loads(cx);
+                    assert!(launcher.icon_loading.is_none());
+                })
+                .unwrap()
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn application_bundle_icons_load_and_cache_off_the_search_path(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = vec![app_bundle_item("finder", &finder)];
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert!(launcher.icon_cache.contains_key(&finder));
+                    assert!(launcher.icon_loading.is_none());
+                    assert!(!launcher.icon_failed.contains(&finder));
+                })
+                .unwrap()
+        });
+    }
+
     #[gpui::test]
     fn compact_empty_and_action_screens_fit_the_window(cx: &mut TestAppContext) {
         let window = test_window(cx, ProviderRegistry::new());
         let view = window.root(cx).unwrap();
-        cx.update(|cx| window.update(cx, |launcher, window, _| {
-            launcher.options.width = 480.;
-            launcher.state.screen = Some(Screen::Search);
-            launcher.error = Some("No results".into());
-            launcher.resize_window(window);
-            assert_eq!(window.bounds().size, size(px(480.), px(120.)));
-            launcher.state.screen = Some(Screen::Actions);
-            launcher.actions = (0..12).map(|index| Action {
-                id: ActionId(index.to_string()), title: format!("Action {index}"),
-            }).collect();
-            launcher.state.action_index = 11;
-            launcher.resize_window(window);
-            assert_eq!(window.bounds().size, size(px(480.), px(348.)));
-        }).unwrap());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, _| {
+                    launcher.options.width = 480.;
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.error = Some("No results".into());
+                    launcher.resize_window(window);
+                    assert_eq!(window.bounds().size, size(px(480.), px(120.)));
+                    launcher.state.screen = Some(Screen::Actions);
+                    launcher.actions = (0..12)
+                        .map(|index| Action {
+                            id: ActionId(index.to_string()),
+                            title: format!("Action {index}"),
+                        })
+                        .collect();
+                    launcher.state.action_index = 11;
+                    launcher.resize_window(window);
+                    assert_eq!(window.bounds().size, size(px(480.), px(348.)));
+                })
+                .unwrap()
+        });
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual.simulate_resize(size(px(480.), px(348.)));
-        visual.draw(point(px(0.), px(0.)), size(
-            AvailableSpace::Definite(px(480.)), AvailableSpace::Definite(px(348.)),
-        ), |_, _| view.clone().into_any_element());
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(px(480.)),
+                AvailableSpace::Definite(px(348.)),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
         let container = visual.debug_bounds("launcher-container").unwrap();
         let selected = visual.debug_bounds("action-11").unwrap();
         assert!(selected.top() >= container.top() + px(52.));
         assert!(selected.bottom() <= container.bottom() - px(FOOTER_HEIGHT));
-        assert!(visual.debug_bounds("action-0").is_none(), "earlier actions scroll out of view");
+        assert!(
+            visual.debug_bounds("action-0").is_none(),
+            "earlier actions scroll out of view"
+        );
     }
 
     #[gpui::test]

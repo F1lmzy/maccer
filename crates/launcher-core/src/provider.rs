@@ -19,6 +19,11 @@ pub struct ActionId(pub String);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IconDescriptor {
+    /// Encoded PNG data, shared across result clones. Providers bound its size.
+    Png(Arc<[u8]>),
+    /// Application bundle whose Finder icon the UI resolves lazily, off the
+    /// search path, and caches. Providers never decode it during search.
+    ApplicationBundle(PathBuf),
     File(PathBuf),
     Text(String),
 }
