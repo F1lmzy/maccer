@@ -33,11 +33,16 @@ pub fn preview(path: &Path, token: &CancellationToken) -> Result<Preview> {
                 "File is too large for an inline preview. Use Quick Look.".into(),
             ));
         }
+        #[cfg(target_os = "macos")]
+        if image {
+            let (bgra, width, height) = crate::image_thumbnail::thumbnail_pixels(path, token)?;
+            return Ok(Preview::Pixels {
+                bgra,
+                width,
+                height,
+            });
+        }
         let png = crate::thumbnail_cache::get_or_generate(path, &metadata, token, || {
-            #[cfg(target_os = "macos")]
-            if image {
-                return crate::image_thumbnail::thumbnail(path, token);
-            }
             let dir = tempfile::tempdir()?;
             let output_path;
             let mut command;
@@ -132,10 +137,44 @@ mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_image_and_pdf_thumbnails_are_png() {
+    fn native_image_previews_return_raw_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.png");
+        std::fs::write(&image, include_bytes!("../tests/fixtures/pixel.png")).unwrap();
+        assert!(matches!(
+            preview(&image, &CancellationToken::default()).unwrap(),
+            Preview::Pixels { width: 1, height: 1, bgra } if bgra.len() == 4
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_image_pixels_preserve_row_order_and_alpha_and_pdf_stays_png() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("image with spaces.png");
-        std::fs::write(&image, include_bytes!("../tests/fixtures/pixel.png")).unwrap();
+        std::fs::write(
+            &image,
+            include_bytes!("../tests/fixtures/orientation-alpha.png"),
+        )
+        .unwrap();
+        let Preview::Pixels {
+            bgra,
+            width,
+            height,
+        } = preview(&image, &CancellationToken::default()).unwrap()
+        else {
+            panic!("expected raw pixel image preview");
+        };
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            bgra,
+            [
+                0, 0, 255, 255, // top-left red
+                0, 255, 0, 128, // top-right half-alpha green, unpremultiplied
+                255, 0, 0, 255, // bottom-left blue
+                0, 0, 0, 0, // transparent white has canonical zero color
+            ]
+        );
         let pdf = dir.path().join("document with spaces.pdf");
         let stream = "BT /F1 18 Tf 20 70 Td (maccer preview fixture) Tj ET\n";
         let objects = ["<< /Type /Catalog /Pages 2 0 R >>".into(), "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 120] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(), "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(), format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len())];
@@ -154,13 +193,10 @@ mod tests {
             "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
         ));
         std::fs::write(&pdf, content).unwrap();
-        for path in [image, pdf] {
-            let Preview::Image { png } = preview(&path, &CancellationToken::default()).unwrap()
-            else {
-                panic!("expected image");
-            };
-            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
-        }
+        let Preview::Image { png } = preview(&pdf, &CancellationToken::default()).unwrap() else {
+            panic!("expected PNG-backed PDF thumbnail");
+        };
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
     #[test]
     fn previews_text_with_unicode_and_truncates_large_files() {

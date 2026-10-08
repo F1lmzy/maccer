@@ -96,9 +96,13 @@ pub struct Launcher {
     was_active: bool,
     preview_key: Option<(String, String, u64)>,
     preview: Option<Preview>,
-    preview_image: Option<Arc<gpui::Image>>,
+    preview_image: Option<Arc<gpui::RenderImage>>,
+    preview_images: crate::preview_image::PreviewImageCache,
+    preview_loading_visible: bool,
     preview_cancellation: Option<CancellationToken>,
     preview_started: Option<std::time::Instant>,
+    preview_span: Option<tracing::Span>,
+    preview_applied_at: Option<std::time::Instant>,
     preview_scroll: ScrollHandle,
     preview_enabled: bool,
     drag_start: Option<(Item, gpui::Point<gpui::Pixels>)>,
@@ -184,8 +188,12 @@ pub fn open_launcher(
                     preview_key: None,
                     preview: None,
                     preview_image: None,
+                    preview_images: Default::default(),
+                    preview_loading_visible: false,
                     preview_cancellation: None,
                     preview_started: None,
+                    preview_span: None,
+                    preview_applied_at: None,
                     preview_scroll: ScrollHandle::new(),
                     preview_enabled: true,
                     drag_start: None,
@@ -342,16 +350,18 @@ impl Launcher {
         self.invalidate_activation();
     }
 
-    fn clear_preview(&mut self, cx: &mut Context<Self>) {
+    fn clear_preview(&mut self, _cx: &mut Context<Self>) {
         if let Some(token) = self.preview_cancellation.take() {
             token.cancel();
         }
-        if let Some(image) = self.preview_image.take() {
-            gpui::ImageSource::from(image).remove_asset(cx);
-        }
+        // Keep decoded pixels and uploaded textures for synchronous revisits.
+        self.preview_image = None;
+        self.preview_loading_visible = false;
         self.preview_key = None;
         self.preview = None;
         self.preview_started = None;
+        self.preview_span = None;
+        self.preview_applied_at = None;
         self.preview_scroll.set_offset(Default::default());
     }
     fn has_preview(&self) -> bool {
@@ -403,47 +413,116 @@ impl Launcher {
         }
         self.clear_preview(cx);
         self.preview_key = Some(key.clone());
+        static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request_id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let span = tracing::debug_span!("preview", request_id, provider = %key.0, revision = key.2);
+        self.preview_span = Some(span.clone());
+        let cache_started = std::time::Instant::now();
+        if let Some(image) = self.preview_images.get(&key) {
+            self.preview_image = Some(image);
+            self.preview = Some(Preview::Image { png: vec![] });
+            span.in_scope(|| {
+                tracing::debug!(
+                    stage = "decoded_cache_lookup",
+                    cache_hit = true,
+                    duration_ms = cache_started.elapsed().as_secs_f64() * 1000.,
+                    "preview stage"
+                )
+            });
+            return;
+        }
+        span.in_scope(|| {
+            tracing::debug!(
+                stage = "decoded_cache_lookup",
+                cache_hit = false,
+                duration_ms = cache_started.elapsed().as_secs_f64() * 1000.,
+                "preview stage"
+            )
+        });
         let token = CancellationToken::default();
         self.preview_cancellation = Some(token.clone());
         let started = std::time::Instant::now();
         self.preview_started = Some(started);
-        tracing::debug!(provider = %key.0, revision = key.2, "preview requested");
+        span.in_scope(|| tracing::debug!("preview requested"));
         self.watch_preview_deadline(key.clone(), token.clone(), cx);
+        self.watch_preview_loading(key.clone(), token.clone(), cx);
         let this = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            // A short debounce avoids starting decodes for rows crossed quickly.
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(40))
-                .await;
             if token.is_cancelled() {
                 return;
             }
             let worker_token = token.clone();
-            let result = cx
+            let worker_span = span.clone();
+            let (result, completed_at) = cx
                 .background_executor()
                 .spawn(async move {
-                    tracing::debug!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "preview worker started"
-                    );
-                    let result = provider.preview(&item, &worker_token);
-                    tracing::debug!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        success = result.is_ok(),
-                        "preview worker completed"
-                    );
-                    result
+                    worker_span.in_scope(|| {
+                        tracing::debug!(
+                            stage = "worker_queue_wait",
+                            duration_ms = started.elapsed().as_secs_f64() * 1000.,
+                            "preview stage"
+                        );
+                        let provider_started = std::time::Instant::now();
+                        let preview = provider.preview(&item, &worker_token);
+                        tracing::debug!(
+                            stage = "provider_preview",
+                            duration_ms = provider_started.elapsed().as_secs_f64() * 1000.,
+                            success = preview.is_ok(),
+                            "preview stage"
+                        );
+                        let result = preview.and_then(|preview| {
+                            preview
+                                .map(crate::preview_image::PreparedPreview::new)
+                                .transpose()
+                        });
+                        tracing::debug!(
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+                            success = result.is_ok(),
+                            "preview worker completed"
+                        );
+                        (result, std::time::Instant::now())
+                    })
                 })
                 .await;
             if token.is_cancelled() {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                this.apply_preview(&key, result, cx);
+                span.in_scope(|| {
+                    tracing::debug!(
+                        stage = "ui_dispatch_wait",
+                        duration_ms = completed_at.elapsed().as_secs_f64() * 1000.,
+                        "preview stage"
+                    );
+                    this.apply_prepared_preview(&key, result, cx);
+                });
             });
         })
         .detach();
     }
+    fn watch_preview_loading(
+        &self,
+        key: crate::preview_image::PreviewKey,
+        token: CancellationToken,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !token.is_cancelled()
+                    && this.preview_key.as_ref() == Some(&key)
+                    && this.preview.is_none()
+                {
+                    this.preview_loading_visible = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn watch_preview_deadline(
         &self,
         key: (String, String, u64),
@@ -483,26 +562,49 @@ impl Launcher {
         result: Result<Option<Preview>>,
         cx: &mut Context<Self>,
     ) {
+        let prepared = result.and_then(|preview| {
+            preview
+                .map(crate::preview_image::PreparedPreview::new)
+                .transpose()
+        });
+        self.apply_prepared_preview(key, prepared, cx);
+    }
+
+    fn apply_prepared_preview(
+        &mut self,
+        key: &crate::preview_image::PreviewKey,
+        result: Result<Option<crate::preview_image::PreparedPreview>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.preview_key.as_ref() != Some(key) {
             return;
         }
-        tracing::debug!(
-            elapsed_ms = self
-                .preview_started
-                .map(|start| start.elapsed().as_millis() as u64),
-            "preview applied to UI"
-        );
+        let applied_at = std::time::Instant::now();
+        let span = self
+            .preview_span
+            .clone()
+            .unwrap_or_else(tracing::Span::none);
+        let _entered = span.enter();
         self.preview = match result {
-            Ok(Some(Preview::Image { png })) => {
-                self.preview_image = Some(Arc::new(gpui::Image::from_bytes(
-                    gpui::ImageFormat::Png,
-                    png,
-                )));
-                Some(Preview::Image { png: vec![] })
+            Ok(Some(prepared)) => {
+                if let Some(image) = prepared.image {
+                    self.preview_images.insert(key.clone(), image.clone());
+                    self.preview_image = Some(image);
+                }
+                Some(prepared.preview)
             }
-            Ok(preview) => preview.or_else(|| Some(Preview::Info("No preview available".into()))),
+            Ok(None) => Some(Preview::Info("No preview available".into())),
             Err(error) => Some(Preview::Info(format!("Preview unavailable: {error}"))),
         };
+        self.preview_applied_at = Some(std::time::Instant::now());
+        tracing::debug!(
+            stage = "ui_apply",
+            duration_ms = applied_at.elapsed().as_secs_f64() * 1000.,
+            elapsed_ms = self
+                .preview_started
+                .map(|start| start.elapsed().as_secs_f64() * 1000.),
+            "preview stage"
+        );
         cx.notify();
     }
     fn preview_panel(&self, height: f32) -> gpui::Stateful<gpui::Div> {
@@ -530,7 +632,7 @@ impl Launcher {
                     );
                 }
             }
-            Some(Preview::Image { .. }) => {
+            Some(Preview::Image { .. } | Preview::Pixels { .. }) => {
                 if let Some(image) = &self.preview_image {
                     panel = panel.child(
                         gpui::img(image.clone())
@@ -543,9 +645,10 @@ impl Launcher {
             Some(Preview::Info(message)) => {
                 panel = panel.child(message.clone());
             }
-            None => {
+            None if self.preview_loading_visible => {
                 panel = panel.child("Loading preview…");
             }
+            None => {}
         }
         panel
     }
@@ -1068,13 +1171,27 @@ impl Focusable for Launcher {
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_preview(cx);
-        if self.preview.is_some() {
-            if let Some(started) = self.preview_started.take() {
+        for image in self.preview_images.take_evicted() {
+            cx.drop_image(image, Some(window));
+        }
+        if self.preview.is_some()
+            && let Some(started) = self.preview_started.take()
+        {
+            let span = self
+                .preview_span
+                .clone()
+                .unwrap_or_else(tracing::Span::none);
+            span.in_scope(|| {
                 tracing::debug!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "preview ready frame rendered"
-                );
-            }
+                    stage = "ui_render_wait",
+                    duration_ms = self
+                        .preview_applied_at
+                        .take()
+                        .map(|applied| applied.elapsed().as_secs_f64() * 1000.),
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+                    "preview render callback reached"
+                )
+            });
         }
         self.resize_window(window);
         let theme = theme();
@@ -1999,6 +2116,194 @@ mod tests {
             visual.debug_bounds("action-0").is_none(),
             "earlier actions scroll out of view"
         );
+    }
+
+    struct FastPreviewProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        revision: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Provider for FastPreviewProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId("fast-preview".into())
+        }
+        fn name(&self) -> &str {
+            "Fast preview"
+        }
+        fn revision(&self) -> u64 {
+            self.revision.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+            Ok(vec![])
+        }
+        fn supports_preview(&self, _: &Item) -> bool {
+            true
+        }
+        fn preview(&self, _: &Item, _: &CancellationToken) -> Result<Option<Preview>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(Preview::Image {
+                png: include_bytes!("../../launcher-macos/tests/fixtures/pixel.png").to_vec(),
+            }))
+        }
+        fn actions(&self, _: &Item) -> Vec<Action> {
+            vec![]
+        }
+        fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+            anyhow::bail!("no test actions")
+        }
+    }
+
+    #[gpui::test]
+    fn fast_previews_do_not_flash_loading_and_stale_timers_do_not_change_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let key = ("files".into(), "slow".into(), 0);
+        let token = CancellationToken::default();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    // Isolate timer behavior from render's selected-provider lookup.
+                    launcher.state.searching = true;
+                    launcher.preview_key = Some(key.clone());
+                    launcher.watch_preview_loading(key.clone(), token.clone(), cx);
+                    assert!(!launcher.preview_loading_visible);
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(149));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert!(!launcher.preview_loading_visible)
+                })
+                .unwrap()
+        });
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    assert!(
+                        launcher.preview_loading_visible,
+                        "slow previews still explain loading"
+                    );
+                    launcher.clear_preview(cx);
+                    launcher.preview_key = Some(key.clone());
+                    launcher.watch_preview_loading(key.clone(), CancellationToken::default(), cx);
+                    launcher.apply_preview(
+                        &key,
+                        Ok(Some(Preview::Image {
+                            png: include_bytes!("../../launcher-macos/tests/fixtures/pixel.png")
+                                .to_vec(),
+                        })),
+                        cx,
+                    );
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    assert!(
+                        !launcher.preview_loading_visible,
+                        "ready images must not show a loading label"
+                    );
+                    launcher.clear_preview(cx);
+                    launcher.preview_key = Some(key.clone());
+                    let stale = CancellationToken::default();
+                    launcher.watch_preview_loading(key, stale.clone(), cx);
+                    stale.cancel();
+                    launcher.preview_key = Some(("files".into(), "new".into(), 1));
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert!(!launcher.preview_loading_visible)
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn image_preview_starts_without_debounce_and_revisit_is_synchronous(cx: &mut TestAppContext) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                Arc::new(FastPreviewProvider {
+                    calls: calls.clone(),
+                    revision: revision.clone(),
+                }),
+                launcher_core::ProviderConfig::default(),
+            )
+            .unwrap();
+        let window = test_window(cx, registry);
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    let mut item = app_bundle_item("image", std::path::Path::new("/unused"));
+                    item.provider = ProviderId("fast-preview".into());
+                    item.icon = None;
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.state.items = vec![item];
+                    launcher.state.selection.reconcile(&launcher.state.items);
+                    launcher.refresh_preview(cx);
+                })
+                .unwrap()
+        });
+        // A ready fake decode must complete without advancing the 40ms clock.
+        cx.run_until_parked();
+        let first = cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+                    launcher
+                        .preview_image
+                        .clone()
+                        .expect("image ready without debounce")
+                })
+                .unwrap()
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.clear_preview(cx);
+                    launcher.refresh_preview(cx);
+                    assert!(Arc::ptr_eq(
+                        launcher
+                            .preview_image
+                            .as_ref()
+                            .expect("synchronous cache hit"),
+                        &first
+                    ));
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+                    revision.store(1, std::sync::atomic::Ordering::Relaxed);
+                    launcher.refresh_preview(cx);
+                    assert!(
+                        launcher.preview_image.is_none(),
+                        "revision change must miss cache"
+                    );
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[gpui::test]

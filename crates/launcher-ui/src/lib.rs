@@ -1,4 +1,5 @@
 mod launcher;
+mod preview_image;
 mod search_input;
 mod state;
 mod theme;

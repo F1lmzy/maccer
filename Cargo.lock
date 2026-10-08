@@ -3234,6 +3234,8 @@ dependencies = [
  "regex",
  "rusqlite",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "url",
 ]
@@ -3245,10 +3247,12 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "gpui",
+ "image",
  "launcher-core",
  "launcher-macos",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
  "unicode-segmentation",
 ]
 

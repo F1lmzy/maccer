@@ -61,11 +61,22 @@ pub enum ActionOutcome {
     },
 }
 
-/// Lazy selected-item preview. PNG bytes are size-bounded by the provider.
+/// Lazy selected-item preview. Image data is bounded by the provider.
 #[derive(Clone, Debug)]
 pub enum Preview {
-    Text { text: String, truncated: bool },
-    Image { png: Vec<u8> },
+    Text {
+        text: String,
+        truncated: bool,
+    },
+    /// Straight-alpha BGRA pixels in top-to-bottom row order, ready for GPUI rendering.
+    Pixels {
+        bgra: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    Image {
+        png: Vec<u8>,
+    },
     Info(String),
 }
 

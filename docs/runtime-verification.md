@@ -81,7 +81,9 @@ The default base width is now 480 points, with six 44-point result rows at most.
 
 ## Image preview latency
 
-The preview path already used GPUI's background executor; lack of threading was not the bottleneck. Images previously launched `sips`, wrote a temporary PNG, and read it back on every selection. They now use ImageIO in-process, with at most two simultaneous native decodes and an 800-pixel thumbnail limit. A 16-entry/16 MiB LRU caches PNG bytes by path, size, modification time and Unix inode/change time. Changed files miss the cache; generation never holds the cache mutex. The UI debounce was reduced from 120 ms to 40 ms.
+The current image path uses ImageIO background decoding into render-ready BGRA, with no preview debounce and a synchronous 16-entry/32 MiB decoded-image UI cache. A native UI sample on the generated 4K PNG improved from 201 ms to 145 ms to the ready element tree; revisits now hit the decoded cache synchronously without dispatching a worker. See [current implementation, Vicinae sources, timings and limits](image-preview-performance.md).
+
+The measurements below describe the earlier PNG-based implementation. It replaced `sips` subprocesses with in-process ImageIO, at most two simultaneous native decodes, and an 800-pixel thumbnail limit. Its 16-entry/16 MiB PNG cache remains for PDF thumbnails, but no longer sits on the native image path. Its 40 ms UI debounce has since been removed.
 
 Comparison sources: [Elephant Files](https://github.com/abenz1267/elephant/blob/master/internal/providers/files/query.go) passes a path and preview type to its frontend. [Walker](https://github.com/abenz1267/walker/blob/master/src/preview/mod.rs) asynchronously reads images and decodes/scales them in-process with gdk-pixbuf. It retains only the last preview widget, not a disk thumbnail cache. Sources were inspected, not benchmarked.
 
@@ -100,7 +102,7 @@ cargo run -p launcher-macos --example preview_bench -- /path/to/image.png --cold
 
 These backend timings exclude the debounce, GPUI PNG decoding, GPU upload and presentation; they are not end-to-end latency or p95 measurements. The generated fixtures are not representative of every image or codec. Native tests cover PNG output, malformed images and decode-slot release; cache tests cover generation avoidance, cancellation, change invalidation, recency and memory limits. PDF generation retains the cancellable five-second `qlmanage` subprocess deadline. ImageIO cannot interrupt a decode already in progress; native decoding is concurrency-limited, checks cancellation between stages and rejects sources over 100 megapixels. Waiting requests check cancellation and have a two-second slot-acquisition limit.
 
-### UI loading follow-up
+### Earlier UI loading follow-up
 
 Backend benchmarks do not cover the full loading indicator. `RUST_LOG=debug cargo run -p launcher --example preview_ui_smoke -- /path/to/image.png` runs the native selection/provider/UI path and logs request, worker start/completion, UI application and ready-frame render. On the generated 4K PNG, these stages measured 0/81/204/205/213 ms. The final stage records GPUI building the ready element tree, not GPU presentation or a screenshot.
 

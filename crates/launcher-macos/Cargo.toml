@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 launcher-core = { path = "../launcher-core" }
 libc = "0.2"
 notify = "8"
@@ -19,6 +20,9 @@ global-hotkey = "0.8"
 objc2 = { version = "=0.6.4", features = ["exception"] }
 objc2-app-kit = { version = "=0.3.2", features = ["NSWorkspace", "NSPasteboard", "NSScreen", "NSEvent", "NSRunningApplication", "NSApplication"] }
 objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSAutoreleasePool", "NSProcessInfo", "NSString", "NSURL"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
