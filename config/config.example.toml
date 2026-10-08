@@ -55,6 +55,18 @@ name = "Show working directory"
 keywords = ["cwd", "pwd"]
 command = "pwd"
 
+[providers.clipboard]
+enabled = true
+prefix = ":"
+priority = 60
+# Clipboard contents never participate in ordinary app search.
+default_search = false
+max_results = 50
+
+[clipboard]
+# Text-only, in-memory history. Pinned entries count toward this limit.
+max_entries = 200
+
 [providers.web]
 enabled = true
 prefix = "?"

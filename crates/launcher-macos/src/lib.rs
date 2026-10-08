@@ -2,6 +2,7 @@
 
 mod application_icon;
 mod applications;
+pub mod clipboard;
 pub mod fd_index;
 mod file_metadata;
 pub mod file_preview;

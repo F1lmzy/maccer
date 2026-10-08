@@ -19,6 +19,7 @@ provider-calculator = { path = "../provider-calculator" }
 provider-web = { path = "../provider-web" }
 provider-files = { path = "../provider-files" }
 provider-shell = { path = "../provider-shell" }
+provider-clipboard = { path = "../provider-clipboard" }
 gpui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

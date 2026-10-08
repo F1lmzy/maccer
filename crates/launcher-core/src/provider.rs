@@ -51,7 +51,14 @@ pub enum ActionOutcome {
     Close,
     KeepOpen(String),
     SetQuery(String),
-    Output { title: String, text: String },
+    /// Refresh after a provider-local mutation without changing the query.
+    RefreshSearch,
+    /// Copy and paste into the application active before the launcher opened.
+    PasteText(String),
+    Output {
+        title: String,
+        text: String,
+    },
 }
 
 /// Lazy selected-item preview. PNG bytes are size-bounded by the provider.

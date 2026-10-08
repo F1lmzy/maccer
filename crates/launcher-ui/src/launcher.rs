@@ -45,6 +45,30 @@ const ROW_HEIGHT: f32 = 44.;
 const PREVIEW_WIDTH: f32 = 280.;
 const FOOTER_HEIGHT: f32 = 22.;
 const MAX_WINDOW_HEIGHT: f32 = 400.;
+/// Delay between asking the paste target to activate and sending Command-V.
+const PASTE_DELAY_MS: u64 = 100;
+
+/// Native operations used to paste into another application. Tests replace
+/// these so they never touch the system clipboard or synthesize keystrokes.
+type FrontmostFn = Arc<dyn Fn() -> Option<i32> + Send + Sync>;
+type PrepareFn = Arc<dyn Fn(&str, i32) -> Result<()> + Send + Sync>;
+type SendFn = Arc<dyn Fn(i32) -> Result<()> + Send + Sync>;
+
+struct PasteBackend {
+    frontmost: FrontmostFn,
+    prepare: PrepareFn,
+    send: SendFn,
+}
+
+impl Default for PasteBackend {
+    fn default() -> Self {
+        Self {
+            frontmost: Arc::new(launcher_macos::clipboard::frontmost_application_pid),
+            prepare: Arc::new(launcher_macos::clipboard::prepare_paste),
+            send: Arc::new(launcher_macos::clipboard::send_paste),
+        }
+    }
+}
 
 pub struct LauncherOptions {
     pub width: f32,
@@ -83,6 +107,18 @@ pub struct Launcher {
     /// The one bundle whose native icon is currently being resolved. At most
     /// one load runs at a time so keystrokes cannot stack overlapping decodes.
     icon_loading: Option<PathBuf>,
+    /// PID of the application that was frontmost before the launcher opened.
+    paste_target: Option<i32>,
+    /// A post-dismissal failure must survive ordinary search updates on reopen.
+    paste_error: Option<String>,
+    /// Pending delayed Command-V. Cancelled when the launcher reopens or the
+    /// query changes so it can never paste into a later, unintended action.
+    paste_cancellation: Option<CancellationToken>,
+    paste_backend: PasteBackend,
+    /// Ask the window platform to hide the window. gpui's test platform does
+    /// not implement `Platform::hide`, so tests set this to false to exercise
+    /// the rest of the hide path without the unsupported call.
+    hide_window: bool,
 }
 
 pub fn open_launcher(
@@ -156,6 +192,11 @@ pub fn open_launcher(
                     icon_cache: HashMap::new(),
                     icon_failed: HashSet::new(),
                     icon_loading: None,
+                    paste_target: None,
+                    paste_error: None,
+                    paste_cancellation: None,
+                    paste_backend: PasteBackend::default(),
+                    hide_window: true,
                 });
                 let refresh = launcher.downgrade();
                 let mut revisions: Vec<(String, u64)> = Vec::new();
@@ -248,6 +289,9 @@ impl Launcher {
     }
 
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Remember which application the user was in before the launcher takes
+        // focus. Never replace a captured target while already shown.
+        self.capture_paste_target();
         self.state.screen = Some(Screen::Search);
         self.was_active = false;
         self.clear_preview(cx);
@@ -277,7 +321,9 @@ impl Launcher {
         self.actions.clear();
         self.action_item = None;
         self.invalidate_activation();
-        cx.hide();
+        if self.hide_window {
+            cx.hide();
+        }
         cx.notify();
     }
 
@@ -536,8 +582,114 @@ impl Launcher {
         if let Some(cancellation) = self.activation_cancellation.take() {
             cancellation.cancel();
         }
+        // A pending paste belongs to the activation that started it. Cancel it
+        // on query changes, dismissal, or a newer activation.
+        self.cancel_paste();
         self.activation_serial = self.activation_serial.wrapping_add(1);
         self.activation_in_flight = None;
+    }
+
+    /// Capture the frontmost application's pid as the paste target. Called when
+    /// the launcher is shown, before it activates and steals focus. Our own pid
+    /// and invalid pids are rejected so the launcher never pastes into itself.
+    fn capture_paste_target(&mut self) {
+        if self.state.screen.is_some() {
+            return;
+        }
+        // Ignore our own pid and empty readings so the last external application
+        // is retained rather than clobbered by the launcher itself.
+        if let Some(pid) = (self.paste_backend.frontmost)()
+            .filter(|pid| *pid > 0 && *pid != std::process::id() as i32)
+        {
+            self.paste_target = Some(pid);
+        }
+    }
+
+    fn visible_error(&self) -> Option<&String> {
+        self.error.as_ref().or(self.paste_error.as_ref())
+    }
+
+    fn cancel_paste(&mut self) {
+        if let Some(token) = self.paste_cancellation.take() {
+            token.cancel();
+        }
+    }
+
+    /// Copy `text` to the pasteboard, return to the saved application, and send
+    /// Command-V after a short delay so activation can finish. Failures before
+    /// hiding keep the launcher open with a visible error. A failure after
+    /// hiding is remembered for the next time the launcher opens rather than
+    /// stealing focus. The keystroke re-checks the target, so it never pastes
+    /// into the wrong application.
+    fn paste_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.paste_error = None;
+        let Some(pid) = self.paste_target else {
+            self.error = Some(
+                "Nothing to paste into. Open the launcher while another app is frontmost.".into(),
+            );
+            cx.notify();
+            return;
+        };
+        if let Err(error) = (self.paste_backend.prepare)(&text, pid) {
+            self.error = Some(format!("Could not paste: {error}"));
+            cx.notify();
+            return;
+        }
+        // The target now owns the clipboard text; hide and let it activate.
+        self.hide(cx);
+        self.cancel_paste();
+        let token = CancellationToken::default();
+        self.paste_cancellation = Some(token.clone());
+        let send = self.paste_backend.send.clone();
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(PASTE_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if token.is_cancelled() {
+                    return;
+                }
+                this.paste_cancellation = None;
+                if let Err(error) = send(pid) {
+                    this.paste_error = Some(format!("Could not paste: {error}. The text is still on the clipboard for manual pasting."));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_action_outcome(&mut self, outcome: ActionOutcome, cx: &mut Context<Self>) {
+        match outcome {
+            ActionOutcome::Close => self.hide(cx),
+            ActionOutcome::KeepOpen(message) => {
+                self.error = Some(message);
+                cx.notify();
+            }
+            ActionOutcome::Output { title, text } => {
+                self.output = Some((title, text));
+                self.output_scroll.set_offset(Default::default());
+                self.state.screen = Some(Screen::Output);
+                self.error = None;
+                cx.notify();
+            }
+            ActionOutcome::SetQuery(query) => {
+                self.replace_query(query, cx);
+                self.start_search(cx);
+            }
+            ActionOutcome::RefreshSearch => {
+                self.state.screen = Some(Screen::Search);
+                self.output = None;
+                self.action_item = None;
+                self.error = None;
+                self.clear_preview(cx);
+                self.refresh_actions();
+                self.start_search(cx);
+                cx.notify();
+            }
+            ActionOutcome::PasteText(text) => self.paste_text(text, cx),
+        }
     }
 
     fn start_search(&mut self, cx: &mut Context<Self>) {
@@ -674,7 +826,7 @@ impl Launcher {
         if self.has_preview() {
             row_count = row_count.max(5);
         }
-        let error_height = if self.error.is_some()
+        let error_height = if self.visible_error().is_some()
             && self.state.screen == Some(Screen::Search)
             && !self.state.items.is_empty()
         {
@@ -857,6 +1009,7 @@ impl Launcher {
         let cancellation = CancellationToken::default();
         self.activation_cancellation = Some(cancellation.clone());
         self.error = None;
+        self.paste_error = None;
         cx.notify();
         let history = self.history.clone();
         let query = self.state.query.clone();
@@ -894,24 +1047,7 @@ impl Launcher {
                 this.activation_in_flight = None;
                 this.activation_cancellation = None;
                 match result {
-                    Ok(outcome) => match outcome {
-                        ActionOutcome::Close => this.hide(cx),
-                        ActionOutcome::KeepOpen(message) => {
-                            this.error = Some(message);
-                            cx.notify();
-                        }
-                        ActionOutcome::Output { title, text } => {
-                            this.output = Some((title, text));
-                            this.output_scroll.set_offset(Default::default());
-                            this.state.screen = Some(Screen::Output);
-                            this.error = None;
-                            cx.notify();
-                        }
-                        ActionOutcome::SetQuery(query) => {
-                            this.replace_query(query, cx);
-                            this.start_search(cx);
-                        }
-                    },
+                    Ok(outcome) => this.apply_action_outcome(outcome, cx),
                     Err(error) => {
                         this.error = Some(error.to_string());
                         cx.notify();
@@ -1060,7 +1196,7 @@ impl Render for Launcher {
                         .items_center()
                         .text_size(px(12.))
                         .text_color(theme.muted)
-                        .child(self.error.clone().unwrap_or_else(|| {
+                        .child(self.visible_error().cloned().unwrap_or_else(|| {
                             if self.state.searching {
                                 "Searching…"
                             } else {
@@ -1070,7 +1206,7 @@ impl Render for Launcher {
                         })),
                 );
             } else {
-                if let Some(error) = &self.error {
+                if let Some(error) = self.visible_error() {
                     root = root.child(
                         div()
                             .px_3()
@@ -1292,7 +1428,7 @@ mod tests {
             history.clone(),
             50,
         ));
-        cx.update(|cx| {
+        let window = cx.update(|cx| {
             open_launcher(
                 coordinator,
                 history,
@@ -1303,7 +1439,15 @@ mod tests {
                 cx,
             )
             .unwrap()
-        })
+        });
+        // gpui's test platform does not implement `Platform::hide`. Turn off
+        // the window-platform call so tests can exercise the hide path.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| launcher.hide_window = false)
+                .unwrap()
+        });
+        window
     }
 
     #[gpui::test]
@@ -1446,6 +1590,262 @@ mod tests {
             gpui::ImageFormat::Png,
             include_bytes!("../../launcher-macos/tests/fixtures/pixel.png").to_vec(),
         ))
+    }
+
+    /// Records paste backend calls without touching the system clipboard or
+    /// synthesizing keystrokes.
+    #[derive(Default)]
+    struct FakePaste {
+        frontmost: std::sync::Mutex<Option<i32>>,
+        prepared: std::sync::Mutex<Vec<(String, i32)>>,
+        sent: std::sync::Mutex<Vec<i32>>,
+        prepare_error: std::sync::Mutex<Option<String>>,
+        send_error: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakePaste {
+        fn backend(self: &Arc<Self>) -> PasteBackend {
+            let frontmost = self.clone();
+            let prepare = self.clone();
+            let send = self.clone();
+            PasteBackend {
+                frontmost: Arc::new(move || *frontmost.frontmost.lock().unwrap()),
+                prepare: Arc::new(move |text: &str, pid: i32| {
+                    if let Some(error) = prepare.prepare_error.lock().unwrap().clone() {
+                        anyhow::bail!(error);
+                    }
+                    prepare
+                        .prepared
+                        .lock()
+                        .unwrap()
+                        .push((text.to_string(), pid));
+                    Ok(())
+                }),
+                send: Arc::new(move |pid: i32| {
+                    if let Some(error) = send.send_error.lock().unwrap().clone() {
+                        anyhow::bail!(error);
+                    }
+                    send.sent.lock().unwrap().push(pid);
+                    Ok(())
+                }),
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn refresh_search_outcome_returns_to_results_and_clears_transient_state(
+        cx: &mut TestAppContext,
+    ) {
+        let window = test_window(cx, ProviderRegistry::new());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.state.screen = Some(Screen::Output);
+                    launcher.output = Some(("Command".into(), "text".into()));
+                    launcher.action_item =
+                        Some(app_bundle_item("x", std::path::Path::new("/x.app")));
+                    launcher.preview_key = Some(("apps".into(), "x".into(), 0));
+                    launcher.error = Some("stale".into());
+                    launcher.apply_action_outcome(ActionOutcome::RefreshSearch, cx);
+                    assert_eq!(launcher.state.screen, Some(Screen::Search));
+                    assert!(launcher.output.is_none());
+                    assert!(launcher.action_item.is_none());
+                    assert!(launcher.preview_key.is_none());
+                    assert!(launcher.error.is_none());
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn paste_target_capture_ignores_self_and_keeps_the_existing_target(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let fake = Arc::new(FakePaste::default());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    launcher.paste_backend = fake.backend();
+                    launcher.state.screen = None;
+                    launcher.paste_target = None;
+
+                    // The launcher's own pid is not a valid paste target.
+                    *fake.frontmost.lock().unwrap() = Some(std::process::id() as i32);
+                    launcher.capture_paste_target();
+                    assert!(launcher.paste_target.is_none());
+
+                    // Another application is captured.
+                    *fake.frontmost.lock().unwrap() = Some(4242);
+                    launcher.capture_paste_target();
+                    assert_eq!(launcher.paste_target, Some(4242));
+
+                    // While already shown, an existing target is never replaced.
+                    launcher.state.screen = Some(Screen::Search);
+                    *fake.frontmost.lock().unwrap() = Some(9999);
+                    launcher.capture_paste_target();
+                    assert_eq!(launcher.paste_target, Some(4242));
+
+                    // A later self/empty reading keeps the last external target.
+                    launcher.state.screen = None;
+                    *fake.frontmost.lock().unwrap() = Some(std::process::id() as i32);
+                    launcher.capture_paste_target();
+                    assert_eq!(launcher.paste_target, Some(4242));
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn paste_permission_failure_keeps_results_visible_and_sends_no_keystroke(
+        cx: &mut TestAppContext,
+    ) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let fake = Arc::new(FakePaste::default());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.paste_backend = fake.backend();
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.paste_target = Some(4242);
+                    *fake.prepare_error.lock().unwrap() =
+                        Some("accessibility permission required".into());
+                    launcher.apply_action_outcome(ActionOutcome::PasteText("secret".into()), cx);
+                    // The launcher stays open so the failure is visible, and no
+                    // Command-V is queued.
+                    assert_eq!(launcher.state.screen, Some(Screen::Search));
+                    assert!(launcher.paste_cancellation.is_none());
+                    assert!(
+                        launcher
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains("accessibility permission required")
+                    );
+                    assert!(fake.prepared.lock().unwrap().is_empty());
+                    assert!(fake.sent.lock().unwrap().is_empty());
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn paste_outcome_hides_copies_and_sends_command_v_after_the_delay(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let fake = Arc::new(FakePaste::default());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.paste_backend = fake.backend();
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.paste_target = Some(4242);
+                    launcher.apply_action_outcome(ActionOutcome::PasteText("hello 🦀".into()), cx);
+                    // The launcher hides immediately and no keystroke is sent yet.
+                    assert_eq!(launcher.state.screen, None);
+                    assert!(launcher.paste_cancellation.is_some());
+                    assert_eq!(
+                        *fake.prepared.lock().unwrap(),
+                        vec![("hello 🦀".to_string(), 4242)]
+                    );
+                    assert!(fake.sent.lock().unwrap().is_empty());
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(PASTE_DELAY_MS));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert_eq!(*fake.sent.lock().unwrap(), vec![4242]);
+                    assert!(launcher.paste_cancellation.is_none());
+                    assert!(launcher.error.is_none());
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn failed_delayed_paste_remains_visible_after_reopen_and_search(cx: &mut TestAppContext) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let fake = Arc::new(FakePaste::default());
+        *fake.send_error.lock().unwrap() = Some("target lost focus".into());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.paste_backend = fake.backend();
+                    launcher.paste_target = Some(4242);
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.apply_action_outcome(ActionOutcome::PasteText("safe".into()), cx);
+                })
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(PASTE_DELAY_MS));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    assert!(
+                        launcher
+                            .visible_error()
+                            .unwrap()
+                            .contains("target lost focus")
+                    );
+                    assert!(fake.sent.lock().unwrap().is_empty());
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn pending_paste_is_cancelled_when_the_launcher_reopens_or_the_query_changes(
+        cx: &mut TestAppContext,
+    ) {
+        for reopen in [false, true] {
+            let window = test_window(cx, ProviderRegistry::new());
+            let fake = Arc::new(FakePaste::default());
+            cx.update(|cx| {
+                window
+                    .update(cx, |launcher, window, cx| {
+                        launcher.paste_backend = fake.backend();
+                        launcher.state.screen = Some(Screen::Search);
+                        launcher.paste_target = Some(4242);
+                        launcher.apply_action_outcome(ActionOutcome::PasteText("gone".into()), cx);
+                        assert!(launcher.paste_cancellation.is_some());
+                        if reopen {
+                            launcher.show(window, cx);
+                        } else {
+                            launcher.replace_query("other".into(), cx);
+                        }
+                        assert!(
+                            launcher.paste_cancellation.is_none(),
+                            "reopen={reopen} must cancel the delayed paste"
+                        );
+                    })
+                    .unwrap()
+            });
+            cx.run_until_parked();
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(PASTE_DELAY_MS));
+            cx.run_until_parked();
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, _, _| {
+                        assert!(
+                            fake.sent.lock().unwrap().is_empty(),
+                            "reopen={reopen} must not send a stale Command-V"
+                        );
+                    })
+                    .unwrap()
+            });
+        }
     }
 
     #[gpui::test]

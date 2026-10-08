@@ -141,6 +141,16 @@ fn main() -> Result<()> {
         )?),
         config.providers.shell.clone(),
     )?;
+    let clipboard = if config.providers.clipboard.enabled {
+        let provider = Arc::new(provider_clipboard::ClipboardProvider::new(
+            Arc::new(NativePlatform),
+            config.clipboard.max_entries,
+        ));
+        registry.register(provider.clone(), config.providers.clipboard.clone())?;
+        Some(provider)
+    } else {
+        None
+    };
     let registry = Arc::new(registry);
     let coordinator = Arc::new(SearchCoordinator::new(
         registry,
@@ -151,6 +161,36 @@ fn main() -> Result<()> {
     let show_on_start = args.show;
 
     Application::new().run(move |cx| {
+        if let Some(clipboard) = clipboard {
+            // Initialize the change-count baseline before the first timer tick.
+            // Pre-existing clipboard text is deliberately not added to history.
+            let mut previous = None;
+            if let Ok(Some(snapshot)) = launcher_macos::clipboard::snapshot_if_changed(None) {
+                previous = Some(snapshot.change_count);
+                clipboard.capture(snapshot.change_count, None);
+            }
+            cx.spawn(async move |cx| {
+                loop {
+                    gpui::Timer::after(std::time::Duration::from_millis(300)).await;
+                    if cx
+                        .update(|_| {
+                            // NSPasteboard access stays on the application thread, independent
+                            // of provider search workers. Read only when changeCount advances.
+                            if let Ok(Some(snapshot)) =
+                                launcher_macos::clipboard::snapshot_if_changed(previous)
+                            {
+                                previous = Some(snapshot.change_count);
+                                clipboard.capture(snapshot.change_count, snapshot.text.as_deref());
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         if let Err(error) = configure_accessory_app() {
             tracing::warn!(%error, "could not set accessory activation policy");
         }

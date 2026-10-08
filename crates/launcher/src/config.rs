@@ -18,6 +18,19 @@ pub struct Config {
     pub web: WebConfig,
     pub files: FileSearchConfig,
     pub shell: ShellConfig,
+    pub clipboard: ClipboardConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub max_entries: usize,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self { max_entries: 200 }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -43,6 +56,7 @@ pub struct ProvidersConfig {
     pub web: ProviderConfig,
     pub files: ProviderConfig,
     pub shell: ProviderConfig,
+    pub clipboard: ProviderConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -166,6 +180,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             web: ProviderOverrides,
             files: ProviderOverrides,
             shell: ProviderOverrides,
+            clipboard: ProviderOverrides,
         }
         let raw = Raw::deserialize(deserializer)?;
         let defaults = ProvidersConfig::default();
@@ -175,6 +190,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             web: raw.web.apply(defaults.web),
             files: raw.files.apply(defaults.files),
             shell: raw.shell.apply(defaults.shell),
+            clipboard: raw.clipboard.apply(defaults.clipboard),
         })
     }
 }
@@ -219,6 +235,13 @@ impl Default for ProvidersConfig {
                 default_search: false,
                 max_results: 10,
             },
+            clipboard: ProviderConfig {
+                enabled: true,
+                prefix: Some(":".into()),
+                priority: 60,
+                default_search: false,
+                max_results: 50,
+            },
             web: ProviderConfig {
                 enabled: true,
                 prefix: Some("?".into()),
@@ -249,6 +272,9 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         validate_hotkey(&self.launcher.hotkey)?;
+        if !(1..=1000).contains(&self.clipboard.max_entries) {
+            bail!("clipboard.max_entries must be between 1 and 1000");
+        }
         if !(1..=8).contains(&self.files.roots.len()) {
             bail!("files.roots must contain 1 to 8 search directories");
         }
@@ -279,6 +305,7 @@ impl Config {
             ("web", &self.providers.web),
             ("files", &self.providers.files),
             ("shell", &self.providers.shell),
+            ("clipboard", &self.providers.clipboard),
         ];
         for (name, provider) in providers.iter().copied() {
             if !(1..=100).contains(&provider.max_results) {
@@ -420,6 +447,27 @@ mod tests {
         let example: Config =
             toml::from_str(include_str!("../../../config/config.example.toml")).unwrap();
         assert_eq!(example.launcher.width, 480.);
+    }
+
+    #[test]
+    fn clipboard_defaults_and_partial_overrides_are_scoped_and_bounded() {
+        let defaults = Config::default();
+        assert_eq!(defaults.providers.clipboard.prefix.as_deref(), Some(":"));
+        assert!(!defaults.providers.clipboard.default_search);
+        assert_eq!(defaults.clipboard.max_entries, 200);
+        let config: Config = toml::from_str(
+            "[providers.clipboard]\nenabled = false\n[clipboard]\nmax_entries = 30\n",
+        )
+        .unwrap();
+        assert!(!config.providers.clipboard.enabled);
+        assert_eq!(config.providers.clipboard.prefix.as_deref(), Some(":"));
+        assert_eq!(config.clipboard.max_entries, 30);
+        config.validate().unwrap();
+        for max_entries in [0, 1001] {
+            let invalid: Config =
+                toml::from_str(&format!("[clipboard]\nmax_entries = {max_entries}\n")).unwrap();
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

@@ -1,0 +1,12 @@
+[package]
+name = "provider-clipboard"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nucleo-matcher.workspace = true
+launcher-core = { path = "../launcher-core" }
+launcher-macos = { path = "../launcher-macos" }
+serde_json.workspace = true
