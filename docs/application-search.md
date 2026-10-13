@@ -2,13 +2,15 @@
 
 ## Cause and fix
 
-Application metadata was already discovered at startup, but the first icon implementation called `NSWorkspace::iconForFile`, exported TIFF, and decoded/downscaled/encoded PNG for each result **inside `ApplicationProvider::search`**. Search held the icon-cache mutex during native work and returned the application batch only after all icons were ready. Broad queries requested up to 50 sequential icon conversions. Cancellation could not interrupt a native call already in progress.
+Application metadata is discovered at startup and refreshed after debounced filesystem changes. The first icon implementation called `NSWorkspace::iconForFile`, exported TIFF, and decoded/downscaled/encoded PNG for each result **inside `ApplicationProvider::search`**. Search held the icon-cache mutex during native work and returned the application batch only after all icons were ready. Broad queries requested up to 50 sequential icon conversions. Cancellation could not interrupt a native call already in progress.
 
 Search now uses prebuilt item templates, UTF-32 fuzzy-match strings, and normalized exact titles. It performs no native icon calls or filesystem access, ranks references to those records, and clones only the retained results. Name, path, bundle-id and executable matching, exact-name priority and deterministic tie-breaking are preserved.
 
-Results carry `IconDescriptor::ApplicationBundle(PathBuf)`. After accepting results, the UI schedules one background icon load. Both native extraction and `gpui::Image` creation/hashing happen off the UI thread. Completion caches the image and redraws without re-running search. The next load is chosen from the **current** ranked results: query changes do not enqueue stale batches or start overlapping native calls. Hiding the launcher stops subsequent loads; an existing load may finish and populate the cache. Successful images and failures are cached for the process lifetime.
+The live application catalog now follows the directory-discovery and snapshot-refresh architecture described in [Vicinae-style application catalog](vicinae-app-implementation.md). Finder-localized names keep their raw bundle names as search aliases, and configured app roots take precedence over default roots. Catalog refresh builds new searchable records on the watcher thread and publishes an immutable snapshot; unchanged catalogs do not increment the revision. The UI's existing revision poll refreshes current results after catalog changes. Static providers remain available when `[apps].watch = false`.
 
-The worker can load all retained results, not just the six visible rows. A placeholder is displayed until each image is ready. Icons remain bounded to 64 pixels per side and 256 KiB; improving native icon throughput is separate from result-delivery latency.
+Results carry `IconDescriptor::ApplicationBundle(PathBuf)`. The UI now fills at most four background icon-load slots. Each bundle has at most one active load, even across query changes. The uniform list reports its actual viewport after mouse or keyboard scrolling; those rows take priority over offscreen warming. Completion selects new work from current results instead of retaining an old query's queue. Hidden, action and output screens stop new loads. Existing loads may finish and populate the process-lifetime cache.
+
+The native worker obtains an NSWorkspace icon and a retained CGImage snapshot under a short AppKit lock, because NSImage backing representations may be shared and thread-unsafe. CoreGraphics then draws outside that lock into a 64x64 BGRA buffer. The worker converts premultiplied alpha to straight alpha and creates an `Arc<gpui::RenderImage>`. This bypasses TIFF export, ImageIO resize/PNG encoding, PNG hashing and GPUI PNG decoding. Rows only look up cached render-ready images; missing images use placeholders. Each pixel buffer is 16 KiB. The legacy PNG API remains available for compatibility and comparison, but application rows no longer use it.
 
 ## Measurements
 
@@ -29,7 +31,29 @@ cargo run -p launcher --example app_search_bench -- a
 # Use --release for production-build measurements; numbers above are debug.
 ```
 
-The example times discovery, index construction, first search, 100 warm searches, and 20 coordinator searches. It does not time UI input-to-paint, mixed-provider completion, icon throughput, or rapid-typing behavior. Provider tests assert that even a real Finder bundle returns a lazy descriptor rather than PNG bytes. UI tests cover single-flight scheduling, selection from current results, hidden-window behavior, and native background loading/caching. Timing assertions are intentionally not embedded in unit tests because native hosts and CI load vary.
+The example times discovery, index construction, first search, 100 warm searches, and 20 coordinator searches. It does not time UI input-to-paint, mixed-provider completion, icon throughput, or rapid-typing behavior. Provider tests assert that even a real Finder bundle returns a lazy descriptor rather than PNG bytes. UI tests cover the four-load limit, per-bundle single-flight, selection from current results and actual scrolled viewport, hidden-window behavior, and native background loading/caching. Timing assertions are intentionally not embedded in unit tests because native hosts and CI load vary.
+
+## Direct-pixel icon measurements
+
+The next optimization addressed icons appearing after the result text. Measurements used the same first six discovered applications, debug builds and a fresh process per invocation. Native framework initialization and OS cache state vary between runs.
+
+| Pipeline | First six-icon batch | Repeated native batch, p50 |
+| --- | ---: | ---: |
+| Old serial TIFF/PNG path | 1,337 ms initially; 4,112 ms on a later run | 560–643 ms |
+| Direct pixels, four worker slots | 231 ms on the final synchronized-snapshot implementation | 3.43 ms |
+
+These are native preparation timings, not input-to-paint or GPU-upload latency. The old measurement includes encoded-image hashing but excludes GPUI's subsequent PNG decode. The pixel measurement excludes RenderImage buffer wrapping. UI tests separately confirm that cached application icons are render-ready 64x64 buffers. No comparison benchmark against Vicinae was run.
+
+```sh
+cargo run -p launcher --example app_icon_bench -- --png
+cargo run -p launcher --example app_icon_bench -- --pixels --parallel
+```
+
+Verification passed 89 native library tests, 43 UI tests and 12 application-provider tests, along with affected-target clippy and formatting checks. The asymmetric real-CGImage fixture checks row orientation, color channels, alpha and transparent pixels; a preliminary row-flip assumption failed that test and was removed. Native tests exercise four concurrent calls, while UI tests verify that query changes cannot exceed four slots and that wheel/keyboard scrolling changes viewport priority.
+
+The rebuilt native launcher was restarted successfully. Its first four icon preparation events completed in 29–34 ms each, followed by 3–8 ms preparation events, with `encoded_decode_required=false`. Its 480x348 window was present. Window capture was unavailable, so this task does not claim a screenshot or measured paint latency.
+
+AppKit API/threading references: [NSWorkspace icon lookup](https://developer.apple.com/documentation/appkit/nsworkspace/icon(forfile:)), [NSImage CGImage snapshot](https://developer.apple.com/documentation/appkit/nsimage/cgimage(forproposedrect:context:hints:)), and [Apple's thread-safety summary](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/ThreadSafetySummary/ThreadSafetySummary.html). The code serializes AppKit snapshot calls and parallelizes work on retained immutable CoreGraphics images. Persistent disk caching and GPU-atlas eviction policy are unchanged.
 
 ## Upstream implementations examined
 

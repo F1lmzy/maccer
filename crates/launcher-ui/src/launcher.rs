@@ -42,6 +42,7 @@ actions!(
 );
 
 const ROW_HEIGHT: f32 = 44.;
+const MAX_ICON_LOADS: usize = 4;
 const PREVIEW_WIDTH: f32 = 280.;
 const FOOTER_HEIGHT: f32 = 22.;
 const MAX_WINDOW_HEIGHT: f32 = 400.;
@@ -106,11 +107,13 @@ pub struct Launcher {
     preview_scroll: ScrollHandle,
     preview_enabled: bool,
     drag_start: Option<(Item, gpui::Point<gpui::Pixels>)>,
-    icon_cache: HashMap<PathBuf, Arc<gpui::Image>>,
+    icon_cache: HashMap<PathBuf, Arc<gpui::RenderImage>>,
     icon_failed: HashSet<PathBuf>,
-    /// The one bundle whose native icon is currently being resolved. At most
-    /// one load runs at a time so keystrokes cannot stack overlapping decodes.
-    icon_loading: Option<PathBuf>,
+    /// Native calls are not interruptible. Keep at most four active across query
+    /// changes, and never queue a second load for the same bundle.
+    icon_loading: HashSet<PathBuf>,
+    /// Actual viewport reported by the uniform list, tagged with its query.
+    icon_viewport: Option<(u64, std::ops::Range<usize>)>,
     /// PID of the application that was frontmost before the launcher opened.
     paste_target: Option<i32>,
     /// A post-dismissal failure must survive ordinary search updates on reopen.
@@ -199,7 +202,8 @@ pub fn open_launcher(
                     drag_start: None,
                     icon_cache: HashMap::new(),
                     icon_failed: HashSet::new(),
-                    icon_loading: None,
+                    icon_loading: HashSet::new(),
+                    icon_viewport: None,
                     paste_target: None,
                     paste_error: None,
                     paste_cancellation: None,
@@ -831,61 +835,90 @@ impl Launcher {
         .detach();
     }
 
-    /// Starts at most one background icon load at a time. When it finishes, the
-    /// next highest-ranked uncached bundle is chosen from the *current* results,
-    /// so a stale queue cannot starve what is on screen. Hiding the launcher
-    /// gates new loads without discarding the in-flight result.
+    /// Fill a bounded set of worker slots, selecting from the current viewport
+    /// before warming offscreen results. No queued stale list survives a query
+    /// change. Hidden/action/output screens stop new work but retain completions.
     fn schedule_icon_loads(&mut self, cx: &mut Context<Self>) {
-        if self.state.screen.is_none() {
+        if self.state.screen != Some(Screen::Search) {
             return;
         }
-        let Some(path) = self.next_icon_to_load() else {
-            return;
-        };
-        self.icon_loading = Some(path.clone());
-        let this = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let load_path = path.clone();
-            // Native decode and PNG hashing both run off the UI thread.
-            let image = cx
-                .background_executor()
-                .spawn(async move {
-                    launcher_macos::application_icon(&load_path)
-                        .map(|png| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.icon_loading = None;
-                match image {
-                    Some(image) => {
-                        this.icon_cache.insert(path, image);
+        while let Some(path) = self.next_icon_to_load() {
+            self.icon_loading.insert(path.clone());
+            let this = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let load_path = path.clone();
+                let image =
+                    cx.background_executor()
+                        .spawn(async move {
+                            let started = std::time::Instant::now();
+                            let image = launcher_macos::application_icon_pixels(&load_path)
+                                .and_then(|pixels| {
+                                    crate::preview_image::PreparedPreview::new(Preview::Pixels {
+                                        bgra: pixels.bgra,
+                                        width: pixels.width,
+                                        height: pixels.height,
+                                    })
+                                    .ok()?
+                                    .image
+                                });
+                            tracing::debug!(
+                                pipeline = "application_icon_pixels",
+                                duration_ms = started.elapsed().as_secs_f64() * 1000.,
+                                success = image.is_some(),
+                                encoded_decode_required = false,
+                                "application icon prepared"
+                            );
+                            image
+                        })
+                        .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.icon_loading.remove(&path);
+                    match image {
+                        Some(image) => {
+                            this.icon_cache.insert(path, image);
+                        }
+                        None => {
+                            this.icon_failed.insert(path);
+                        }
                     }
-                    None => {
-                        this.icon_failed.insert(path);
-                    }
-                }
-                cx.notify();
-                this.schedule_icon_loads(cx);
-            });
-        })
-        .detach();
+                    cx.notify();
+                    this.schedule_icon_loads(cx);
+                });
+            })
+            .detach();
+        }
     }
 
-    /// Highest-ranked bundle in the current results that still needs an icon and
-    /// that no in-flight load already covers.
     fn next_icon_to_load(&self) -> Option<PathBuf> {
-        if self.icon_loading.is_some() {
+        if self.icon_loading.len() >= MAX_ICON_LOADS {
             return None;
         }
-        self.state.items.iter().find_map(|item| {
-            let Some(launcher_core::IconDescriptor::ApplicationBundle(path)) = &item.icon else {
-                return None;
-            };
-            if self.icon_cache.contains_key(path) || self.icon_failed.contains(path) {
-                return None;
-            }
-            Some(path.clone())
-        })
+        let items = &self.state.items;
+        let viewport = self
+            .icon_viewport
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.state.generation)
+            .map(|(_, range)| range.clone())
+            .unwrap_or(0..visible_result_count(items.len()));
+        let start = viewport.start.min(items.len());
+        let end = viewport.end.min(items.len()).max(start);
+        items[start..end]
+            .iter()
+            .chain(&items[..start])
+            .chain(&items[end..])
+            .find_map(|item| {
+                let Some(launcher_core::IconDescriptor::ApplicationBundle(path)) = &item.icon
+                else {
+                    return None;
+                };
+                if self.icon_cache.contains_key(path)
+                    || self.icon_failed.contains(path)
+                    || self.icon_loading.contains(path)
+                {
+                    return None;
+                }
+                Some(path.clone())
+            })
     }
 
     fn refresh_actions(&mut self) {
@@ -1340,9 +1373,9 @@ impl Render for Launcher {
                 let row_theme = theme.clone();
                 let selected_for_rows = selected.clone();
                 let rows_view = cx.entity().downgrade();
-                // Resolved bundle icons are cloned as cheap `Arc`s; rendering must
-                // not re-encode PNG bytes for every frame.
-                let mut icon_images: HashMap<PathBuf, Arc<gpui::Image>> = HashMap::new();
+                // Render-ready BGRA images bypass GPUI's encoded-image decoder.
+                let generation = self.state.generation;
+                let mut icon_images: HashMap<PathBuf, Arc<gpui::RenderImage>> = HashMap::new();
                 for item in &items {
                     if let Some(launcher_core::IconDescriptor::ApplicationBundle(path)) = &item.icon
                         && let Some(image) = self.icon_cache.get(path)
@@ -1350,7 +1383,17 @@ impl Render for Launcher {
                         icon_images.insert(path.clone(), image.clone());
                     }
                 }
-                let list = uniform_list("launcher-results", items.len(), move |range, _, _| {
+                let list = uniform_list("launcher-results", items.len(), move |range, _, cx| {
+                    // Layout reports the real range after mouse/keyboard scroll.
+                    // Scheduling only spawns bounded work; no native calls here.
+                    let _ = rows_view.update(cx, |this, cx| {
+                        if this.state.generation == generation
+                            && this.state.screen == Some(Screen::Search)
+                        {
+                            this.icon_viewport = Some((generation, range.clone()));
+                            this.schedule_icon_loads(cx);
+                        }
+                    });
                     range
                         .map(|index| {
                             let item = &items[index];
@@ -1435,7 +1478,7 @@ fn result_row(
     item: &Item,
     selected: bool,
     theme: &crate::theme::Theme,
-    image: Option<Arc<gpui::Image>>,
+    image: Option<Arc<gpui::RenderImage>>,
 ) -> gpui::Div {
     let secondary = item
         .subtitle
@@ -1702,11 +1745,15 @@ mod tests {
         }
     }
 
-    fn icon_image() -> Arc<gpui::Image> {
-        Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            include_bytes!("../../launcher-macos/tests/fixtures/pixel.png").to_vec(),
-        ))
+    fn icon_image() -> Arc<gpui::RenderImage> {
+        crate::preview_image::PreparedPreview::new(Preview::Pixels {
+            bgra: vec![0, 0, 255, 255],
+            width: 1,
+            height: 1,
+        })
+        .unwrap()
+        .image
+        .unwrap()
     }
 
     /// Records paste backend calls without touching the system clipboard or
@@ -1966,67 +2013,99 @@ mod tests {
     }
 
     #[gpui::test]
-    fn next_icon_to_load_picks_highest_current_result_and_skips_cached(cx: &mut TestAppContext) {
+    fn icon_scheduler_fills_four_slots_without_duplicating_a_bundle(cx: &mut TestAppContext) {
         let window = test_window(cx, ProviderRegistry::new());
-        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
-        let safari = PathBuf::from("/Applications/Safari.app");
-        cx.update(|cx| {
-            window
-                .update(cx, |launcher, _, _| {
-                    launcher.state.items = vec![
-                        app_bundle_item("finder", &finder),
-                        app_bundle_item("safari", &safari),
-                    ];
-                    // The highest-ranked uncached bundle wins.
-                    assert_eq!(
-                        launcher.next_icon_to_load().as_deref(),
-                        Some(finder.as_path())
-                    );
-                    // One in-flight load suppresses any further scheduling.
-                    launcher.icon_loading = Some(finder.clone());
-                    assert!(launcher.next_icon_to_load().is_none());
-                    // Once resolved, the next current result is chosen.
-                    launcher.icon_loading = None;
-                    launcher.icon_cache.insert(finder.clone(), icon_image());
-                    assert_eq!(
-                        launcher.next_icon_to_load().as_deref(),
-                        Some(safari.as_path())
-                    );
-                    // Failed bundles are never retried.
-                    launcher.icon_failed.insert(safari.clone());
-                    assert!(launcher.next_icon_to_load().is_none());
-                })
-                .unwrap()
-        });
-    }
-
-    #[gpui::test]
-    fn icon_loads_run_one_at_a_time_and_recompute_from_current_results(cx: &mut TestAppContext) {
-        let window = test_window(cx, ProviderRegistry::new());
-        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
-        let safari = PathBuf::from("/Applications/Safari.app");
         cx.update(|cx| {
             window
                 .update(cx, |launcher, _, cx| {
                     launcher.state.screen = Some(Screen::Search);
-                    launcher.state.items = vec![app_bundle_item("finder", &finder)];
+                    launcher.state.items = (0..8)
+                        .map(|i| {
+                            app_bundle_item(&i.to_string(), &PathBuf::from(format!("/app-{i}.app")))
+                        })
+                        .collect();
+                    launcher
+                        .state
+                        .items
+                        .insert(1, launcher.state.items[0].clone());
                     launcher.schedule_icon_loads(cx);
-                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
-                    // A second call must not launch a parallel decode.
+                    assert_eq!(
+                        launcher.icon_loading.len(),
+                        4,
+                        "visible icons must not wait for one serial load"
+                    );
                     launcher.schedule_icon_loads(cx);
-                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
-                    // New results neither cancel nor overlap the running load.
-                    launcher.state.items = vec![app_bundle_item("safari", &safari)];
-                    launcher.schedule_icon_loads(cx);
-                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
-                    // Simulated completion: the next load is recomputed from the
-                    // current results (Safari), not the stale list.
-                    launcher.icon_loading = None;
-                    launcher.icon_cache.insert(finder.clone(), icon_image());
-                    launcher.schedule_icon_loads(cx);
-                    assert_eq!(launcher.icon_loading.as_deref(), Some(safari.as_path()));
+                    assert_eq!(
+                        launcher.icon_loading.len(),
+                        4,
+                        "a second call must not duplicate or exceed the active limit"
+                    );
                 })
-                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    fn icon_candidates_prioritize_viewport_and_skip_cached_failed_and_active(
+        cx: &mut TestAppContext,
+    ) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let paths: Vec<_> = (0..8)
+            .map(|i| PathBuf::from(format!("/app-{i}.app")))
+            .collect();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, _| {
+                    launcher.state.items = paths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, path)| app_bundle_item(&i.to_string(), path))
+                        .collect();
+                    launcher.state.generation = 1;
+                    launcher.icon_viewport = Some((1, 4..7));
+                    assert_eq!(launcher.next_icon_to_load(), Some(paths[4].clone()));
+                    launcher.icon_cache.insert(paths[4].clone(), icon_image());
+                    launcher.icon_loading.insert(paths[5].clone());
+                    launcher.icon_failed.insert(paths[6].clone());
+                    assert_eq!(launcher.next_icon_to_load(), Some(paths[0].clone()));
+                    // An old query's scrolled viewport must not reorder new results.
+                    launcher.icon_viewport = Some((0, 7..8));
+                    assert_eq!(launcher.next_icon_to_load(), Some(paths[0].clone()));
+                    // Out-of-bounds ranges are safe after a result-count change.
+                    launcher.icon_viewport = Some((1, 100..200));
+                    assert_eq!(launcher.next_icon_to_load(), Some(paths[0].clone()));
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    fn completion_refills_from_current_results_without_exceeding_global_slots(
+        cx: &mut TestAppContext,
+    ) {
+        let window = test_window(cx, ProviderRegistry::new());
+        let paths: Vec<_> = (0..4)
+            .map(|i| PathBuf::from(format!("/app-{i}.app")))
+            .collect();
+        let new_path = PathBuf::from("/new-query.app");
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    launcher.state.screen = Some(Screen::Search);
+                    launcher.icon_loading.extend(paths.iter().cloned());
+                    launcher.state.items = vec![app_bundle_item("new", &new_path)];
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.len(), MAX_ICON_LOADS);
+                    assert!(!launcher.icon_loading.contains(&new_path));
+                    // Simulate one old query load completing. The new result takes
+                    // its freed slot rather than an old queue of offscreen bundles.
+                    launcher.icon_loading.remove(&paths[0]);
+                    launcher.icon_cache.insert(paths[0].clone(), icon_image());
+                    launcher.schedule_icon_loads(cx);
+                    assert_eq!(launcher.icon_loading.len(), MAX_ICON_LOADS);
+                    assert!(launcher.icon_loading.contains(&new_path));
+                })
+                .unwrap();
         });
     }
 
@@ -2040,7 +2119,12 @@ mod tests {
                     launcher.state.screen = None;
                     launcher.state.items = vec![app_bundle_item("finder", &finder)];
                     launcher.schedule_icon_loads(cx);
-                    assert!(launcher.icon_loading.is_none());
+                    assert!(launcher.icon_loading.is_empty());
+                    for screen in [Screen::Actions, Screen::Output] {
+                        launcher.state.screen = Some(screen);
+                        launcher.schedule_icon_loads(cx);
+                        assert!(launcher.icon_loading.is_empty());
+                    }
                 })
                 .unwrap()
         });
@@ -2057,7 +2141,7 @@ mod tests {
                     launcher.state.screen = Some(Screen::Search);
                     launcher.state.items = vec![app_bundle_item("finder", &finder)];
                     launcher.schedule_icon_loads(cx);
-                    assert_eq!(launcher.icon_loading.as_deref(), Some(finder.as_path()));
+                    assert!(launcher.icon_loading.contains(&finder));
                 })
                 .unwrap()
         });
@@ -2066,8 +2150,11 @@ mod tests {
             window
                 .update(cx, |launcher, _, _| {
                     assert!(launcher.icon_cache.contains_key(&finder));
-                    assert!(launcher.icon_loading.is_none());
+                    assert!(launcher.icon_loading.is_empty());
                     assert!(!launcher.icon_failed.contains(&finder));
+                    let image = launcher.icon_cache.get(&finder).unwrap();
+                    assert_eq!(image.frame_count(), 1);
+                    assert_eq!(image.as_bytes(0).unwrap().len(), 64 * 64 * 4);
                 })
                 .unwrap()
         });
@@ -2753,6 +2840,15 @@ mod tests {
             scroll.0.borrow().base_handle.offset().y <= px(-384.),
             "wheel must reach beyond the first eight rows"
         );
+        cx.read(|cx| {
+            let view = view.read(cx);
+            let (generation, range) = view.icon_viewport.as_ref().unwrap();
+            assert_eq!(*generation, view.state.generation);
+            assert!(
+                range.start >= 8,
+                "icon priority must follow the actual wheel-scrolled viewport"
+            );
+        });
         for _ in 0..49 {
             visual.dispatch_action(MoveDown);
         }
@@ -2767,5 +2863,16 @@ mod tests {
             scroll.0.borrow().base_handle.offset().y < px(-1500.),
             "keyboard selection must keep the final row visible"
         );
+        cx.read(|cx| {
+            assert!(
+                view.read(cx)
+                    .icon_viewport
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .contains(&49),
+                "icon priority must follow keyboard scrolling too"
+            );
+        });
     }
 }

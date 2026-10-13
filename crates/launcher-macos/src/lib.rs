@@ -17,7 +17,7 @@ pub mod process;
 pub mod spotlight;
 mod thumbnail_cache;
 
-pub use application_icon::application_icon;
+pub use application_icon::{ApplicationIconPixels, application_icon, application_icon_pixels};
 pub use application_watcher::ApplicationWatcher;
 pub use applications::{Application, application_search_paths, discover_applications, discover_in};
 pub use hotkey::{GlobalHotkey, is_activation_event, validate_hotkey};
