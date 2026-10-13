@@ -4,10 +4,9 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use config::{Config, config_path, history_path};
 use gpui::Application;
-use launcher_core::{HistoryStore, ProviderRegistry, SearchCoordinator};
+use launcher_core::{HistoryStore, Provider, ProviderRegistry, SearchCoordinator};
 use launcher_macos::{
-    GlobalHotkey, NativePlatform, configure_accessory_app, discover_applications,
-    is_activation_event,
+    GlobalHotkey, NativePlatform, configure_accessory_app, discover_in, is_activation_event,
 };
 use provider_apps::ApplicationProvider;
 use provider_calculator::CalculatorProvider;
@@ -59,8 +58,9 @@ fn main() -> Result<()> {
     if config.files.use_zoxide || config.files.use_fzf {
         tracing::warn!("files.use_zoxide/use_fzf are ignored; the files provider now uses fd");
     }
-    let applications = discover_applications().context("scanning installed applications")?;
+    let app_roots = config.apps.search_paths()?;
     if args.check {
+        let applications = discover_in(&app_roots).context("scanning installed applications")?;
         println!(
             "configuration: {}",
             if config_file.exists() {
@@ -92,10 +92,21 @@ fn main() -> Result<()> {
     let history = Arc::new(HistoryStore::open(&history_file).context("opening usage history")?);
     let platform = Arc::new(NativePlatform);
     let mut registry = ProviderRegistry::new();
-    registry.register(
-        Arc::new(ApplicationProvider::new(applications, platform.clone())),
-        config.providers.apps.clone(),
-    )?;
+    // A watched provider installs watches before its first scan and republishes
+    // prebuilt records after debounced changes. A disabled provider is never
+    // searched, so it neither scans nor watches.
+    let apps: Arc<dyn Provider> = if !config.providers.apps.enabled {
+        Arc::new(ApplicationProvider::new(Vec::new(), platform.clone()))
+    } else if config.apps.watch {
+        Arc::new(
+            ApplicationProvider::watched(app_roots.clone(), platform.clone())
+                .context("starting application catalog watcher")?,
+        )
+    } else {
+        let applications = discover_in(&app_roots).context("scanning installed applications")?;
+        Arc::new(ApplicationProvider::new(applications, platform.clone()))
+    };
+    registry.register(apps, config.providers.apps.clone())?;
     registry.register(
         Arc::new(CalculatorProvider::new(platform.clone())),
         config.providers.calculator.clone(),

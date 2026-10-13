@@ -3,13 +3,16 @@ use launcher_core::{
     Action, ActionId, ActionOutcome, IconDescriptor, Item, ItemId, Provider, ProviderId,
     SearchContext, SearchQuery,
 };
-use launcher_macos::{Application, Platform};
+use launcher_macos::{Application, ApplicationWatcher, Platform};
 use nucleo_matcher::{
     Config, Matcher, Utf32String,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 struct SearchableApplication {
     item: Item,
@@ -21,18 +24,18 @@ const ID: &str = "apps";
 const OPEN: &str = "open";
 const REVEAL: &str = "reveal";
 
-pub struct ApplicationProvider {
+struct ApplicationIndex {
     applications: Vec<Application>,
-    platform: Arc<dyn Platform>,
     index: Vec<SearchableApplication>,
+    revision: u64,
 }
 
-impl ApplicationProvider {
-    pub fn new(applications: Vec<Application>, platform: Arc<dyn Platform>) -> Self {
+impl ApplicationIndex {
+    fn new(applications: Vec<Application>, revision: u64) -> Self {
         let index = applications
             .iter()
             .map(|app| {
-                let item = Self::item(app);
+                let item = ApplicationProvider::item(app);
                 let haystack =
                     Utf32String::from(format!("{} {}", item.title, item.keywords.join(" ")));
                 let exact_title = item.title.trim().to_lowercase();
@@ -45,9 +48,58 @@ impl ApplicationProvider {
             .collect();
         Self {
             applications,
-            platform,
             index,
+            revision,
         }
+    }
+}
+
+// Build outside the publication lock. Searches keep an Arc to a complete old
+// or new index, never a partially rebuilt catalog or a lock held during I/O.
+fn publish_index(state: &RwLock<Arc<ApplicationIndex>>, applications: Vec<Application>) {
+    let current = state.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if current.applications == applications {
+        return;
+    }
+    let next = Arc::new(ApplicationIndex::new(applications, current.revision + 1));
+    *state.write().unwrap_or_else(|e| e.into_inner()) = next;
+}
+
+pub struct ApplicationProvider {
+    snapshot: Arc<RwLock<Arc<ApplicationIndex>>>,
+    platform: Arc<dyn Platform>,
+    watcher: Option<ApplicationWatcher>,
+}
+
+impl ApplicationProvider {
+    /// Fixed catalog for examples, tests and installations with watching disabled.
+    pub fn new(applications: Vec<Application>, platform: Arc<dyn Platform>) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(Arc::new(ApplicationIndex::new(
+                applications,
+                0,
+            )))),
+            platform,
+            watcher: None,
+        }
+    }
+
+    /// Install watches before discovery, then publish prebuilt records after
+    /// debounced background scans. The watcher never retains this provider.
+    pub fn watched(roots: Vec<PathBuf>, platform: Arc<dyn Platform>) -> Result<Self> {
+        let mut provider = Self::new(Vec::new(), platform);
+        let state = provider.snapshot.clone();
+        provider.watcher = Some(ApplicationWatcher::start(roots, move |apps| {
+            publish_index(&state, apps);
+        })?);
+        Ok(provider)
+    }
+
+    fn snapshot(&self) -> Arc<ApplicationIndex> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn item(app: &Application) -> Item {
@@ -63,6 +115,9 @@ impl ApplicationProvider {
         if let Some(executable) = &app.executable_name {
             keywords.push(executable.clone());
         }
+        if let Some(name) = &app.unlocalized_name {
+            keywords.push(name.clone());
+        }
         Item {
             id: ItemId(stable_id),
             provider: ProviderId(ID.into()),
@@ -76,7 +131,7 @@ impl ApplicationProvider {
         }
     }
 
-    fn path_for<'a>(&'a self, item: &Item) -> Result<&'a std::path::Path> {
+    fn path_for(&self, item: &Item) -> Result<PathBuf> {
         if item.provider != ProviderId(ID.into()) {
             bail!("item is not an application result")
         }
@@ -85,10 +140,14 @@ impl ApplicationProvider {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("application result has no path"))?;
-        self.applications
+        self.snapshot()
+            .index
             .iter()
-            .find(|app| app.path == std::path::Path::new(path))
-            .map(|app| app.path.as_path())
+            .find(|app| {
+                app.item.id == item.id
+                    && app.item.payload.get("path").and_then(|v| v.as_str()) == Some(path)
+            })
+            .map(|_| PathBuf::from(path))
             .ok_or_else(|| anyhow::anyhow!("application is not in this provider's index"))
     }
 }
@@ -100,6 +159,12 @@ impl Provider for ApplicationProvider {
     fn name(&self) -> &str {
         "Applications"
     }
+    fn revision(&self) -> u64 {
+        self.snapshot().revision
+    }
+    fn status(&self) -> Option<String> {
+        self.watcher.as_ref().and_then(ApplicationWatcher::status)
+    }
 
     fn search(&self, query: &SearchQuery, ctx: &SearchContext) -> Result<Vec<Item>> {
         if ctx.cancellation.is_cancelled() {
@@ -108,7 +173,8 @@ impl Provider for ApplicationProvider {
         let pattern = Pattern::parse(&query.text, CaseMatching::Ignore, Normalization::Smart);
         let mut matcher = Matcher::new(Config::DEFAULT);
         let mut scored = Vec::new();
-        for app in &self.index {
+        let snapshot = self.snapshot();
+        for app in &snapshot.index {
             if ctx.cancellation.is_cancelled() {
                 return Ok(Vec::new());
             }
@@ -158,8 +224,8 @@ impl Provider for ApplicationProvider {
     fn activate(&self, item: &Item, action: &Action) -> Result<ActionOutcome> {
         let path = self.path_for(item)?;
         match action.id.0.as_str() {
-            OPEN => self.platform.launch_application(path)?,
-            REVEAL => self.platform.reveal_in_finder(path)?,
+            OPEN => self.platform.launch_application(&path)?,
+            REVEAL => self.platform.reveal_in_finder(&path)?,
             _ => bail!("unsupported application action: {}", action.id.0),
         }
         Ok(ActionOutcome::Close)
@@ -197,6 +263,7 @@ mod tests {
             path: format!("/Applications/{name}.app").into(),
             bundle_id: Some(bundle.into()),
             display_name: name.into(),
+            unlocalized_name: None,
             executable_name: Some(name.to_lowercase()),
             icon_path: None,
         }
@@ -285,6 +352,84 @@ mod tests {
             "apps:com.apple.safari"
         );
     }
+    #[test]
+    fn searches_unlocalized_names_without_changing_the_display_title() {
+        let mut localized = app("カレンダー", "com.apple.calendar");
+        localized.unlocalized_name = Some("Calendar".into());
+        localized.executable_name = None;
+        let p = ApplicationProvider::new(vec![localized], Arc::new(FakePlatform::default()));
+        let found = p
+            .search(
+                &SearchQuery {
+                    raw: "calendar".into(),
+                    text: "calendar".into(),
+                },
+                &ctx(1),
+            )
+            .unwrap();
+        assert_eq!(found[0].title, "カレンダー");
+        assert!(found[0].keywords.contains(&"Calendar".to_string()));
+    }
+
+    #[test]
+    fn publishing_a_changed_catalog_updates_search_and_rejects_stale_actions() {
+        let platform = Arc::new(FakePlatform::default());
+        let p = ApplicationProvider::new(vec![app("Old", "dev.old")], platform.clone());
+        let old = p
+            .search(&SearchQuery::default(), &ctx(10))
+            .unwrap()
+            .remove(0);
+        publish_index(&p.snapshot, vec![app("New", "dev.new")]);
+        assert_eq!(p.revision(), 1);
+        let found = p.search(&SearchQuery::default(), &ctx(10)).unwrap();
+        assert_eq!(found[0].title, "New");
+        assert!(p.actions(&old).is_empty());
+        assert!(
+            p.activate(
+                &old,
+                &Action {
+                    id: ActionId(OPEN.into()),
+                    title: "Open".into()
+                }
+            )
+            .is_err()
+        );
+        assert!(platform.0.lock().unwrap().is_empty());
+        publish_index(&p.snapshot, vec![app("New", "dev.new")]);
+        assert_eq!(
+            p.revision(),
+            1,
+            "an unchanged scan must not trigger UI searches"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_refresh_stays_consistent() {
+        let p = ApplicationProvider::new(
+            vec![app("Old", "dev.old")],
+            Arc::new(FakePlatform::default()),
+        );
+        let before = p.snapshot();
+        publish_index(&p.snapshot, vec![app("New", "dev.new")]);
+        assert_eq!(before.index[0].item.title, "Old");
+        assert_eq!(before.revision, 0);
+        assert_eq!(p.snapshot().index[0].item.title, "New");
+    }
+
+    #[test]
+    fn replacing_an_app_at_the_same_path_rejects_its_previous_identity() {
+        let p = ApplicationProvider::new(
+            vec![app("Editor", "dev.old")],
+            Arc::new(FakePlatform::default()),
+        );
+        let old = p
+            .search(&SearchQuery::default(), &ctx(1))
+            .unwrap()
+            .remove(0);
+        publish_index(&p.snapshot, vec![app("Editor", "dev.new")]);
+        assert!(p.actions(&old).is_empty());
+    }
+
     #[test]
     fn exact_application_name_is_kept_when_results_are_limited() {
         let p = ApplicationProvider::new(

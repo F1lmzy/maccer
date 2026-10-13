@@ -15,6 +15,7 @@ use std::{
 pub struct Config {
     pub launcher: LauncherConfig,
     pub providers: ProvidersConfig,
+    pub apps: ApplicationConfig,
     pub web: WebConfig,
     pub files: FileSearchConfig,
     pub shell: ShellConfig,
@@ -66,6 +67,67 @@ pub struct WebConfig {
     pub engines: Vec<WebEngine>,
 }
 
+/// Application catalog discovery settings. The system application roots are
+/// always scanned; `paths` add extra roots that take precedence during
+/// duplicate resolution.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ApplicationConfig {
+    pub paths: Vec<String>,
+    /// Refresh the catalog after debounced filesystem changes. When false the
+    /// catalog is scanned once at startup.
+    pub watch: bool,
+}
+impl Default for ApplicationConfig {
+    fn default() -> Self {
+        Self {
+            paths: vec![],
+            watch: true,
+        }
+    }
+}
+impl ApplicationConfig {
+    /// Configured roots first, then the fixed system roots. Earlier roots win
+    /// bundle-identifier and canonical-path conflicts during discovery.
+    pub fn search_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut roots = if self.paths.is_empty() {
+            Vec::new()
+        } else {
+            expand_roots(&self.paths, "application search")?
+        };
+        roots.extend(launcher_macos::application_search_paths());
+        Ok(roots)
+    }
+}
+
+/// Expand `~`/`~/` prefixes and reject relative, parent-traversing or
+/// control-character entries. Shared by the file and application roots so both
+/// accept the same path shapes.
+fn expand_roots(paths: &[String], label: &str) -> Result<Vec<PathBuf>> {
+    let home = dirs::home_dir().with_context(|| format!("finding home directory for {label}"))?;
+    paths
+        .iter()
+        .map(|text| {
+            let path = if text == "~" {
+                home.clone()
+            } else if let Some(relative) = text.strip_prefix("~/") {
+                home.join(relative.trim_start_matches('/'))
+            } else {
+                PathBuf::from(text)
+            };
+            let traverses_parent = path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir);
+            if !path.is_absolute() || text.chars().any(char::is_control) || traverses_parent {
+                bail!(
+                    "{label} paths must be absolute or start with ~/, without '..' or control characters"
+                );
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct FileSearchConfig {
@@ -94,26 +156,7 @@ impl Default for FileSearchConfig {
 }
 impl FileSearchConfig {
     fn expand(paths: &[String]) -> Result<Vec<PathBuf>> {
-        let home = dirs::home_dir().context("finding home directory for file search")?;
-        paths
-            .iter()
-            .map(|text| {
-                let path = if text == "~" {
-                    home.clone()
-                } else if let Some(relative) = text.strip_prefix("~/") {
-                    home.join(relative.trim_start_matches('/'))
-                } else {
-                    PathBuf::from(text)
-                };
-                let traverses_parent = path
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir);
-                if !path.is_absolute() || text.chars().any(char::is_control) || traverses_parent {
-                    bail!("file search paths must be absolute or start with ~/, without '..' or control characters");
-                }
-                Ok(path)
-            })
-            .collect()
+        expand_roots(paths, "file search")
     }
     pub fn fd_config(&self) -> Result<launcher_macos::fd_index::FdConfig> {
         Ok(launcher_macos::fd_index::FdConfig {
@@ -293,6 +336,10 @@ impl Config {
             bail!("files.ignore_previews supports at most 64 paths");
         }
         self.files.fd_config()?.validate()?;
+        if self.apps.paths.len() > 64 {
+            bail!("apps.paths supports at most 64 directories");
+        }
+        self.apps.search_paths()?;
         if !self.launcher.width.is_finite() || !(400.0..=1200.0).contains(&self.launcher.width) {
             bail!("launcher.width must be between 400 and 1200 points");
         }
@@ -437,6 +484,73 @@ mod tests {
             config.files.roots = roots;
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn apps_default_to_watching_with_no_extra_paths() {
+        let config = Config::default();
+        assert!(config.apps.watch);
+        assert!(config.apps.paths.is_empty());
+        let roots = config.apps.search_paths().unwrap();
+        assert_eq!(roots.first().unwrap(), &PathBuf::from("/Applications"));
+        assert_eq!(
+            roots.last().unwrap(),
+            &PathBuf::from("/System/Library/CoreServices/Finder.app")
+        );
+    }
+
+    #[test]
+    fn app_extra_paths_expand_and_precede_the_system_roots() {
+        let config: Config =
+            toml::from_str("[apps]\npaths = ['/opt/apps', '~/Extras', '~//Extras2']\n").unwrap();
+        assert_eq!(config.apps.paths.len(), 3);
+        let roots = config.apps.search_paths().unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(roots[0], PathBuf::from("/opt/apps"));
+        assert_eq!(roots[1], home.join("Extras"));
+        assert_eq!(roots[2], home.join("Extras2"));
+        // System roots still follow the configured ones.
+        assert_eq!(roots[3], PathBuf::from("/Applications"));
+        assert!(config.apps.watch);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn app_watch_can_be_disabled_and_paths_default_to_empty() {
+        let config: Config = toml::from_str("[apps]\nwatch = false\n").unwrap();
+        assert!(!config.apps.watch);
+        assert!(config.apps.paths.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn app_paths_reject_relative_parent_and_control_entries() {
+        for paths in [
+            vec!["relative".to_string()],
+            vec!["~/../other".to_string()],
+            vec!["/tmp/apps\u{7}".to_string()],
+        ] {
+            let mut config = Config::default();
+            config.apps.paths = paths;
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn app_paths_are_bounded() {
+        let mut config = Config::default();
+        config.apps.paths = (0..65).map(|i| format!("/tmp/apps{i}")).collect();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("apps.paths"), "{error}");
+    }
+
+    #[test]
+    fn example_config_declares_the_apps_table() {
+        let example: Config =
+            toml::from_str(include_str!("../../../config/config.example.toml")).unwrap();
+        assert!(example.apps.watch);
+        assert!(example.apps.paths.is_empty());
+        example.validate().unwrap();
     }
 
     #[test]

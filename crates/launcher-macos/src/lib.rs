@@ -1,6 +1,7 @@
 //! macOS integration for maccer. Native services live here; core and UI stay portable.
 
 mod application_icon;
+mod application_watcher;
 mod applications;
 pub mod clipboard;
 pub mod fd_index;
@@ -17,6 +18,7 @@ pub mod spotlight;
 mod thumbnail_cache;
 
 pub use application_icon::application_icon;
-pub use applications::{Application, discover_applications, discover_in};
+pub use application_watcher::ApplicationWatcher;
+pub use applications::{Application, application_search_paths, discover_applications, discover_in};
 pub use hotkey::{GlobalHotkey, is_activation_event, validate_hotkey};
 pub use platform::{NativePlatform, Platform, configure_accessory_app, mouse_display_bounds};

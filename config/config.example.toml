@@ -18,6 +18,16 @@ priority = 90
 default_search = false
 max_results = 1
 
+# Application catalog discovery. The system roots (/Applications,
+# /System/Applications, /System/Library/CoreServices/Applications, ~/Applications
+# and Finder) are always scanned. Extra roots listed here are scanned first, so
+# a bundle found there wins bundle-identifier and path conflicts.
+[apps]
+paths = []
+# Example: paths = ["/opt/apps", "~/Applications/Setapp"]
+# Rescan after debounced filesystem changes. Set false for a one-time startup scan.
+watch = true
+
 [providers.files]
 enabled = true
 prefix = "/"
