@@ -9,16 +9,21 @@ mod file_metadata;
 pub mod file_preview;
 pub mod file_tools;
 pub mod file_transfer;
+mod frontend_instance;
 mod hotkey;
 #[cfg(target_os = "macos")]
 mod image_thumbnail;
 mod platform;
 pub mod process;
+pub mod resident;
+mod service_runtime;
 pub mod spotlight;
 mod thumbnail_cache;
 
 pub use application_icon::{ApplicationIconPixels, application_icon, application_icon_pixels};
 pub use application_watcher::ApplicationWatcher;
 pub use applications::{Application, application_search_paths, discover_applications, discover_in};
+pub use frontend_instance::FrontendInstance;
 pub use hotkey::{GlobalHotkey, is_activation_event, validate_hotkey};
 pub use platform::{NativePlatform, Platform, configure_accessory_app, mouse_display_bounds};
+pub use service_runtime::{run_service_loop, run_service_loop_with};

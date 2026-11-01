@@ -20,6 +20,45 @@ pub struct Config {
     pub files: FileSearchConfig,
     pub shell: ShellConfig,
     pub clipboard: ClipboardConfig,
+    pub service: ServiceConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ServiceConfig {
+    pub frontend: Option<FrontendConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendConfig {
+    pub kind: String,
+    pub path: String,
+}
+
+impl FrontendConfig {
+    pub fn expanded_path(&self) -> Result<PathBuf> {
+        let path = self.path.trim();
+        if path.is_empty() || path.chars().any(char::is_control) || path.contains('\0') {
+            bail!("service.frontend.path must be a nonempty path without control characters");
+        }
+        let home = dirs::home_dir().context("finding home directory for service frontend")?;
+        let expanded = if path == "~" {
+            home
+        } else if let Some(relative) = path.strip_prefix("~/") {
+            home.join(relative)
+        } else {
+            PathBuf::from(path)
+        };
+        if !expanded.is_absolute()
+            || expanded
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            bail!("service.frontend.path must be absolute or start with ~/, without '..'");
+        }
+        Ok(expanded)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -58,6 +97,8 @@ pub struct ProvidersConfig {
     pub files: ProviderConfig,
     pub shell: ProviderConfig,
     pub clipboard: ProviderConfig,
+    /// Shared-service read-only theme browsing; ignored by embedded frontends.
+    pub themes: ProviderConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +265,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             files: ProviderOverrides,
             shell: ProviderOverrides,
             clipboard: ProviderOverrides,
+            themes: ProviderOverrides,
         }
         let raw = Raw::deserialize(deserializer)?;
         let defaults = ProvidersConfig::default();
@@ -234,6 +276,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             files: raw.files.apply(defaults.files),
             shell: raw.shell.apply(defaults.shell),
             clipboard: raw.clipboard.apply(defaults.clipboard),
+            themes: raw.themes.apply(defaults.themes),
         })
     }
 }
@@ -285,6 +328,13 @@ impl Default for ProvidersConfig {
                 default_search: false,
                 max_results: 50,
             },
+            themes: ProviderConfig {
+                enabled: true,
+                prefix: Some("/themes".into()),
+                priority: 50,
+                default_search: true,
+                max_results: 50,
+            },
             web: ProviderConfig {
                 enabled: true,
                 prefix: Some("?".into()),
@@ -315,6 +365,12 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         validate_hotkey(&self.launcher.hotkey)?;
+        if let Some(frontend) = &self.service.frontend {
+            if !matches!(frontend.kind.as_str(), "gpui" | "pill") {
+                bail!("service.frontend.kind must be 'gpui' or 'pill'");
+            }
+            frontend.expanded_path()?;
+        }
         if !(1..=1000).contains(&self.clipboard.max_entries) {
             bail!("clipboard.max_entries must be between 1 and 1000");
         }
@@ -353,6 +409,7 @@ impl Config {
             ("files", &self.providers.files),
             ("shell", &self.providers.shell),
             ("clipboard", &self.providers.clipboard),
+            ("themes", &self.providers.themes),
         ];
         for (name, provider) in providers.iter().copied() {
             if !(1..=100).contains(&provider.max_results) {
@@ -596,6 +653,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_theme_provider_defaults_and_overrides_are_validated() {
+        let defaults = Config::default();
+        assert_eq!(defaults.providers.themes.prefix.as_deref(), Some("/themes"));
+        assert!(defaults.providers.themes.enabled && defaults.providers.themes.default_search);
+        let configured: Config =
+            toml::from_str("[providers.themes]\nenabled = false\nmax_results = 7\n").unwrap();
+        assert!(!configured.providers.themes.enabled);
+        assert_eq!(configured.providers.themes.max_results, 7);
+        assert_eq!(
+            configured.providers.themes.prefix,
+            defaults.providers.themes.prefix
+        );
+        configured.validate().unwrap();
+        let invalid: Config = toml::from_str("[providers.themes]\nmax_results = 0\n").unwrap();
+        assert!(invalid.validate().is_err());
+        let duplicate: Config = toml::from_str("[providers.themes]\nprefix = '/apps'\n").unwrap();
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
     fn provider_overrides_keep_per_provider_defaults() {
         let config: Config = toml::from_str(
             r#"
@@ -751,6 +828,34 @@ mod tests {
                 .to_string()
                 .contains("unsupported")
         );
+    }
+
+    #[test]
+    fn optional_service_frontend_config_is_validated_and_expands_home() {
+        let default = Config::default();
+        assert!(default.service.frontend.is_none());
+        let gpui: Config =
+            toml::from_str("[service.frontend]\nkind='gpui'\npath='~/Applications/maccer'")
+                .unwrap();
+        gpui.validate().unwrap();
+        assert_eq!(
+            gpui.service.frontend.unwrap().expanded_path().unwrap(),
+            dirs::home_dir().unwrap().join("Applications/maccer")
+        );
+        for (kind, path) in [
+            ("other", "/tmp/app"),
+            ("pill", "relative"),
+            ("gpui", "/tmp/../app"),
+            ("gpui", ""),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[service.frontend]\nkind={kind:?}\npath={path:?}"))
+                    .unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted kind={kind:?} path={path:?}"
+            );
+        }
     }
 
     #[test]

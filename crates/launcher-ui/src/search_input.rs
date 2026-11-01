@@ -49,6 +49,9 @@ pub(crate) struct SearchInput {
     is_selecting: bool,
     horizontal_offset: Pixels,
     events: async_channel::Sender<SearchInputEvent>,
+    /// Palette owned by this input's window. Defaults to the embedded theme so
+    /// a launcher without service state keeps its current appearance.
+    theme: Theme,
 }
 
 pub(crate) fn bind_keys(cx: &mut App) {
@@ -88,7 +91,23 @@ impl SearchInput {
             is_selecting: false,
             horizontal_offset: px(0.),
             events,
+            theme: crate::theme::theme(),
         }
+    }
+
+    /// Replace this input's palette. Used only by its own window, so separate
+    /// launchers (or a window without service state) keep independent colors.
+    pub(crate) fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        if self.theme != theme {
+            self.theme = theme;
+            cx.notify();
+        }
+    }
+
+    /// Test-only view of the palette this input paints with.
+    #[cfg(test)]
+    pub(crate) fn theme_matches(&self, theme: &Theme) -> bool {
+        self.theme == *theme
     }
 
     pub(crate) fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
@@ -610,7 +629,7 @@ impl Render for SearchInput {
                     .px_1()
                     .child(SearchInputElement {
                         input: cx.entity(),
-                        theme: crate::theme::theme(),
+                        theme: self.theme.clone(),
                     }),
             )
     }

@@ -1,4 +1,4 @@
-mod config;
+use launcher_config as config;
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -7,6 +7,7 @@ use gpui::Application;
 use launcher_core::{HistoryStore, Provider, ProviderRegistry, SearchCoordinator};
 use launcher_macos::{
     GlobalHotkey, NativePlatform, configure_accessory_app, discover_in, is_activation_event,
+    resident::{ResidentEvent, ResidentMenu, show_error_alert},
 };
 use provider_apps::ApplicationProvider;
 use provider_calculator::CalculatorProvider;
@@ -24,7 +25,10 @@ struct Args {
     /// Read configuration from this path instead of ~/.config/maccer/config.toml
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Validate config and scan applications without opening a window or registering a hotkey
+    /// Connect to an already-running shared service instead of starting embedded providers
+    #[arg(long, conflicts_with = "config")]
+    service_socket: Option<PathBuf>,
+    /// Validate embedded config, or probe IPC in service mode, without opening a window
     #[arg(long)]
     check: bool,
     /// Open the launcher immediately on startup instead of starting hidden
@@ -40,7 +44,20 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
+    let report_visibly = !args.check && cfg!(target_os = "macos");
+    run(args).inspect_err(|error| {
+        if report_visibly {
+            report_error("maccer could not start", error);
+        }
+    })
+}
+
+fn run(args: Args) -> Result<()> {
     tracing::debug!(show_on_start = args.show, "launcher starting");
+    let socket_env = std::env::var_os("MACCER_SERVICE_SOCKET");
+    if let Some(socket) = selected_service_socket(&args, socket_env.as_deref())? {
+        return run_service_frontend(socket, args.show, args.check);
+    }
     let config_file = config_path(args.config.as_deref())?;
     if args.config.is_some() && !config_file.is_file() {
         bail!(
@@ -55,6 +72,12 @@ fn main() -> Result<()> {
         defaults.validate()?;
         defaults
     };
+    if !args.check && config.service.frontend.is_some() {
+        tracing::warn!(
+            "a shared-service frontend is configured; use the backend shortcut instead of starting an embedded GPUI frontend"
+        );
+        return Ok(());
+    }
     if config.files.use_zoxide || config.files.use_fzf {
         tracing::warn!("files.use_zoxide/use_fzf are ignored; the files provider now uses fd");
     }
@@ -203,17 +226,17 @@ fn main() -> Result<()> {
             .detach();
         }
         if let Err(error) = configure_accessory_app() {
-            tracing::warn!(%error, "could not set accessory activation policy");
+            fail_startup(cx, error.context("setting accessory activation policy"));
+            return;
         }
-        let hotkey = match GlobalHotkey::new(&config.launcher.hotkey) {
-            Ok(hotkey) => hotkey,
-            Err(error) => fail_startup(error.context("registering global hotkey")),
+        let (events_tx, events_rx) = async_channel::unbounded::<ResidentEvent>();
+        let menu = match ResidentMenu::new(events_tx.clone()) {
+            Ok(menu) => menu,
+            Err(error) => {
+                fail_startup(cx, error.context("creating menu bar controls"));
+                return;
+            }
         };
-        tracing::debug!(
-            shortcut = %config.launcher.hotkey,
-            hotkey_id = hotkey.id(),
-            "launcher shortcut registered"
-        );
         let window = match launcher_ui::open_launcher(
             coordinator,
             history,
@@ -224,61 +247,205 @@ fn main() -> Result<()> {
             cx,
         ) {
             Ok(window) => window,
-            Err(error) => fail_startup(error.context("opening launcher window")),
+            Err(error) => {
+                fail_startup(cx, error.context("opening launcher window"));
+                return;
+            }
         };
         if show_on_start
             && let Err(error) = window.update(cx, |launcher, window, cx| launcher.show(window, cx))
         {
-            fail_startup(error.context("showing launcher window"));
+            fail_startup(cx, error.context("showing launcher window"));
+            return;
         }
-        let hotkey_id = hotkey.id();
-        let (events_tx, events_rx) = async_channel::unbounded::<()>();
-        std::thread::spawn(move || {
-            loop {
-                match global_hotkey::GlobalHotKeyEvent::receiver().recv() {
-                    Ok(event) if is_activation_event(&event, hotkey_id) => {
-                        tracing::debug!(hotkey_id, "launcher shortcut pressed");
-                        if events_tx.send_blocking(()).is_err() {
+        let hotkey = match GlobalHotkey::new(&config.launcher.hotkey) {
+            Ok(hotkey) => Some(hotkey),
+            Err(error) => {
+                let error = error.context("Use Open Launcher in the menu bar. Change [launcher].hotkey in your config and restart maccer.");
+                cx.spawn(async move |_| {
+                    // Yield until Application::run releases its mutable app borrow.
+                    gpui::Timer::after(std::time::Duration::ZERO).await;
+                    report_error("maccer shortcut unavailable", &error);
+                }).detach();
+                None
+            }
+        };
+        if let Some(hotkey) = &hotkey {
+            let hotkey_id = hotkey.id();
+            tracing::debug!(shortcut = %config.launcher.hotkey, hotkey_id, "launcher shortcut registered");
+            std::thread::spawn(move || {
+                loop {
+                    match global_hotkey::GlobalHotKeyEvent::receiver().recv() {
+                        Ok(event) if is_activation_event(&event, hotkey_id) => {
+                            if events_tx.send_blocking(ResidentEvent::ToggleLauncher).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "global hotkey event channel closed");
+                            let _ = events_tx.send_blocking(ResidentEvent::HotkeyFailed);
                             break;
                         }
                     }
-                    Ok(event) => {
-                        tracing::debug!(
-                            event_id = event.id,
-                            state = ?event.state,
-                            hotkey_id,
-                            "ignoring non-activation shortcut event"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "global hotkey event channel closed");
+                }
+            });
+        }
+        tracing::debug!("launcher ready; menu bar controls available");
+        cx.spawn(async move |cx| {
+            // These native owners must outlive the hidden window.
+            let _hotkey = hotkey;
+            let menu = menu;
+            while let Ok(event) = events_rx.recv().await {
+                let result = match event {
+                    ResidentEvent::OpenLauncher | ResidentEvent::ToggleLauncher => cx
+                        .update(|cx| {
+                            window.update(cx, |launcher, window, cx| {
+                                if event == ResidentEvent::OpenLauncher {
+                                    launcher.show(window, cx);
+                                } else {
+                                    launcher.toggle(window, cx);
+                                }
+                            })
+                        })
+                        .and_then(|result| result),
+                    // Modal Cocoa loops must never run inside cx.update, which borrows App.
+                    ResidentEvent::ToggleLaunchAtLogin => menu.toggle_launch_at_login(),
+                    ResidentEvent::Quit => {
+                        let _ = cx.update(|cx| cx.quit());
                         break;
                     }
-                }
-            }
-        });
-        tracing::debug!("launcher ready; listening for shortcut events");
-        cx.spawn(async move |cx| {
-            let _hotkey = hotkey;
-            while events_rx.recv().await.is_ok() {
-                tracing::debug!("handling launcher shortcut");
-                // `cx.update` and `WindowHandle::update` each return a `Result`, so the
-                // nested call yields `Result<Result<_, _>>`. Flatten it, otherwise an inner
-                // window error is silently swallowed and the loop keeps the hotkey alive.
-                if let Err(error) = cx
-                    .update(|cx| {
-                        window.update(cx, |launcher, window, cx| launcher.toggle(window, cx))
-                    })
-                    .and_then(|result| result)
-                {
-                    tracing::error!(%error, "launcher shortcut cannot update window");
-                    break;
+                    ResidentEvent::HotkeyFailed => {
+                        show_error_alert(
+                            "maccer shortcut stopped working",
+                            "Use Open Launcher in the menu bar, then restart maccer to restore the shortcut.",
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = result {
+                    report_error("maccer action failed", &error);
                 }
             }
         })
         .detach();
     });
 
+    Ok(())
+}
+
+/// Choose IPC before reading any embedded configuration or initializing providers.
+fn selected_service_socket(
+    args: &Args,
+    environment: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>> {
+    let socket = args.service_socket.clone().or_else(|| {
+        environment
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = &socket {
+        if args.config.is_some() {
+            bail!(
+                "--config belongs to the backend; pass it to maccer-service, not the IPC frontend"
+            );
+        }
+        let text = path.to_str().context("service socket path must be UTF-8")?;
+        if !path.is_absolute() || text.len() > 4096 || text.contains('\0') {
+            bail!("service socket path must be absolute, NUL-free and at most 4096 UTF-8 bytes");
+        }
+    }
+    Ok(socket)
+}
+
+fn run_service_frontend(socket: PathBuf, show_on_start: bool, check: bool) -> Result<()> {
+    if check {
+        // This read-only CLI probe runs before GPUI, so blocking IPC cannot block its UI.
+        let mut client = launcher_client::Client::connect(&socket)
+            .context("connecting to the existing service; no backend was started")?;
+        let providers = client
+            .providers()
+            .context("reading service provider descriptors")?;
+        println!("service instance: {}", client.hello().instance_id);
+        println!("providers available: {}", providers.len());
+        return Ok(());
+    }
+    if !cfg!(target_os = "macos") {
+        bail!("the GPUI frontend requires macOS; use --check to probe the service");
+    }
+    let _instance = match launcher_agent::frontend_startup::claim(&socket, "gpui") {
+        Ok(instance) => instance,
+        Err(error) => {
+            // Refusal must not leave a resident UI or a modal startup alert
+            // beside the selected frontend. Diagnostics stay in the log.
+            tracing::warn!("GPUI frontend startup refused: {error:#}");
+            return Ok(());
+        }
+    };
+    Application::new().run(move |cx| {
+        if let Err(error) = configure_accessory_app() {
+            fail_startup(cx, error.context("setting frontend activation policy"));
+            return;
+        }
+        let (events_tx, events_rx) = async_channel::unbounded::<ResidentEvent>();
+        let menu = match ResidentMenu::new_frontend(events_tx) {
+            Ok(menu) => menu,
+            Err(error) => {
+                fail_startup(cx, error.context("creating frontend menu controls"));
+                return;
+            }
+        };
+        let window = match launcher_ui::open_service_launcher(
+            &socket,
+            launcher_ui::LauncherOptions {
+                width: 480.,
+                max_results: 50,
+            },
+            cx,
+        ) {
+            Ok(window) => window,
+            Err(error) => {
+                fail_startup(cx, error.context("opening service frontend"));
+                return;
+            }
+        };
+        if show_on_start
+            && let Err(error) = window.update(cx, |launcher, window, cx| launcher.show(window, cx))
+        {
+            fail_startup(cx, error.context("showing service frontend"));
+            return;
+        }
+        // No clipboard timer, native icon resolver, provider registry, history store,
+        // global shortcut or service lifecycle owner is created by this branch.
+        cx.spawn(async move |cx| {
+            let menu = menu;
+            while let Ok(event) = events_rx.recv().await {
+                let result = match event {
+                    ResidentEvent::OpenLauncher | ResidentEvent::ToggleLauncher => cx
+                        .update(|cx| {
+                            window.update(cx, |launcher, window, cx| {
+                                if event == ResidentEvent::OpenLauncher {
+                                    launcher.show(window, cx);
+                                } else {
+                                    launcher.toggle(window, cx);
+                                }
+                            })
+                        })
+                        .and_then(|result| result),
+                    ResidentEvent::ToggleLaunchAtLogin => menu.toggle_launch_at_login(),
+                    ResidentEvent::Quit => {
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
+                    }
+                    ResidentEvent::HotkeyFailed => continue,
+                };
+                if let Err(error) = result {
+                    report_error("maccer frontend action failed", &error);
+                }
+            }
+        })
+        .detach();
+    });
     Ok(())
 }
 
@@ -289,10 +456,22 @@ fn main() -> Result<()> {
 /// return on that path, so a startup failure would be indistinguishable from a
 /// clean shutdown. Exiting directly also guarantees no invisible resident
 /// process is left behind.
-fn fail_startup(error: anyhow::Error) -> ! {
+fn fail_startup(cx: &mut gpui::App, error: anyhow::Error) {
     let error = error.context("launcher startup failed");
-    tracing::error!(%error, "launcher startup failed");
-    std::process::exit(1);
+    cx.spawn(async move |_| {
+        // runModal spins Cocoa's event loop. Wait until startup releases App's
+        // RefCell borrow so clipboard/window callbacks can safely re-enter GPUI.
+        gpui::Timer::after(std::time::Duration::ZERO).await;
+        report_error("maccer could not start", &error);
+        std::process::exit(1);
+    })
+    .detach();
+}
+
+fn report_error(title: &str, error: &anyhow::Error) {
+    let detail = format!("{error:#}");
+    tracing::error!(%detail, "{title}");
+    show_error_alert(title, &detail);
 }
 
 #[cfg(test)]
@@ -310,5 +489,57 @@ mod tests {
         assert!(!args.show);
 
         assert!(Args::try_parse_from(["maccer", "--nonsense"]).is_err());
+    }
+
+    #[test]
+    fn service_mode_selection_is_explicit_and_cli_overrides_environment() {
+        let args = Args::try_parse_from(["maccer", "--service-socket", "/tmp/owned/rpc", "--show"])
+            .unwrap();
+        assert_eq!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new("/tmp/env/rpc"))).unwrap(),
+            Some(PathBuf::from("/tmp/owned/rpc")),
+        );
+        let args = Args::try_parse_from(["maccer", "--show"]).unwrap();
+        assert_eq!(selected_service_socket(&args, None).unwrap(), None);
+        assert_eq!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new(""))).unwrap(),
+            None
+        );
+        assert_eq!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new("/tmp/env/rpc"))).unwrap(),
+            Some(PathBuf::from("/tmp/env/rpc")),
+        );
+    }
+
+    #[test]
+    fn service_mode_rejects_frontend_provider_config_and_invalid_paths() {
+        assert!(
+            Args::try_parse_from([
+                "maccer",
+                "--service-socket",
+                "/tmp/owned/rpc",
+                "--config",
+                "/does/not/exist",
+            ])
+            .is_err()
+        );
+        let args = Args::try_parse_from(["maccer", "--config", "/does/not/exist"]).unwrap();
+        assert!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new("/tmp/owned/rpc"))).is_err()
+        );
+        let args = Args::try_parse_from(["maccer", "--check"]).unwrap();
+        assert!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new("relative/rpc"))).is_err()
+        );
+        assert!(
+            selected_service_socket(&args, Some(std::ffi::OsStr::new("/tmp/bad\0rpc"))).is_err()
+        );
+        assert!(
+            selected_service_socket(
+                &args,
+                Some(std::ffi::OsStr::new(&format!("/{}", "x".repeat(4096))))
+            )
+            .is_err()
+        );
     }
 }

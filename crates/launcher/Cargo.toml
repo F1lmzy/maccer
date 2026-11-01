@@ -12,8 +12,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-channel.workspace = true
 launcher-core = { path = "../launcher-core" }
+launcher-config = { path = "../launcher-config" }
 launcher-macos = { path = "../launcher-macos" }
 launcher-ui = { path = "../launcher-ui" }
+launcher-client = { path = "../launcher-client" }
+launcher-agent = { path = "../launcher-agent" }
 provider-apps = { path = "../provider-apps" }
 provider-calculator = { path = "../provider-calculator" }
 provider-web = { path = "../provider-web" }
@@ -29,3 +32,8 @@ tracing-subscriber.workspace = true
 global-hotkey.workspace = true
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+
+[dev-dependencies]
+launcher-protocol = { path = "../launcher-protocol" }
+launcher-service = { path = "../launcher-service" }
+tempfile = "3"

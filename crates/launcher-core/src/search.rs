@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    CancellationToken, HistoryStore, Item, ProviderId, ProviderRegistry, QueryMode, SearchContext,
-    SearchQuery,
+    CancellationToken, HistoryStore, Item, ParsedQuery, ProviderId, ProviderRegistry, QueryMode,
+    SearchContext, SearchQuery,
 };
 
 #[derive(Clone, Debug)]
@@ -50,6 +50,20 @@ impl SearchCoordinator {
         }
     }
     pub fn start(&self, raw: String) -> SearchSession {
+        let parsed = self.registry.parse(&raw);
+        self.start_parsed(parsed)
+    }
+    /// Starts a search scoped to a provider without requiring a configured query prefix.
+    /// Used by explicit frontend routes such as the searchable home menu.
+    pub fn start_provider(&self, raw: String, provider: ProviderId) -> SearchSession {
+        self.start_parsed(ParsedQuery {
+            raw: raw.clone(),
+            search_text: raw,
+            mode: QueryMode::Provider(provider),
+        })
+    }
+    fn start_parsed(&self, parsed: ParsedQuery) -> SearchSession {
+        let raw = parsed.raw.clone();
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let cancellation = CancellationToken::default();
         if let Ok(mut active) = self.active.lock()
@@ -58,7 +72,6 @@ impl SearchCoordinator {
             previous.cancel();
         }
         let (sender, receiver) = async_channel::bounded(32);
-        let parsed = self.registry.parse(&raw);
         let providers: Vec<_> = match &parsed.mode {
             QueryMode::Mixed => self
                 .registry

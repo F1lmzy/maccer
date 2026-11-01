@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 gpui.workspace = true
 launcher-core = { path = "../launcher-core" }
+launcher-agent = { path = "../launcher-agent" }
+launcher-protocol = { path = "../launcher-protocol" }
 launcher-macos = { path = "../launcher-macos" }
 anyhow.workspace = true
 tracing.workspace = true
@@ -17,4 +19,9 @@ image = { version = "0.25.1", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+launcher-service = { path = "../launcher-service" }
+provider-apps = { path = "../provider-apps" }
+provider-web = { path = "../provider-web" }
+provider-clipboard = { path = "../provider-clipboard" }
+tempfile = "3"
 gpui = { workspace = true, features = ["test-support"] }

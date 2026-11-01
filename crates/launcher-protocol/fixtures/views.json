@@ -1,0 +1,97 @@
+[
+  {
+    "viewId": "view-1",
+    "revision": "1",
+    "route": {"type": "home"},
+    "query": "theme",
+    "sections": [
+      {
+        "id": "providers",
+        "title": "Providers",
+        "layoutHint": "list",
+        "items": [
+          {
+            "id": "apps",
+            "providerId": "menu",
+            "revision": "1",
+            "kind": "provider",
+            "title": "Apps",
+            "subtitle": "Find and open applications",
+            "icon": {"type": "glyph", "name": "apps", "fallbackText": "A"},
+            "content": [{"type": "text", "text": "Applications", "truncated": false, "fallbackText": "Apps"}],
+            "data": null,
+            "actions": [{"id": "open", "actionRef": "ref-home-apps", "title": "Open Apps", "isPrimary": true, "kind": "navigate"}],
+            "detailsAvailable": false
+          },
+          {
+            "id": "themes",
+            "providerId": "menu",
+            "revision": "1",
+            "kind": "provider",
+            "title": "Themes",
+            "subtitle": "Browse and apply themes",
+            "icon": {"type": "glyph", "name": "palette", "fallbackText": "T"},
+            "content": [{"type": "text", "text": "Browse themes", "truncated": false, "fallbackText": "Themes"}],
+            "data": null,
+            "actions": [{"id": "open", "actionRef": "ref-home-themes", "title": "Open Themes", "isPrimary": true, "kind": "navigate"}],
+            "detailsAvailable": false
+          }
+        ]
+      },
+      {
+        "id": "results",
+        "title": "Results",
+        "layoutHint": null,
+        "items": [
+          {
+            "id": "catppuccin",
+            "providerId": "themes",
+            "revision": "1",
+            "kind": "theme",
+            "title": "Catppuccin Mocha",
+            "subtitle": "Dark theme",
+            "icon": {"type": "glyph", "name": "palette", "fallbackText": "T"},
+            "content": [{"type": "colorPalette", "colors": [{"role": "background", "value": "#1e1e2e"}, {"role": "accent", "value": "#cba6f7"}], "fallbackText": "Dark theme with a purple accent"}],
+            "data": {"type": "themeSummary", "schemaVersion": 1, "slug": "catppuccin", "variant": "dark"},
+            "actions": [{"id": "apply", "actionRef": "ref-theme-apply", "title": "Apply theme", "isPrimary": true, "kind": "invoke", "confirmation": "Apply Catppuccin? It changes the desktop theme."}],
+            "detailsAvailable": true
+          },
+          {
+            "id": "wallpaper-1",
+            "providerId": "wallpapers",
+            "revision": "1",
+            "kind": "wallpaper",
+            "title": "Moonlit ridge",
+            "subtitle": "Catppuccin Mocha",
+            "icon": {"type": "asset", "asset": {"id": "asset-wallpaper-thumb", "revision": "1", "representations": ["image/jpeg"]}, "fallbackText": "W"},
+            "content": [{"type": "image", "asset": {"id": "asset-wallpaper-thumb", "revision": "1", "representations": ["image/jpeg"]}, "alt": "Mountain ridge at night", "fallbackText": "Moonlit ridge wallpaper"}],
+            "data": {"type": "wallpaperSummary", "schemaVersion": 1, "themeSlug": "catppuccin", "wallpaperId": "wallpaper-1"},
+            "actions": [{"id": "apply", "actionRef": "ref-wallpaper-apply", "title": "Set wallpaper", "isPrimary": true, "kind": "invoke"}],
+            "detailsAvailable": true
+          }
+        ]
+      },
+      {
+        "id": "calculator",
+        "title": "Calculator",
+        "layoutHint": null,
+        "items": [{
+          "id": "calculator:42",
+          "providerId": "calculator",
+          "revision": "1",
+          "kind": "calculation",
+          "title": "42",
+          "subtitle": "6 * 7",
+          "icon": {"type": "glyph", "name": "equals", "fallbackText": "="},
+          "content": [{"type": "value", "value": "42", "label": "6 * 7", "fallbackText": "6 * 7 = 42"}],
+          "data": {"type": "calculation", "schemaVersion": 1, "expression": "6 * 7", "result": "42"},
+          "actions": [{"id": "copy", "actionRef": "ref-calculator-copy", "title": "Copy result", "isPrimary": true, "kind": "invoke"}],
+          "detailsAvailable": false
+        }]
+      }
+    ],
+    "complete": true,
+    "truncated": false,
+    "errors": []
+  }
+]

@@ -4,6 +4,14 @@ width = 480
 # Keep up to 50 results; the window shows six rows at a time.
 max_results = 50
 
+# Shared-service only. Unset by default, so the backend has no global shortcut
+# until a frontend is selected. Restart the backend after changing this.
+# [service.frontend]
+# kind = "gpui"
+# path = "~/Documents/maccer/target/debug/maccer"
+# For Pill, use kind = "pill" and the application bundle directory:
+# path = "~/pill-macos-spike/build/app/PillSpike.app"
+
 [providers.apps]
 enabled = true
 prefix = "/apps"
@@ -70,12 +78,24 @@ enabled = true
 prefix = ":"
 priority = 60
 # Clipboard contents never participate in ordinary app search.
+# Shared-service mode captures in the backend even with no frontend running.
+# Copy and history management work there; direct Paste is embedded-only.
 default_search = false
 max_results = 50
 
 [clipboard]
 # Text-only, in-memory history. Pinned entries count toward this limit.
 max_entries = 200
+
+# Shared-service only. Browsing/preview never applies a theme. Live Apply
+# requires explicit confirmation and leaves wallpaper unchanged. Disable this
+# provider to avoid starting either catalog or mutation helpers.
+[providers.themes]
+enabled = true
+prefix = "/themes"
+priority = 50
+default_search = true
+max_results = 50
 
 [providers.web]
 enabled = true

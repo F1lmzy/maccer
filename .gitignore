@@ -1,5 +1,6 @@
 /target/
 /.codegraph/
+/.pi/
 .DS_Store
 *.dSYM/
 *.app/
