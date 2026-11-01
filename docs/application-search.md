@@ -6,11 +6,27 @@ Application metadata is discovered at startup and refreshed after debounced file
 
 Search now uses prebuilt item templates, UTF-32 fuzzy-match strings, and normalized exact titles. It performs no native icon calls or filesystem access, ranks references to those records, and clones only the retained results. Name, path, bundle-id and executable matching, exact-name priority and deterministic tie-breaking are preserved.
 
-The live application catalog now follows the directory-discovery and snapshot-refresh architecture described in [Vicinae-style application catalog](vicinae-app-implementation.md). Finder-localized names keep their raw bundle names as search aliases, and configured app roots take precedence over default roots. Catalog refresh builds new searchable records on the watcher thread and publishes an immutable snapshot; unchanged catalogs do not increment the revision. The UI's existing revision poll refreshes current results after catalog changes. Static providers remain available when `[apps].watch = false`.
+The live application catalog uses bounded directory discovery and immutable snapshot refresh. Finder-localized names keep their raw bundle names as search aliases, and configured app roots take precedence over default roots. Catalog refresh builds new searchable records on the watcher thread and publishes an immutable snapshot; unchanged catalogs do not increment the revision. The UI's existing revision poll refreshes current results after catalog changes. Static providers remain available when `[apps].watch = false`.
 
 Results carry `IconDescriptor::ApplicationBundle(PathBuf)`. The UI now fills at most four background icon-load slots. Each bundle has at most one active load, even across query changes. The uniform list reports its actual viewport after mouse or keyboard scrolling; those rows take priority over offscreen warming. Completion selects new work from current results instead of retaining an old query's queue. Hidden, action and output screens stop new loads. Existing loads may finish and populate the process-lifetime cache.
 
 The native worker obtains an NSWorkspace icon and a retained CGImage snapshot under a short AppKit lock, because NSImage backing representations may be shared and thread-unsafe. CoreGraphics then draws outside that lock into a 64x64 BGRA buffer. The worker converts premultiplied alpha to straight alpha and creates an `Arc<gpui::RenderImage>`. This bypasses TIFF export, ImageIO resize/PNG encoding, PNG hashing and GPUI PNG decoding. Rows only look up cached render-ready images; missing images use placeholders. Each pixel buffer is 16 KiB. The legacy PNG API remains available for compatibility and comparison, but application rows no longer use it.
+
+## Catalog discovery and refresh
+
+Standard roots include CoreServices/Applications and Finder. Discovery scans root entries, one subfolder level and immediate companions under `Contents/Applications`, not arbitrary internal helpers. Earlier roots win duplicate bundle IDs. Finder-localized names retain differing raw bundle names as searchable aliases. No upstream GPL implementation was copied.
+
+Existing roots are watched recursively; missing roots use a nonrecursive watch on the nearest existing ancestor. A bounded event channel coalesces changes after 500 ms of quiet, capped at two seconds per burst. Failed watches retry on a timer. Refresh publishes an immutable index snapshot only when metadata changes; searches never scan the filesystem or decode icons. Initial discovery failure stops startup, while background failure retains the last-good snapshot. A 30,000-entry budget rejects exhaustion rather than publishing partial results. Shutdown stops and joins the worker.
+
+Activation checks the current item identity and path, rejecting removed, moved or replaced entries from stale results. The UI polls provider revisions, so visible refresh includes notification latency, debounce, scanning and the UI poll.
+
+```toml
+[apps]
+paths = ["/opt/apps", "~/Applications/Setapp"]
+watch = true
+```
+
+Up to 64 extra roots precede built-in roots. Paths must be absolute or begin with `~/`, without parent traversal or control characters. `watch = false` uses a single startup scan. Configuration changes require a restart. Regression coverage includes discovery bounds, aliases, precedence, add/remove/rename, unchanged revisions, stale activation, failed-watch recovery and worker shutdown.
 
 ## Measurements
 

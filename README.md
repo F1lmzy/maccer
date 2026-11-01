@@ -1,8 +1,10 @@
 # maccer
 
-A small, keyboard-first macOS launcher written in Rust and GPUI. The current build searches installed applications and personal files, searches text clipboard history, evaluates calculator expressions, offers configured web search engines, and runs explicitly selected shell commands. This is the first usable slice of the larger plan in `gpui-macos-launcher-plan.md`, not a complete implementation of that roadmap.
+A keyboard-first macOS launcher with an independent background service and removable GPUI or Pill/QML frontends. Shared-service mode supplies applications, web search, text clipboard history and themes. Embedded GPUI also supports files, calculator expressions and explicitly selected shell commands.
 
-## Run
+## Run embedded GPUI
+
+This mode requires no `[service.frontend]` selection. For a backend-owned shortcut and Pill or GPUI frontend, follow the [shared-service guide](docs/shared-service.md).
 
 Requires macOS, Rust 1.85 or newer (edition 2024), a working Apple SDK, and `fd` for the files provider. Install `fd` with `brew install fd`, or set `[providers.files].enabled = false`. GPUI is pinned to 0.2.2 with runtime shader compilation enabled, so full Xcode is not required merely to compile on machines with Command Line Tools. First build can take a few minutes.
 
@@ -12,7 +14,24 @@ cargo run -p launcher
 
 The launcher starts hidden and stays resident. Press **Option-Space** to toggle it. Use arrows (or Ctrl-N/Ctrl-P) to move, Return to use the default action, Cmd-Return or Cmd-K for the action menu, Tab for the secondary action, Cmd-P or `;` for the provider picker, and Escape to go back, clear the query, or hide the window. Prefixes are configurable; defaults are `/apps`, `/` for files, `=`, `?`, `:` for clipboard history, and `>` for shell commands. If Karabiner remaps your left Option key, use right Option-Space.
 
-While the launcher window is focused, **Cmd-Q** quits. There is no menu bar item yet, so there is no global quit affordance; if the window is hidden, use `kill <pid>` or re-open it with Option-Space first.
+The **maccer** menu bar item has **Open Launcher**, **Launch at Login**, and **Quit** actions, even while the launcher is hidden. Open Launcher always shows the window; Option-Space still toggles it. **Cmd-Q** also quits while the launcher is focused.
+
+### Install as a resident app
+
+Launch at Login requires macOS 13 or newer and a signed app bundle. Build one with:
+
+```sh
+./scripts/bundle-macos.sh
+mkdir -p ~/Applications
+cp -R target/release/maccer.app ~/Applications/
+open ~/Applications/maccer.app
+```
+
+Quit any terminal-launched copy first. Enable **Launch at Login** from the installed app's menu. It is off by default; macOS saves the registration through `SMAppService.mainAppService`, not the TOML config. A checkmark means enabled, a dash means awaiting approval in **System Settings > General > Login Items**. Click either to disable. The app offers to open System Settings when approval is needed. The menu refreshes from macOS each time it opens, so changes in System Settings are reflected.
+
+Terminal builds have the same Open Launcher and Quit actions, but Launch at Login is disabled. The script uses ad-hoc signing for local builds; set `MACCER_SIGNING_IDENTITY` to a signing identity for distribution. Signing/notarization for distribution and the actual login-time launch remain manual verification steps. macOS registration errors appear in an alert rather than setting a false local preference. Keep the app at its installed location; disable Launch at Login before replacing it, then re-enable it afterward.
+
+For a faster development bundle, use `./scripts/bundle-macos.sh debug`, which creates `target/debug/maccer.app`.
 
 ### Development flags
 
@@ -28,17 +47,23 @@ cargo run -p launcher -- --config ./config/config.example.toml --check
 
 `--config PATH` selects a TOML file other than the default.
 
+## Shared service
+
+The backend owns providers, capture, theme state and the global shortcut. Only the selected service-mode native frontend can start; a shared lifetime lock prevents duplicate GPUI/Pill processes. Closing a frontend leaves the backend running. Headless clients remain independent.
+
+See the [setup and operations guide](docs/shared-service.md) for building both frontends, selecting Pill or GPUI, starting the backend, clipboard privacy, confirmed theme actions, verification and known limits. The [architecture contract](docs/provider-service-spec.md) describes IPC, snapshots, action authorization and lifecycle. The protocol is experimental; files, calculator, shell, direct Paste and independent installation have not migrated.
+
 ## Configuration
 
 Configuration is read from `~/.config/maccer/config.toml`. Start from [`config/config.example.toml`](config/config.example.toml). Partial files inherit defaults, so a file with only `[launcher]` keeps the default providers. Provider tables merge field by field: `[providers.calculator] priority = 123` keeps the calculator prefix, `default_search`, and result limit. Web search engines default to Google and DuckDuckGo; define `[[web.engines]]` tables to replace that list, and set `[web].default_engine` to one of the configured ids.
 
-Usage history is stored at `~/Library/Application Support/maccer/history.sqlite3`. maccer records an activation only after the action succeeds; each record includes the query text, the provider and item identifiers, the action, and a timestamp. Ranking uses per-item activation counts plus a bounded recency bonus. The database never leaves the machine; delete the file to clear history. Set `RUST_LOG=debug` for diagnostics. Hotkey conflicts are reported to stderr; change `[launcher].hotkey` and rerun.
+Usage history is stored at `~/Library/Application Support/maccer/history.sqlite3`. maccer records an activation only after the action succeeds; each record includes the query text, the provider and item identifiers, the action, and a timestamp. Ranking uses per-item activation counts plus a bounded recency bonus. The database never leaves the machine; delete the file to clear history. Set `RUST_LOG=debug` for diagnostics. Startup failures display a native alert with the error chain and exit nonzero after dismissal. Hotkey conflicts display an alert but leave the app running, so Open Launcher and Quit remain available in the menu bar. Change `[launcher].hotkey` and restart to restore the shortcut. `--check` remains terminal-only and never opens an alert.
 
 ### Application search and icons
 
 Application metadata and fuzzy-match strings are indexed once at startup. Each query matches in memory and clones only the ranked results; it does no filesystem access or native icon extraction.
 
-Results carry `IconDescriptor::ApplicationBundle` paths. The GUI displays results immediately with placeholders, then resolves Finder icons on a single background worker, choosing the next icon from the current ranked results after each load. Images and failed lookups are cached until restart. PNGs are at most 64 pixels per side and 256 KiB; asset-catalog icons and `.icns` resources are supported. Icon loading never delays search completion.
+Results carry `IconDescriptor::ApplicationBundle` paths. The GUI displays placeholders immediately, then resolves Finder icons through four bounded background workers with visible-row priority and per-bundle single-flight. Render-ready straight-alpha BGRA icons are at most 64x64. Embedded GPUI caches them for its process lifetime; the service and adapters use bounded caches. Icon loading never delays search completion.
 
 See [application-search measurements and upstream comparisons](docs/application-search.md). To measure discovery, cold/warm matching, and coordinator result delivery without opening a window:
 
@@ -65,13 +90,15 @@ The default keeps 50 results with six visible rows. Scroll with the trackpad/mou
 
 ### Clipboard history
 
-Type `:` to browse recent text copies, or `: words` to search them. Return copies the selected entry back to the clipboard and closes the launcher. Cmd-K opens Copy, Paste, Pin/Unpin, Delete, and Clear History actions. Tab invokes Paste. Cmd-Shift-P shows the full text preview.
+Type `:` to browse recent text copies, or `: words` to search them. Return copies the selected entry back to the clipboard and closes the launcher. Cmd-K opens Copy, Paste, Pin/Unpin, Delete, and Clear History actions. Tab invokes Paste in embedded mode. Cmd-Shift-P shows the text preview.
+
+In shared-service mode, capture belongs to the background service and survives closing GPUI or Pill. History disappears when that service exits, not when a frontend closes. Copy, Pin/Unpin, Delete and Clear History work in both frontends. Direct Paste is unavailable until previous-app handoff is verified, so use Copy and Cmd-V in the target app. Service details and frontend previews have bounded text lengths; Copy still uses the stored entry. New captures appear on the next query or when you reopen history.
 
 History stays in memory and disappears when maccer exits, including pins. Capture starts after launch and polls every 300 ms; rapid copies between polls may be missed. The text already on the clipboard at startup is not captured. Duplicate copies move the existing entry to the front. Pins prevent automatic eviction, but Delete and Clear History remove them.
 
 The default limit is 200 entries, configurable with `[clipboard].max_entries` from 1 to 1,000. Text is limited to 64 KiB per entry and 4 MiB total. If pinned entries leave no room, new copies are ignored. History never participates in ordinary app search and clipboard queries/activations are excluded from SQLite usage history. Set `[providers.clipboard].enabled = false` to disable capture.
 
-Paste returns to the application active before the launcher opened and requires **System Settings > Privacy & Security > Accessibility** permission for maccer. Copy needs no extra permission. If the target cannot be confirmed, no paste keystroke is sent. After a delayed-paste failure, the error appears when the launcher is reopened; the text remains available for manual Cmd-V.
+In embedded mode, Paste returns to the application active before the launcher opened and requires **System Settings > Privacy & Security > Accessibility** permission for maccer. Copy needs no extra permission. If the target cannot be confirmed, no paste keystroke is sent. After a delayed-paste failure, the error appears when the launcher is reopened; the text remains available for manual Cmd-V.
 
 Files, images, and pasteboard content marked concealed, transient, or autogenerated are skipped. **Unmarked passwords and other sensitive text can still enter history.** In-memory storage avoids intentional disk persistence; it is not a password detector or a guarantee against OS memory swapping.
 
@@ -89,7 +116,7 @@ Shell command text and activations are excluded from SQLite history. The launche
 
 Included:
 
-- Resident floating launcher window and global hotkey.
+- Resident floating launcher window, global hotkey, menu bar controls, and native launch-at-login support.
 - Application discovery, native icons, open, and reveal in Finder (via NSWorkspace).
 - Fuzzy application/file search, calculator, and configurable web search providers.
 - fd-indexed file/folder discovery, live updates, text/image/PDF previews, native file/path copying and external dragging.
@@ -102,8 +129,8 @@ Included:
 Not included yet:
 
 - Image/file clipboard history and emoji/symbols.
-- Login item, menu bar item, settings GUI.
-- Multi-monitor placement and theme reload.
+- Settings GUI.
+- Multi-monitor placement and embedded GPUI theme reload.
 - Plugin protocol, accessibility review, code signing/notarization, automatic updates.
 
 ## Development
@@ -121,4 +148,4 @@ cargo build -p launcher
 cargo run -p launcher-ui --example retained_window_smoke
 ```
 
-It performs 20 show/hide cycles and exits nonzero if the main thread stalls. See [`docs/runtime-verification.md`](docs/runtime-verification.md) for what has and has not been verified on real macOS.
+It performs 20 show/hide cycles and exits nonzero if the main thread stalls. See the [shared-service verification limits](docs/shared-service.md#verification-and-remaining-limits) before treating scoped checks as a clean workspace-wide gate. Physical hotkey/remapper behavior, real IME input, native desktop theme Apply, login-time launch and notarization still require manual acceptance.
