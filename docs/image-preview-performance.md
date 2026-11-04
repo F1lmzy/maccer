@@ -39,7 +39,7 @@ The legacy `thumbnail()` PNG path is test-only now. It emits `pipeline="png"` st
 For native-only stage logs:
 
 ```sh
-RUST_LOG=debug cargo run -p launcher-macos --example preview_bench -- /path/to/image.png
+RUST_LOG=debug cargo run -p launcher --example preview_bench -- /path/to/image.png
 ```
 
 Tests capture real debug events for both native pipelines, icon labelling, a failing native stage, and PNG versus raw-pixel GPUI preparation, including request-span correlation.
@@ -69,7 +69,7 @@ Debug builds on generated 3840x2160 PNG/JPEG fixtures, on the same Mac. Cold bac
 Backend figures exclude UI scheduling, GPU upload, and presentation. The native UI measurement ends at GPUI building the ready element tree, not screen presentation; it is not a p95 or broad hardware benchmark. These generated fixtures do not represent every codec. Cold images still require file I/O and decoding; PNG decompression remains the dominant cost in this sample.
 
 ```sh
-cargo run -p launcher-macos --example preview_bench -- /path/to/image.png --cold
+cargo run -p launcher --example preview_bench -- /path/to/image.png --cold
 RUST_LOG=debug cargo run -p launcher --example preview_ui_smoke -- /path/to/image.png
 ```
 

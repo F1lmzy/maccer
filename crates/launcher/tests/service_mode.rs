@@ -1,5 +1,5 @@
-use launcher_client::Client;
-use launcher_service::{Server, Service};
+use launcher_agent::client::Client;
+use launcher_agent::service::{Server, Service};
 use std::{
     os::unix::fs::PermissionsExt,
     process::Command,
@@ -31,8 +31,8 @@ impl Fixture {
             std::fs::create_dir(&target).unwrap();
             service
                 .attach_frontend(
-                    launcher_service::FrontendRouter::new(
-                        launcher_protocol::FrontendKind::Pill,
+                    launcher_agent::service::FrontendRouter::new(
+                        launcher_agent::protocol::FrontendKind::Pill,
                         target,
                         dir.path().join("rpc"),
                     )
@@ -147,7 +147,7 @@ fn pill_selection_refuses_gpui_startup_without_opening_a_window() {
         "{diagnostics}"
     );
     assert!(
-        launcher_macos::FrontendInstance::claim(&fixture.socket())
+        launcher_agent::macos::FrontendInstance::claim(&fixture.socket())
             .unwrap()
             .is_some()
     );

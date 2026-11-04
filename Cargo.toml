@@ -1,20 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/launcher-core",
-    "crates/launcher-protocol",
-    "crates/launcher-service",
-    "crates/launcher-client",
-    "crates/launcher-config",
-    "crates/launcher-agent",
-    "crates/launcher-macos",
-    "crates/launcher-ui",
-    "crates/provider-apps",
-    "crates/provider-calculator",
-    "crates/provider-web",
-    "crates/provider-files",
-    "crates/provider-shell",
-    "crates/provider-clipboard",
     "crates/launcher",
 ]
 

@@ -20,7 +20,7 @@ Home is a searchable backend view. An empty query lists enabled providers; selec
 Use macOS with a working Rust toolchain and Apple SDK:
 
 ```sh
-cargo build -p launcher-service -p launcher -p launcher-client
+cargo build -p launcher
 # Optional signed GPUI bundle:
 ./scripts/bundle-macos.sh release
 ```
@@ -110,24 +110,21 @@ Do not retry an uncertain operation after disconnect or restart. Deduplication i
 
 ## Verification and remaining limits
 
-The test suites cover socket permissions and ownership, framing and bounds, independent sessions, stale/cross-session authority, retained mutation results, confirmation, shared providers, rich previews, palette updates and native admission. See the [architecture contract](provider-service-spec.md) and `crates/launcher-protocol/schema/protocol.schema.json` for wire details.
+The test suites cover socket permissions and ownership, framing and bounds, independent sessions, stale/cross-session authority, retained mutation results, confirmation, shared providers, rich previews, palette updates and native admission. See the [architecture contract](provider-service-spec.md) and `crates/launcher/schema/protocol.schema.json` for wire details.
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace
-cargo test -p launcher-protocol -p launcher-client -p launcher-service \
-  -p launcher-agent -p launcher-config -p launcher-ui -p launcher -- --test-threads=1
-cargo test -p launcher-macos --lib frontend_instance
-cargo test -p launcher-macos --test service_hotkey
-cargo clippy -p launcher-protocol -p launcher-client -p launcher-service \
-  -p launcher-config -p launcher-ui -p launcher -p launcher-macos \
-  --all-targets --no-deps -- -D warnings
+cargo test -p launcher -- --test-threads=1
+cargo test -p launcher --lib frontend_instance
+cargo test -p launcher --test service_hotkey
+cargo clippy -p launcher --all-targets --no-deps -- -D warnings
 ```
+
+The launcher is one package. The former `launcher-*` and `provider-*` crates are modules under `crates/launcher/src`, so the whole launcher builds and tests as a unit. The C ABI header is `crates/launcher/include/maccer_agent.h`, and `cargo build -p launcher --lib` still produces `liblauncher_agent.dylib`; Pill's `MACCER_SOURCE` scripts must use those two paths.
 
 Pill's `scripts/test.sh` includes QML-to-IPC owned-data web/clipboard acceptance, native geometry, Swift integration and relocated-bundle checks. Its latest full run passed 22 launcher C++ and 80 QML tests with no skips. Rust startup tests cover both kinds, C ownership and GPUI process refusal. Injected Option-Space has opened/refocused Pill without GPUI, and closing/reopening Pill preserved the backend instance and four providers. This is not physical keyboard/IME or native desktop mutation acceptance.
 
-The pre-publish serialized workspace run passed 468 Rust tests with only the known file-index regression filtered out. The filter is not a fix; the unfiltered workspace gate remains open.
-
-Known validation issues remain separate from this service work: the broader native library's `fd_index::tests::broad_queries_are_bounded_without_hiding_older_literal_matches` regression, timing-sensitive parallel watched-theme tests, and legacy embedded-agent strict Clippy diagnostics. Do not interpret scoped gates as a clean full-workspace test/lint gate. GPUI's retained-window patch has its own [native regression instructions](gpui-patch.md).
+The consolidated workspace passes `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, 469 Rust tests with `--test-threads=1`, and the two native harness checks (`resident_menu` and `service_hotkey`). Timing-sensitive watcher tests should still be rerun when changing debounce or filesystem behavior. GPUI's retained-window patch has its own [native regression instructions](gpui-patch.md).
 
 Independent installation, login lifecycle, complete JSON Schema validator conformance, streaming, larger service previews, remaining provider migration and retirement of embedded ownership are unfinished.

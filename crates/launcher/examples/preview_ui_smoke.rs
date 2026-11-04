@@ -3,7 +3,7 @@
 //! Reads the supplied file; performs no file actions or history persistence.
 use anyhow::Result;
 use gpui::{Application, Timer};
-use launcher_core::{
+use launcher_agent::core::{
     Action, ActionOutcome, CancellationToken, HistoryStore, Item, ItemId, Preview, Provider,
     ProviderConfig, ProviderId, ProviderRegistry, SearchContext, SearchCoordinator, SearchQuery,
 };
@@ -43,7 +43,7 @@ impl Provider for ImageProvider {
         true
     }
     fn preview(&self, _: &Item, token: &CancellationToken) -> Result<Option<Preview>> {
-        let result = launcher_macos::file_preview::preview(&self.path, token);
+        let result = launcher_agent::macos::file_preview::preview(&self.path, token);
         self.completed.store(true, Ordering::Release);
         result.map(Some)
     }
@@ -83,10 +83,10 @@ fn main() {
             history.clone(),
             8,
         ));
-        let window = launcher_ui::open_launcher(
+        let window = launcher_agent::ui::open_launcher(
             coordinator,
             history,
-            launcher_ui::LauncherOptions {
+            launcher_agent::ui::LauncherOptions {
                 width: 480.,
                 max_results: 8,
             },

@@ -1,11 +1,11 @@
 //! cargo run --release -p launcher --example app_search_bench -- safari
 use anyhow::Result;
-use launcher_core::{
+use launcher_agent::core::{
     CancellationToken, HistoryStore, Provider, ProviderConfig, ProviderRegistry, SearchContext,
     SearchCoordinator, SearchQuery,
 };
-use launcher_macos::{NativePlatform, discover_applications};
-use provider_apps::ApplicationProvider;
+use launcher_agent::macos::{NativePlatform, discover_applications};
+use launcher_agent::providers::apps::ApplicationProvider;
 use std::{sync::Arc, time::Instant};
 
 fn main() -> Result<()> {

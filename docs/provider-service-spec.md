@@ -12,7 +12,7 @@ Each connection has an independent session, search coordinator, view revisions a
 
 ## Public contract
 
-`launcher-protocol` defines Rust DTOs, the [JSON Schema](../crates/launcher-protocol/schema/protocol.schema.json) and fixtures. Public DTOs contain no GPUI/Qt types, frontend image URLs, executable commands or provider-private payloads. Providers project safe display data through service presentation adapters; internal `Item.payload` never crosses IPC.
+The `protocol` module defines Rust DTOs, the [JSON Schema](../crates/launcher/schema/protocol.schema.json) and fixtures. Public DTOs contain no GPUI/Qt types, frontend image URLs, executable commands or provider-private payloads. Providers project safe display data through service presentation adapters; internal `Item.payload` never crosses IPC.
 
 Public objects include provider descriptors, routes, snapshots, result items, content blocks, action descriptors, asset references and structured errors. Titles remain readable. Content blocks provide fallback text for unknown types. Unknown domain records retain their discriminator/schema version but discard unrecognized fields. This is a display contract, not a lossless proxy format. Layout hints are preferences, not frontend components.
 

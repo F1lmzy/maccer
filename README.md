@@ -142,10 +142,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p launcher
 ```
 
+The whole launcher is one package, `crates/launcher`. Its former `launcher-*` and `provider-*` crates are now modules under `src` (`core`, `protocol`, `client`, `config`, `macos`, `agent`, `service`, `ui`, `providers`). The package builds the `maccer`, `maccer-service` and `maccer-client` binaries plus the `liblauncher_agent.dylib` C ABI consumed by Pill; the header is at `crates/launcher/include/maccer_agent.h`.
+
 `gpui` is patched locally to fix a retained-window reactivation deadlock. See [`docs/gpui-patch.md`](docs/gpui-patch.md). The native regression check is:
 
 ```sh
-cargo run -p launcher-ui --example retained_window_smoke
+cargo run -p launcher --example retained_window_smoke
 ```
 
 It performs 20 show/hide cycles and exits nonzero if the main thread stalls. See the [shared-service verification limits](docs/shared-service.md#verification-and-remaining-limits) before treating scoped checks as a clean workspace-wide gate. Physical hotkey/remapper behavior, real IME input, native desktop theme Apply, login-time launch and notarization still require manual acceptance.

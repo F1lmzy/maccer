@@ -2,7 +2,7 @@
 //! Compare with --png, optionally --parallel. Each invocation is a fresh process.
 //! Measures six-result native batches, not layout, encoded GPUI decode or GPU upload.
 use anyhow::Result;
-use launcher_macos::{
+use launcher_agent::macos::{
     Application, application_icon, application_icon_pixels, discover_applications,
 };
 use std::time::Instant;

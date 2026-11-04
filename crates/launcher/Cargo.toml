@@ -4,36 +4,57 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+# Keep the C ABI artifact name Pill loads: liblauncher_agent.dylib.
+[lib]
+name = "launcher_agent"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "maccer"
 path = "src/main.rs"
 
+[[test]]
+name = "resident_menu"
+harness = false
+
+[[test]]
+name = "service_hotkey"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
-launcher-core = { path = "../launcher-core" }
-launcher-config = { path = "../launcher-config" }
-launcher-macos = { path = "../launcher-macos" }
-launcher-ui = { path = "../launcher-ui" }
-launcher-client = { path = "../launcher-client" }
-launcher-agent = { path = "../launcher-agent" }
-provider-apps = { path = "../provider-apps" }
-provider-calculator = { path = "../provider-calculator" }
-provider-web = { path = "../provider-web" }
-provider-files = { path = "../provider-files" }
-provider-shell = { path = "../provider-shell" }
-provider-clipboard = { path = "../provider-clipboard" }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+global-hotkey.workspace = true
 gpui.workspace = true
-serde.workspace = true
+image = { version = "0.25.1", default-features = false, features = ["png"] }
+libc = "0.2"
+meval = "0.2"
+nucleo-matcher.workspace = true
+notify = "8"
+plist = "1"
+regex = "1"
+rusqlite.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
+tempfile = "3"
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-global-hotkey.workspace = true
-clap = { version = "4", features = ["derive"] }
-dirs = "6"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+url = "2"
+objc2 = { version = "=0.6.4", features = ["exception"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSWorkspace", "NSPasteboard", "NSScreen", "NSEvent", "NSRunningApplication", "NSApplication"] }
+objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSAutoreleasePool", "NSProcessInfo", "NSString", "NSURL"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+block2 = "0.6"
+dispatch2 = "=0.3.1"
 
 [dev-dependencies]
-launcher-protocol = { path = "../launcher-protocol" }
-launcher-service = { path = "../launcher-service" }
-tempfile = "3"
+gpui = { workspace = true, features = ["test-support"] }

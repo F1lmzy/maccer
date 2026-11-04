@@ -1,17 +1,17 @@
-use launcher_config as config;
+use launcher_agent::config;
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use config::{Config, config_path, history_path};
 use gpui::Application;
-use launcher_core::{HistoryStore, Provider, ProviderRegistry, SearchCoordinator};
-use launcher_macos::{
+use launcher_agent::core::{HistoryStore, Provider, ProviderRegistry, SearchCoordinator};
+use launcher_agent::macos::{
     GlobalHotkey, NativePlatform, configure_accessory_app, discover_in, is_activation_event,
     resident::{ResidentEvent, ResidentMenu, show_error_alert},
 };
-use provider_apps::ApplicationProvider;
-use provider_calculator::CalculatorProvider;
-use provider_web::WebProvider;
+use launcher_agent::providers::apps::ApplicationProvider;
+use launcher_agent::providers::calculator::CalculatorProvider;
+use launcher_agent::providers::web::WebProvider;
 use std::{path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
@@ -97,7 +97,7 @@ fn run(args: Args) -> Result<()> {
         if config.providers.files.enabled {
             println!(
                 "files backend: fd ({})",
-                launcher_macos::fd_index::FdIndex::executable()?.display()
+                launcher_agent::macos::fd_index::FdIndex::executable()?.display()
             );
         }
         return Ok(());
@@ -151,11 +151,11 @@ fn run(args: Args) -> Result<()> {
         if let Some(parent) = history_file.parent() {
             files_config.excluded.push(parent.to_path_buf());
         }
-        let index = launcher_macos::fd_index::FdIndex::open(files_config, &cache)?;
+        let index = launcher_agent::macos::fd_index::FdIndex::open(files_config, &cache)?;
         index.start();
         registry.register(
             Arc::new(
-                provider_files::FileProvider::new(
+                launcher_agent::providers::files::FileProvider::new(
                     index,
                     Arc::new(NativePlatform),
                     dirs::home_dir().context("finding home directory for file scope")?,
@@ -168,7 +168,7 @@ fn run(args: Args) -> Result<()> {
         )?;
     }
     registry.register(
-        Arc::new(provider_shell::ShellProvider::new(
+        Arc::new(launcher_agent::providers::shell::ShellProvider::new(
             Arc::new(NativePlatform),
             config.shell.commands.clone(),
             dirs::home_dir().context("finding shell working directory")?,
@@ -176,10 +176,12 @@ fn run(args: Args) -> Result<()> {
         config.providers.shell.clone(),
     )?;
     let clipboard = if config.providers.clipboard.enabled {
-        let provider = Arc::new(provider_clipboard::ClipboardProvider::new(
-            Arc::new(NativePlatform),
-            config.clipboard.max_entries,
-        ));
+        let provider = Arc::new(
+            launcher_agent::providers::clipboard::ClipboardProvider::new(
+                Arc::new(NativePlatform),
+                config.clipboard.max_entries,
+            ),
+        );
         registry.register(provider.clone(), config.providers.clipboard.clone())?;
         Some(provider)
     } else {
@@ -199,7 +201,7 @@ fn run(args: Args) -> Result<()> {
             // Initialize the change-count baseline before the first timer tick.
             // Pre-existing clipboard text is deliberately not added to history.
             let mut previous = None;
-            if let Ok(Some(snapshot)) = launcher_macos::clipboard::snapshot_if_changed(None) {
+            if let Ok(Some(snapshot)) = launcher_agent::macos::clipboard::snapshot_if_changed(None) {
                 previous = Some(snapshot.change_count);
                 clipboard.capture(snapshot.change_count, None);
             }
@@ -211,7 +213,7 @@ fn run(args: Args) -> Result<()> {
                             // NSPasteboard access stays on the application thread, independent
                             // of provider search workers. Read only when changeCount advances.
                             if let Ok(Some(snapshot)) =
-                                launcher_macos::clipboard::snapshot_if_changed(previous)
+                                launcher_agent::macos::clipboard::snapshot_if_changed(previous)
                             {
                                 previous = Some(snapshot.change_count);
                                 clipboard.capture(snapshot.change_count, snapshot.text.as_deref());
@@ -237,10 +239,10 @@ fn run(args: Args) -> Result<()> {
                 return;
             }
         };
-        let window = match launcher_ui::open_launcher(
+        let window = match launcher_agent::ui::open_launcher(
             coordinator,
             history,
-            launcher_ui::LauncherOptions {
+            launcher_agent::ui::LauncherOptions {
                 width: config.launcher.width,
                 max_results: config.launcher.max_results,
             },
@@ -361,7 +363,7 @@ fn selected_service_socket(
 fn run_service_frontend(socket: PathBuf, show_on_start: bool, check: bool) -> Result<()> {
     if check {
         // This read-only CLI probe runs before GPUI, so blocking IPC cannot block its UI.
-        let mut client = launcher_client::Client::connect(&socket)
+        let mut client = launcher_agent::client::Client::connect(&socket)
             .context("connecting to the existing service; no backend was started")?;
         let providers = client
             .providers()
@@ -373,7 +375,7 @@ fn run_service_frontend(socket: PathBuf, show_on_start: bool, check: bool) -> Re
     if !cfg!(target_os = "macos") {
         bail!("the GPUI frontend requires macOS; use --check to probe the service");
     }
-    let _instance = match launcher_agent::frontend_startup::claim(&socket, "gpui") {
+    let _instance = match launcher_agent::agent::frontend_startup::claim(&socket, "gpui") {
         Ok(instance) => instance,
         Err(error) => {
             // Refusal must not leave a resident UI or a modal startup alert
@@ -395,9 +397,9 @@ fn run_service_frontend(socket: PathBuf, show_on_start: bool, check: bool) -> Re
                 return;
             }
         };
-        let window = match launcher_ui::open_service_launcher(
+        let window = match launcher_agent::ui::open_service_launcher(
             &socket,
-            launcher_ui::LauncherOptions {
+            launcher_agent::ui::LauncherOptions {
                 width: 480.,
                 max_results: 50,
             },

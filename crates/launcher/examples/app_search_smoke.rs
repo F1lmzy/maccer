@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use launcher_core::{HistoryStore, ProviderConfig, ProviderRegistry, SearchCoordinator};
-use launcher_macos::{NativePlatform, discover_applications};
-use provider_apps::ApplicationProvider;
-use provider_web::WebProvider;
+use launcher_agent::core::{HistoryStore, ProviderConfig, ProviderRegistry, SearchCoordinator};
+use launcher_agent::macos::{NativePlatform, discover_applications};
+use launcher_agent::providers::apps::ApplicationProvider;
+use launcher_agent::providers::web::WebProvider;
 
 fn main() -> Result<()> {
     let query = std::env::args()
