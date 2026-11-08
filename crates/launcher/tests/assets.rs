@@ -14,8 +14,9 @@ use serde_json::json;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
 };
@@ -287,4 +288,47 @@ fn native_resolver_is_only_a_thin_adapter_and_is_not_used_by_fixtures() {
             .iter()
             .any(|c| c == "iconAssetsBgra8")
     );
+}
+
+/// An asset evicted while its pixels are being produced must report expiry, not
+/// success: the client's view is refreshed from that error.
+#[test]
+fn an_asset_evicted_mid_resolution_reports_expiry() {
+    struct Blocking {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl IconResolver for Blocking {
+        fn resolve(&self, _: &Path) -> Result<Option<ApplicationIconPixels>> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(Some(ApplicationIconPixels {
+                bgra: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }))
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let store = AssetStore::new(Arc::new(Blocking {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let reference = store.reference(Path::new("/private/slow.app"), 1);
+    let (id, revision) = (reference.id.clone(), reference.revision.clone());
+    let worker = store.clone();
+    let resolving = thread::spawn(move || worker.get(&id, &revision, "bgra8"));
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("resolution started");
+    for index in 0..256 {
+        store.reference(&Path::new("/private/eviction").join(index.to_string()), 1);
+    }
+    release_tx.send(()).unwrap();
+    let error = resolving
+        .join()
+        .unwrap()
+        .expect_err("an evicted asset cannot be delivered");
+    assert!(error.to_string().contains("ASSET_EXPIRED"), "{error}");
 }

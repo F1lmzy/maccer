@@ -7,7 +7,8 @@
 //! directory, and hands the private path to the asset store. Paths never enter
 //! the protocol: a frontend only ever sees an opaque `previewBgra8` reference.
 use crate::core::{
-    Action, ActionId, ActionOutcome, Item, ItemId, Provider, ProviderId, SearchContext, SearchQuery,
+    Action, ActionId, ActionOutcome, CancellationToken, Item, ItemId, Provider, ProviderId,
+    SearchContext, SearchQuery,
 };
 use crate::macos::process::run_bounded;
 use crate::protocol::{DomainData, Icon, ThemeWallpaper, is_theme_slug, is_wallpaper_id};
@@ -17,11 +18,12 @@ use crate::service::{
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
@@ -37,6 +39,16 @@ const PARTIAL_MESSAGE: &str = "The wallpaper helper failed or did not finish. Th
 may be unchanged or partly applied; check it before retrying.";
 const INVALID_MESSAGE: &str = "The wallpaper information is invalid.";
 const KNOWN_WARNINGS: [&str; 1] = ["wallpaperFailed"];
+
+/// How many wallpapers one background pass warms.
+///
+/// A pack ships a handful of pictures; the cap only exists so a pathological
+/// directory cannot start unbounded decode work.
+const PREFETCH_LIMIT: usize = 32;
+/// Background decode workers. `image_thumbnail` allows four concurrent
+/// decodes, so three leaves one permit free and a demand request never queues
+/// behind the prefetch.
+const PREFETCH_WORKERS: usize = 3;
 
 /// Where mac-themer keeps its packs.
 ///
@@ -233,6 +245,9 @@ pub struct WallpaperServiceProvider {
     /// The active theme. A picker is scoped to the pack the desktop is wearing,
     /// so switching themes changes the strip rather than mixing every pack.
     theme: Option<Arc<ThemerState>>,
+    /// The pack whose previews were last warmed, plus the token that stops the
+    /// previous pass when the desktop switches themes mid-decode.
+    prefetched: Mutex<Option<(u64, Option<String>, CancellationToken)>>,
 }
 impl WallpaperServiceProvider {
     /// Browsing and previews only. Never starts a mutation helper.
@@ -247,6 +262,7 @@ impl WallpaperServiceProvider {
             assets,
             apply: None,
             theme: None,
+            prefetched: Mutex::new(None),
         }
     }
 
@@ -269,6 +285,7 @@ impl WallpaperServiceProvider {
             assets,
             apply: Some(apply),
             theme: None,
+            prefetched: Mutex::new(None),
         }
     }
 
@@ -305,6 +322,67 @@ impl WallpaperServiceProvider {
             }
         }
         (snapshot.revision, entries)
+    }
+
+    /// Warm the strip's thumbnails in the background.
+    ///
+    /// Decoding one 2880x1800 WebP at a 384 px edge costs ~70 ms, so a
+    /// sixteen-picture pack needs ~1.1 s of serial work before its last frame
+    /// can paint. The picker is a browse surface: it always ends up painting
+    /// the whole strip, so the decode starts the moment the scope opens instead
+    /// of one image at a time as the frontend asks for them. Each finished
+    /// frame is cached in the asset store, turning the demand path into a copy.
+    ///
+    /// One pass per (catalog revision, active pack). A repeat search — every
+    /// keystroke in the picker — is a no-op, and switching packs cancels the
+    /// previous pass so an abandoned pack stops competing for decode permits.
+    fn prefetch(&self, revision: u64, entries: &[Entry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let key = (revision, self.active_slug());
+        let jobs = prefetch_order(entries, PREFETCH_LIMIT);
+        let token = {
+            let mut state = self.prefetched.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .as_ref()
+                .is_some_and(|(known, slug, _)| *known == key.0 && *slug == key.1)
+            {
+                return;
+            }
+            if let Some((_, _, previous)) = state.take() {
+                previous.cancel();
+            }
+            let token = CancellationToken::default();
+            *state = Some((key.0, key.1, token.clone()));
+            token
+        };
+        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+        let workers = PREFETCH_WORKERS.min(queue.lock().unwrap_or_else(|e| e.into_inner()).len());
+        for index in 0..workers {
+            let assets = self.assets.clone();
+            let queue = queue.clone();
+            let token = token.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("maccer-wallpaper-prefetch-{index}"))
+                .spawn(move || {
+                    loop {
+                        if token.is_cancelled() {
+                            return;
+                        }
+                        let Some((path, revision)) =
+                            queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+                        else {
+                            return;
+                        };
+                        assets.prefetch_preview(&path, revision);
+                    }
+                });
+            if spawned.is_err() {
+                // Prefetching is an optimization; the demand path still works.
+                return;
+            }
+        }
     }
 
     /// Resolve one retained item back to the exact wallpaper it advertised.
@@ -387,6 +465,7 @@ impl Provider for WallpaperServiceProvider {
             return Ok(vec![]);
         }
         let (revision, entries) = self.entries();
+        self.prefetch(revision, &entries);
         let mut matched = Vec::new();
         for (position, entry) in entries.iter().enumerate() {
             let Some(score) = menu::score(
@@ -494,6 +573,22 @@ impl ServiceProvider for WallpaperServiceProvider {
     }
 }
 
+/// Order a prefetch pass by what the strip paints first.
+///
+/// The strip opens on the first published frame and draws two neighbours on
+/// each side, so distance around the ring — not position — decides which image
+/// should exist first. Ties keep the published order.
+fn prefetch_order(entries: &[Entry], limit: usize) -> Vec<(PathBuf, u64)> {
+    let count = entries.len();
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|index| ((*index).min(count - index), *index));
+    order
+        .into_iter()
+        .take(limit)
+        .map(|index| (entries[index].path.clone(), entries[index].revision))
+        .collect()
+}
+
 /// Asset revisions roll when the catalog does or when the file itself changes,
 /// so a re-rendered pack is re-decoded instead of serving stale pixels.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -568,6 +663,18 @@ mod tests {
         themes: PathBuf,
         packs: &[(&str, &[&str])],
     ) -> (WallpaperServiceProvider, Arc<crate::service::ThemeCatalog>) {
+        let (provider, catalog, _assets) = provider_with_assets(themes, packs);
+        (provider, catalog)
+    }
+
+    fn provider_with_assets(
+        themes: PathBuf,
+        packs: &[(&str, &[&str])],
+    ) -> (
+        WallpaperServiceProvider,
+        Arc<crate::service::ThemeCatalog>,
+        Arc<crate::service::AssetStore>,
+    ) {
         let palettes = packs
             .iter()
             .map(|(slug, _)| palette(slug))
@@ -584,8 +691,13 @@ mod tests {
         let catalog = crate::service::ThemeCatalog::from_catalog(palettes, wallpapers).unwrap();
         let assets = crate::service::AssetStore::new(Arc::new(NoIcons));
         (
-            WallpaperServiceProvider::new(catalog.clone(), WallpaperLocation::at(themes), assets),
+            WallpaperServiceProvider::new(
+                catalog.clone(),
+                WallpaperLocation::at(themes),
+                assets.clone(),
+            ),
             catalog,
+            assets,
         )
     }
 
@@ -689,6 +801,82 @@ mod tests {
             WallpaperLocation::default()
                 .path_for("pack", "1-a.webp")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn prefetch_order_walks_outward_from_the_frame_the_strip_opens_on() {
+        let (_dir, themes) = pack_tree(&[(
+            "pack",
+            &["1-a.webp", "2-b.webp", "3-c.webp", "4-d.webp", "5-e.webp"],
+        )]);
+        let (provider, _catalog, _assets) = provider_with_assets(
+            themes,
+            &[(
+                "pack",
+                &["1-a.webp", "2-b.webp", "3-c.webp", "4-d.webp", "5-e.webp"],
+            )],
+        );
+        let (_revision, entries) = provider.entries();
+        // The strip draws one frame on each side of the focused one, so the two
+        // neighbours around the wrap are needed before the far end is.
+        let ordered: Vec<PathBuf> = prefetch_order(&entries, 32)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        let names: Vec<String> = ordered
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["1-a.webp", "2-b.webp", "5-e.webp", "3-c.webp", "4-d.webp"]
+        );
+        // The cap bounds the pass without changing its order.
+        let bounded: Vec<String> = prefetch_order(&entries, 2)
+            .into_iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(bounded, ["1-a.webp", "2-b.webp"]);
+    }
+
+    /// The decode itself is covered by the asset-store tests; what matters here
+    /// is the schedule: one pass per pack, none per keystroke, and an abandoned
+    /// pack stops competing for decode permits.
+    #[test]
+    fn the_strip_is_warmed_once_per_pack_and_a_switch_abandons_the_pass() {
+        let (_dir, themes) = pack_tree(&[("pack-a", &["1-a.webp"]), ("pack-b", &["1-b.webp"])]);
+        let packs: &[(&str, &[&str])] = &[("pack-a", &["1-a.webp"]), ("pack-b", &["1-b.webp"])];
+        let (provider, _catalog) = provider(themes, packs);
+        let scheduled = |provider: &WallpaperServiceProvider| {
+            provider
+                .prefetched
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(revision, slug, token)| (*revision, slug.clone(), token.clone()))
+        };
+        assert!(scheduled(&provider).is_none(), "nothing browsed yet");
+        // Browsing the pack — not asking for pixels — starts the pass.
+        assert_eq!(search(&provider, "").len(), 2);
+        let (revision, slug, first) = scheduled(&provider).expect("a pass is scheduled");
+        assert_eq!(slug, None);
+        assert!(!first.is_cancelled());
+        // A keystroke in the same view re-searches but must not start over.
+        assert_eq!(search(&provider, "").len(), 2);
+        let (same, slug, token) = scheduled(&provider).unwrap();
+        assert_eq!((same, slug), (revision, None));
+        assert!(!token.is_cancelled(), "the pass is still the same one");
+
+        // Switching the desktop's theme abandons the pack it left behind.
+        let switched = provider.with_theme(ThemerState::fixture_named("pack-b"));
+        assert_eq!(search(&switched, "").len(), 1);
+        let (_, slug, next) = scheduled(&switched).expect("the new pack is scheduled");
+        assert_eq!(slug, Some("pack-b".to_owned()));
+        assert!(!next.is_cancelled());
+        assert!(
+            first.is_cancelled(),
+            "the abandoned pack must stop decoding"
         );
     }
 

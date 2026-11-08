@@ -11,7 +11,7 @@ Image previews use a synchronous decoded-image cache, immediate background decod
 - Evicted images release their GPU textures, including the currently rendered window's atlas. The memory budget counts decoded pixels, not compressed PNG size. GPU allocation overhead is additional.
 - The pane stays blank for short cold loads rather than flashing "Loading preview". Loading text appears after 150 ms if work is still pending; the existing two-second slow-preview notice remains. No previously selected image is shown under the new selection.
 
-Native decoding still uses a shared two-worker limit, cancellation checks between stages, a 100-megapixel dimension guard, and a 64 MiB source-file limit. ImageIO cannot interrupt a decode already in progress. PDFs retain their cancellable Quick Look subprocess, PNG thumbnail cache, and five-second deadline. The UI decodes their PNG on a worker and caches the render-ready image too. Text and clipboard previews are not retained in the decoded-image cache.
+Native decoding still uses a shared four-permit limit (wallpaper strips decode in parallel through it; see [`wallpaper-preview-performance.md`](wallpaper-preview-performance.md)), cancellation checks between stages, a 100-megapixel dimension guard, and a 64 MiB source-file limit. ImageIO cannot interrupt a decode already in progress. PDFs retain their cancellable Quick Look subprocess, PNG thumbnail cache, and five-second deadline. The UI decodes their PNG on a worker and caches the render-ready image too. Text and clipboard previews are not retained in the decoded-image cache.
 
 ## Per-stage debug timings
 

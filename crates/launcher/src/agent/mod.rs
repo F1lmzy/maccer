@@ -32,6 +32,9 @@ const EVENT_CAPACITY: usize = 256;
 const ICON_CAPACITY: usize = 512;
 /// Wallpaper previews are ~590 KiB each, so the preview cache is sized by
 /// memory rather than by count: twelve of them is about 7 MiB.
+///
+/// The frontend's decoded cache is the durable one; this only keeps the most
+/// recently delivered strip window so a re-advertised reference costs nothing.
 const PREVIEW_CAPACITY: usize = 12;
 const ICON_WORKERS: usize = 4;
 

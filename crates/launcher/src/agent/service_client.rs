@@ -21,8 +21,10 @@ const COMMAND_CAPACITY: usize = 16;
 const RESULT_LIMIT: usize = 100;
 const MAX_ICONS_PER_VIEW: usize = 8;
 /// A wallpaper strip can show a dozen tiles, and each preview is fetched once
-/// per revision, so this cap is deliberately larger than the icon one.
-const MAX_PREVIEWS_PER_VIEW: usize = 24;
+/// per revision, so this cap is deliberately larger than the icon one. Thirty
+/// two covers every pack the service has seen; past that the strip shows a
+/// glyph rather than transferring more pixels than a window can present.
+const MAX_PREVIEWS_PER_VIEW: usize = 32;
 /// Read-only active theme state is polled at most this often. Bounded so a
 /// steady stream of searches cannot starve state, and cheap because the
 /// service answers from an in-memory snapshot.
@@ -794,6 +796,29 @@ fn run(
                 {
                     continue;
                 }
+                let cache = if icon.preview {
+                    &caches.previews
+                } else {
+                    &caches.icons
+                };
+                let (kind, prefix) = if icon.preview {
+                    ("preview", "maccer-previews")
+                } else {
+                    ("icon", "maccer-icons")
+                };
+                let announce = |token: &str| {
+                    let _ = events.try_send(json!({"type":kind,"request":icon.request,"provider":icon.provider,"id":icon.id,"source":format!("image://{prefix}/{token}")}));
+                };
+                // Pixels already delivered under an earlier snapshot of the same
+                // revision are re-announced from the local cache. Without this a
+                // strip re-downloads every thumbnail — ~370 KiB each — on each
+                // keystroke, because a new snapshot re-queues the same assets.
+                if let Some(token) =
+                    cache.token(&format!("{}:{}", icon.asset.id, icon.asset.revision))
+                {
+                    announce(&token);
+                    continue;
+                }
                 match client.get_asset(&icon.asset) {
                     Ok(asset)
                         if latest.load(Ordering::Acquire) == icon.request
@@ -801,11 +826,6 @@ fn run(
                     {
                         let key =
                             format!("{}:{}", asset.metadata.asset_id, asset.metadata.revision);
-                        let cache = if icon.preview {
-                            &caches.previews
-                        } else {
-                            &caches.icons
-                        };
                         let token = cache.insert(
                             key,
                             PixelIcon {
@@ -815,12 +835,7 @@ fn run(
                             },
                         );
                         if let Some(token) = token {
-                            let (kind, prefix) = if icon.preview {
-                                ("preview", "maccer-previews")
-                            } else {
-                                ("icon", "maccer-icons")
-                            };
-                            let _ = events.try_send(json!({"type":kind,"request":icon.request,"provider":icon.provider,"id":icon.id,"source":format!("image://{prefix}/{token}")}));
+                            announce(&token);
                         }
                     }
                     Err(error) => {

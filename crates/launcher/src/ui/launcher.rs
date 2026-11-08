@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -107,7 +107,7 @@ impl StripGeometry {
 /// Only the two frames on each side of the focused one are drawn.
 const FILMSTRIP_WINDOW: f32 = 2.;
 /// Wallpaper thumbnails held as decoded images before the oldest is dropped.
-const MAX_PREVIEW_CACHE: usize = 24;
+const MAX_PREVIEW_CACHE: usize = 32;
 /// Frame time constant for the strip chase. Same feel as the reference.
 const FILMSTRIP_CHASE: f32 = 0.07;
 const MAX_ICON_LOADS: usize = 4;
@@ -267,6 +267,9 @@ pub struct Launcher {
     icon_cache: HashMap<PathBuf, Arc<gpui::RenderImage>>,
     /// Decoded wallpaper thumbnails, keyed by `image://maccer-previews/` source.
     preview_cache: HashMap<PathBuf, Arc<gpui::RenderImage>>,
+    /// Insertion order for `preview_cache`, so eviction drops the oldest
+    /// thumbnail instead of an arbitrary one the strip may still be painting.
+    preview_order: VecDeque<PathBuf>,
     /// Animated strip position chasing the selected index, and the pointer
     /// accumulators that turn wheel/trackpad deltas into single steps.
     filmstrip_pos: f32,
@@ -420,6 +423,7 @@ fn open_launcher_backend(
                     drag_start: None,
                     icon_cache: HashMap::new(),
                     preview_cache: HashMap::new(),
+                    preview_order: VecDeque::new(),
                     filmstrip_pos: 0.,
                     filmstrip_target: 0.,
                     filmstrip_wheel: 0.,
@@ -723,6 +727,12 @@ impl Launcher {
                                 service
                                     .preview_sources
                                     .values()
+                                    // A source already painted is left alone. Rebuilding it
+                                    // would copy every pixel buffer and allocate a fresh
+                                    // render image on the UI thread for each keystroke.
+                                    .filter(|source| {
+                                        !self.preview_cache.contains_key(Path::new(source))
+                                    })
                                     .filter_map(|source| {
                                         let pixels = service.preview(
                                             source.rsplit('/').next().unwrap_or_default(),
@@ -950,11 +960,14 @@ impl Launcher {
     /// budget is reached. Sources are revision-scoped, so an evicted one is
     /// simply re-fetched if the strip scrolls back to it.
     fn cache_preview(&mut self, key: PathBuf, image: Arc<gpui::RenderImage>) {
-        if !self.preview_cache.contains_key(&key)
-            && self.preview_cache.len() >= MAX_PREVIEW_CACHE
-            && let Some(evicted) = self.preview_cache.keys().next().cloned()
-        {
-            self.preview_cache.remove(&evicted);
+        if !self.preview_cache.contains_key(&key) {
+            while self.preview_cache.len() >= MAX_PREVIEW_CACHE {
+                let Some(evicted) = self.preview_order.pop_front() else {
+                    break;
+                };
+                self.preview_cache.remove(&evicted);
+            }
+            self.preview_order.push_back(key.clone());
         }
         self.preview_cache.insert(key, image);
     }

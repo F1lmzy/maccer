@@ -20,7 +20,12 @@ use std::{
 };
 
 // ImageIO cannot interrupt an active synchronous decode. Limit expensive work
-// to two images, and let cancelled requests stop while waiting for a slot.
+// to a few images, and let cancelled requests stop while waiting for a slot.
+//
+// The ceiling is measured, not guessed: sixteen 2880x1800 WebP wallpapers
+// decode in 1160 ms one at a time, 596 ms with two permits and 324 ms with
+// four on an M1, so four is where the curve flattens on this class of machine.
+const MAX_CONCURRENT_DECODES: usize = 4;
 struct DecodeSlots(AtomicUsize);
 struct DecodePermit<'a>(&'a DecodeSlots);
 impl DecodeSlots {
@@ -31,7 +36,7 @@ impl DecodeSlots {
             if self
                 .0
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                    (used < 2).then_some(used + 1)
+                    (used < MAX_CONCURRENT_DECODES).then_some(used + 1)
                 })
                 .is_ok()
             {
@@ -565,15 +570,17 @@ mod tests {
     fn native_decode_slots_are_bounded_and_released() {
         let slots = DecodeSlots(AtomicUsize::new(0));
         let token = CancellationToken::default();
-        let first = slots.acquire(&token).unwrap();
-        let second = slots.acquire(&token).unwrap();
-        assert_eq!(slots.0.load(Ordering::Relaxed), 2);
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_DECODES {
+            held.push(slots.acquire(&token).unwrap());
+        }
+        assert_eq!(slots.0.load(Ordering::Relaxed), MAX_CONCURRENT_DECODES);
         let cancelled = CancellationToken::default();
         cancelled.cancel();
         assert!(slots.acquire(&cancelled).is_err());
-        drop(first);
-        let third = slots.acquire(&token).unwrap();
-        drop((second, third));
+        held.pop();
+        held.push(slots.acquire(&token).unwrap());
+        drop(held);
         assert_eq!(slots.0.load(Ordering::Relaxed), 0);
     }
 
@@ -581,8 +588,10 @@ mod tests {
     fn waiting_for_a_decode_slot_observes_cancellation() {
         let slots = std::sync::Arc::new(DecodeSlots(AtomicUsize::new(0)));
         let token = CancellationToken::default();
-        let first = slots.acquire(&token).unwrap();
-        let second = slots.acquire(&token).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_DECODES {
+            held.push(slots.acquire(&token).unwrap());
+        }
         let waiting_slots = slots.clone();
         let waiting_token = token.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -597,8 +606,8 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         token.cancel();
         assert!(waiter.join().unwrap().contains("cancelled"));
-        assert_eq!(slots.0.load(Ordering::Relaxed), 2);
-        drop((first, second));
+        assert_eq!(slots.0.load(Ordering::Relaxed), MAX_CONCURRENT_DECODES);
+        drop(held);
         assert_eq!(slots.0.load(Ordering::Relaxed), 0);
     }
 
