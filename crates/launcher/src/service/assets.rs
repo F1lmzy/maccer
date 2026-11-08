@@ -1,5 +1,7 @@
 use crate::macos::ApplicationIconPixels;
-use crate::protocol::{AssetMetadata, AssetRef, MAX_ASSET_BYTES, MAX_ICON_EDGE};
+use crate::protocol::{
+    AssetLimits, AssetMetadata, AssetRef, REPRESENTATION_ICON, REPRESENTATION_PREVIEW,
+};
 use anyhow::{Result, anyhow};
 use std::{
     collections::{HashMap, VecDeque},
@@ -22,9 +24,27 @@ impl IconResolver for NativeIconResolver {
     }
 }
 
+/// Which size class one registered path belongs to. The representation is
+/// fixed when the reference is created, so a caller can never ask a 64px icon
+/// slot for 512px pixels or the reverse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssetKind {
+    Icon,
+    Preview,
+}
+impl AssetKind {
+    fn representation(self) -> &'static str {
+        match self {
+            Self::Icon => REPRESENTATION_ICON,
+            Self::Preview => REPRESENTATION_PREVIEW,
+        }
+    }
+}
+
 struct Entry {
     path: PathBuf,
     revision: String,
+    kind: AssetKind,
     value: Option<Option<(AssetMetadata, Vec<u8>)>>,
 }
 
@@ -54,10 +74,20 @@ impl AssetStore {
 
     /// Registers a stable opaque reference without touching the filesystem or resolving the icon.
     pub fn reference(&self, path: &Path, revision: u64) -> AssetRef {
+        self.register(path, revision, AssetKind::Icon)
+    }
+
+    /// Registers a lazily decoded wallpaper thumbnail for `path`.
+    pub fn reference_preview(&self, path: &Path, revision: u64) -> AssetRef {
+        self.register(path, revision, AssetKind::Preview)
+    }
+
+    fn register(&self, path: &Path, revision: u64, kind: AssetKind) -> AssetRef {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let revision = revision.to_string();
         if let Some(id) = state.entries.iter().find_map(|(id, entry)| {
-            (entry.path == path && entry.revision == revision).then(|| id.clone())
+            (entry.path == path && entry.revision == revision && entry.kind == kind)
+                .then(|| id.clone())
         }) {
             // Reuse immutable assets across views/clients instead of re-resolving
             // the same Finder icon on every keystroke. Touch the bounded LRU.
@@ -66,10 +96,13 @@ impl AssetStore {
             return AssetRef {
                 id,
                 revision,
-                representations: vec!["bgra8".into()],
+                representations: vec![kind.representation().into()],
             };
         }
-        let id = format!("icon-{}", state.next_id);
+        let id = match kind {
+            AssetKind::Icon => format!("icon-{}", state.next_id),
+            AssetKind::Preview => format!("preview-{}", state.next_id),
+        };
         state.next_id = state
             .next_id
             .checked_add(1)
@@ -85,20 +118,28 @@ impl AssetStore {
             Entry {
                 path: path.to_path_buf(),
                 revision: revision.clone(),
+                kind,
                 value: None,
             },
         );
         AssetRef {
             id,
             revision,
-            representations: vec!["bgra8".into()],
+            representations: vec![kind.representation().into()],
         }
     }
 
     /// Resolves an authorized opaque reference on demand. Missing icons are cached too.
-    pub fn get(&self, id: &str, revision: &str) -> Result<(AssetMetadata, Vec<u8>)> {
+    pub fn get(
+        &self,
+        id: &str,
+        revision: &str,
+        representation: &str,
+    ) -> Result<(AssetMetadata, Vec<u8>)> {
+        let limits = AssetLimits::for_representation(representation)
+            .ok_or_else(|| anyhow!("ASSET_UNSUPPORTED_REPRESENTATION"))?;
         let _resolve = self.resolve_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (path, cached) = {
+        let (path, kind, cached) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let entry = state
                 .entries
@@ -107,16 +148,35 @@ impl AssetStore {
             if entry.revision != revision {
                 return Err(anyhow!("ASSET_EXPIRED"));
             }
+            if entry.kind.representation() != representation {
+                return Err(anyhow!("ASSET_UNSUPPORTED_REPRESENTATION"));
+            }
             let cached = entry.value.clone();
-            (entry.path.clone(), cached)
+            (entry.path.clone(), entry.kind, cached)
         };
         let resolved = match cached {
             Some(resolved) => resolved,
-            None => self
-                .resolver
-                .resolve(&path)?
-                .map(|pixels| validate_pixels(id, revision, pixels))
-                .transpose()?,
+            None => match kind {
+                AssetKind::Icon => self
+                    .resolver
+                    .resolve(&path)?
+                    .map(|pixels| validate_icon_pixels(id, revision, pixels))
+                    .transpose()?,
+                AssetKind::Preview => {
+                    // ImageIO decodes on this thread and the result is cached, so
+                    // each file pays this once per revision.
+                    let (bgra, width, height) =
+                        crate::macos::preview_pixels(&path, limits.max_edge)?;
+                    Some(validate_pixels(
+                        id,
+                        revision,
+                        representation,
+                        width,
+                        height,
+                        bgra,
+                    )?)
+                }
+            },
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = state.entries.get_mut(id).filter(|e| e.revision == revision) else {
@@ -127,39 +187,60 @@ impl AssetStore {
     }
 }
 
-fn validate_pixels(
+fn validate_icon_pixels(
     id: &str,
     revision: &str,
     pixels: ApplicationIconPixels,
 ) -> Result<(AssetMetadata, Vec<u8>)> {
-    let stride = pixels
-        .width
+    validate_pixels(
+        id,
+        revision,
+        REPRESENTATION_ICON,
+        pixels.width,
+        pixels.height,
+        pixels.bgra,
+    )
+}
+
+/// Check one straight-alpha BGRA buffer against its representation budget.
+fn validate_pixels(
+    id: &str,
+    revision: &str,
+    representation: &str,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+) -> Result<(AssetMetadata, Vec<u8>)> {
+    let Some(limits) = AssetLimits::for_representation(representation) else {
+        return Err(anyhow!("ASSET_UNSUPPORTED_REPRESENTATION"));
+    };
+    let stride = width
         .checked_mul(4)
-        .ok_or_else(|| anyhow!("invalid icon stride"))?;
+        .ok_or_else(|| anyhow!("invalid asset stride"))?;
     let expected = (stride as usize)
-        .checked_mul(pixels.height as usize)
-        .ok_or_else(|| anyhow!("invalid icon size"))?;
-    if pixels.width == 0
-        || pixels.height == 0
-        || pixels.width > MAX_ICON_EDGE
-        || pixels.height > MAX_ICON_EDGE
-        || expected > MAX_ASSET_BYTES
-        || pixels.bgra.len() != expected
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow!("invalid asset size"))?;
+    if width == 0
+        || height == 0
+        || width > limits.max_edge
+        || height > limits.max_edge
+        || expected > limits.max_bytes
+        || bgra.len() != expected
     {
-        return Err(anyhow!("invalid icon pixel buffer"));
+        return Err(anyhow!("invalid asset pixel buffer"));
     }
     Ok((
         AssetMetadata {
             asset_id: id.into(),
             revision: revision.into(),
-            representation: "bgra8".into(),
-            width: pixels.width,
-            height: pixels.height,
+            representation: representation.into(),
+            width,
+            height,
             stride,
             alpha_mode: "straight".into(),
             row_order: "topToBottom".into(),
-            byte_length: pixels.bgra.len(),
+            byte_length: bgra.len(),
         },
-        pixels.bgra,
+        bgra,
     ))
 }

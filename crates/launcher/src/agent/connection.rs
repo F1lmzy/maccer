@@ -4,7 +4,7 @@
 //! provider backend, reads configuration, or starts a service.
 
 use crate::agent::{
-    IconCache, PixelIcon,
+    AssetCache, PixelIcon,
     frontend_client::FrontendControl,
     service_client::{IpcCommand, IpcHandle},
 };
@@ -38,7 +38,8 @@ pub struct ServiceConnection {
     events: Receiver<Value>,
     event_sender: SyncSender<Value>,
     ipc: IpcHandle,
-    icon_cache: Arc<IconCache>,
+    icon_cache: Arc<AssetCache>,
+    preview_cache: Arc<AssetCache>,
     frontend: Option<FrontendControl>,
 }
 
@@ -62,13 +63,14 @@ impl ServiceConnection {
             ));
         }
         let (sender, events) = mpsc::sync_channel(EVENT_CAPACITY);
-        let icon_cache = Arc::new(IconCache::default());
-        let ipc = IpcHandle::start(path, sender.clone(), icon_cache.clone())?;
+        let caches = crate::agent::AssetCaches::new();
+        let ipc = IpcHandle::start(path, sender.clone(), caches.clone())?;
         Ok(Self {
             events,
             event_sender: sender,
             ipc,
-            icon_cache,
+            icon_cache: caches.icons.clone(),
+            preview_cache: caches.previews.clone(),
             frontend: None,
         })
     }
@@ -90,8 +92,15 @@ impl ServiceConnection {
         self.ipc.send(IpcCommand::Search { request, query })
     }
 
+    /// Queue an empty-query home search that discards any provider scope first.
+    pub fn home_search(&self, request: u64) -> Result<(), String> {
+        self.ipc.send(IpcCommand::HomeSearch { request })
+    }
+
     /// Invoke an action authorized by the specified displayed search snapshot.
     /// Use this for actions whose descriptor carried no `confirmation` prompt.
+    /// Invoke an action with no input field. The same guard as the confirmed
+    /// path applies: the service still decides whether consent is required.
     pub fn activate(
         &self,
         request: u64,
@@ -100,7 +109,39 @@ impl ServiceConnection {
         id: String,
         action: String,
     ) -> Result<(), String> {
-        self.activate_with_confirmation(request, search_request, provider, id, action, false)
+        self.activate_with_input(
+            request,
+            search_request,
+            provider,
+            id,
+            action,
+            false,
+            std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// Invoke an action that published an input field, sending the values the
+    /// user collected. An empty map is the ordinary no-input invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate_with_input(
+        &self,
+        request: u64,
+        search_request: u64,
+        provider: String,
+        id: String,
+        action: String,
+        confirmed: bool,
+        input: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.ipc.send(IpcCommand::Activate {
+            request,
+            search_request,
+            provider,
+            id,
+            action,
+            confirmed,
+            input,
+        })
     }
 
     /// Invoke an action after the user explicitly confirmed the descriptor's
@@ -113,27 +154,9 @@ impl ServiceConnection {
         provider: String,
         id: String,
         action: String,
+        input: std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
-        self.activate_with_confirmation(request, search_request, provider, id, action, true)
-    }
-
-    fn activate_with_confirmation(
-        &self,
-        request: u64,
-        search_request: u64,
-        provider: String,
-        id: String,
-        action: String,
-        confirmed: bool,
-    ) -> Result<(), String> {
-        self.ipc.send(IpcCommand::Activate {
-            request,
-            search_request,
-            provider,
-            id,
-            action,
-            confirmed,
-        })
+        self.activate_with_input(request, search_request, provider, id, action, true, input)
     }
 
     /// Fetch provider-owned safe details for a result in a delivered snapshot.
@@ -179,7 +202,17 @@ impl ServiceConnection {
 
     /// Copy a previously delivered `image://maccer-icons/<token>` icon from the local cache.
     pub fn icon(&self, token: &str) -> Option<IconPixels> {
-        let pixels: PixelIcon = self.icon_cache.pixels(token)?;
+        self.pixels(&self.icon_cache, token)
+    }
+
+    /// Copy a previously delivered `image://maccer-previews/<token>` wallpaper
+    /// thumbnail out of the local cache.
+    pub fn preview(&self, token: &str) -> Option<IconPixels> {
+        self.pixels(&self.preview_cache, token)
+    }
+
+    fn pixels(&self, cache: &AssetCache, token: &str) -> Option<IconPixels> {
+        let pixels: PixelIcon = cache.pixels(token)?;
         Some(IconPixels {
             bgra: pixels.bgra,
             width: pixels.width,
@@ -205,7 +238,7 @@ mod tests {
     fn icon_returns_an_owned_copy_from_the_shared_actor_cache() {
         let path = std::env::temp_dir().join(format!("maccer-missing-{}.sock", std::process::id()));
         let (sender, events) = mpsc::sync_channel(EVENT_CAPACITY);
-        let cache = Arc::new(IconCache::default());
+        let cache = Arc::new(AssetCache::icons());
         let token = cache
             .insert(
                 "fixture-icon".into(),
@@ -216,12 +249,18 @@ mod tests {
                 },
             )
             .unwrap();
-        let ipc = IpcHandle::start(&path, sender.clone(), cache.clone()).unwrap();
+        let previews = Arc::new(AssetCache::previews());
+        let caches = crate::agent::AssetCaches {
+            icons: cache.clone(),
+            previews: previews.clone(),
+        };
+        let ipc = IpcHandle::start(&path, sender.clone(), caches).unwrap();
         let connection = ServiceConnection {
             events,
             event_sender: sender,
             ipc,
             icon_cache: cache,
+            preview_cache: previews,
             frontend: None,
         };
 
@@ -229,5 +268,52 @@ mod tests {
         assert_eq!(pixels.bgra, [1, 2, 3, 4]);
         pixels.bgra[0] = 9;
         assert_eq!(connection.icon(&token).unwrap().bgra, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn previews_live_in_their_own_cache_with_their_own_size_class() {
+        let path = std::env::temp_dir().join(format!("maccer-missing-{}.sock", std::process::id()));
+        let (sender, _events) = mpsc::sync_channel(EVENT_CAPACITY);
+        let icons = Arc::new(AssetCache::icons());
+        let previews = Arc::new(AssetCache::previews());
+        // 200x120 is a preview, never an icon.
+        let token = previews
+            .insert(
+                "wallpaper".into(),
+                PixelIcon {
+                    bgra: vec![7; 200 * 120 * 4],
+                    width: 200,
+                    height: 120,
+                },
+            )
+            .unwrap();
+        assert!(
+            icons
+                .insert(
+                    "wallpaper".into(),
+                    PixelIcon {
+                        bgra: vec![7; 200 * 120 * 4],
+                        width: 200,
+                        height: 120,
+                    },
+                )
+                .is_none(),
+            "an oversized buffer must not enter the icon cache"
+        );
+        let caches = crate::agent::AssetCaches {
+            icons: icons.clone(),
+            previews: previews.clone(),
+        };
+        let ipc = IpcHandle::start(&path, sender.clone(), caches).unwrap();
+        let connection = ServiceConnection {
+            events: mpsc::sync_channel(1).1,
+            event_sender: sender,
+            ipc,
+            icon_cache: icons,
+            preview_cache: previews,
+            frontend: None,
+        };
+        assert_eq!(connection.preview(&token).unwrap().width, 200);
+        assert!(connection.icon(&token).is_none());
     }
 }

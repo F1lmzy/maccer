@@ -125,6 +125,7 @@ fn params(
         action_ref: descriptor.action_ref.clone(),
         operation_id: operation.into(),
         confirmed: false,
+        input: Default::default(),
     }
 }
 #[test]

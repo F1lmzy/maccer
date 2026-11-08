@@ -6,4 +6,6 @@ mod service_preview;
 mod state;
 mod theme;
 
-pub use launcher::{Launcher, LauncherOptions, open_launcher, open_service_launcher};
+pub use launcher::{
+    Launcher, LauncherOptions, WebPreviewOptions, open_launcher, open_service_launcher,
+};

@@ -159,8 +159,9 @@ fn live_apps(
     use launcher_agent::providers::apps::ApplicationProvider;
     use launcher_agent::service::{
         ApplicationServiceProvider, AssetStore, ClipboardMonitor, ClipboardServiceProvider,
-        NativeIconResolver, ServiceProvider, ThemeApply, ThemeCatalog,
-        ThemeServiceProvider, ThemerState, WebServiceProvider,
+        NativeIconResolver, ServiceProvider, ThemeApply, ThemeCatalog, ThemeInstall,
+        ThemeServiceProvider, ThemerState, WallpaperApply, WallpaperLocation,
+        WallpaperServiceProvider, WebServiceProvider,
     };
     let explicit = config.is_some();
     let config_file = match config {
@@ -224,16 +225,57 @@ fn live_apps(
             )
         }
     };
-    let themes = if config.providers.themes.enabled {
+    // The picker shares the theme catalog: its identities and revision come from
+    // the same snapshot, so a wallpaper can never outlive its theme listing.
+    // Installing publishes into the same catalog Apply reads from, so the
+    // installer reloads it before replying.
+    let (theme_catalog, theme_apply, theme_install) = if config.providers.themes.enabled {
         let helper = themer_helper()?;
-        ThemeServiceProvider::with_apply(
-            ThemeCatalog::start(helper.clone()),
-            ThemeApply::new(helper),
+        let catalog = ThemeCatalog::start(helper.clone());
+        (
+            Some(catalog.clone()),
+            Some(ThemeApply::new(helper.clone())),
+            Some(ThemeInstall::with_catalog(helper, catalog)),
         )
     } else {
-        ThemeServiceProvider::new(ThemeCatalog::from_palettes(Vec::new())?)
+        (None, None, None)
+    };
+    // One reader of the active theme, shared by the picker, the wallpaper strip
+    // and the service so all three agree on which pack the desktop is wearing.
+    let theme_state = ThemerState::watch(theme_directory()?);
+    // The scope publishes install and remove as its own options, so the
+    // provider needs the same executor the two endpoints run.
+    let themes = match (theme_catalog.clone(), theme_apply, theme_install.clone()) {
+        (Some(catalog), Some(apply), install) => {
+            let provider =
+                ThemeServiceProvider::with_apply(catalog, apply).with_theme(theme_state.clone());
+            match install {
+                Some(install) => provider.with_install(install),
+                None => provider,
+            }
+        }
+        _ => ThemeServiceProvider::new(ThemeCatalog::from_palettes(Vec::new())?),
     };
     let assets = AssetStore::new(Arc::new(NativeIconResolver));
+    let wallpapers = if config.providers.wallpapers.enabled {
+        let helper = themer_helper()?;
+        let catalog = match theme_catalog {
+            Some(catalog) => catalog,
+            None => ThemeCatalog::from_palettes(Vec::new())?,
+        };
+        let location = WallpaperLocation::resolve(&helper);
+        Some(
+            WallpaperServiceProvider::with_apply(
+                catalog,
+                location,
+                assets.clone(),
+                WallpaperApply::new(helper),
+            )
+            .with_theme(theme_state.clone()),
+        )
+    } else {
+        None
+    };
     let mut registrations: Vec<(
         Arc<dyn ServiceProvider>,
         launcher_agent::core::ProviderConfig,
@@ -244,6 +286,9 @@ fn live_apps(
         ),
         (Arc::new(themes), config.providers.themes),
     ];
+    if let Some(wallpapers) = wallpapers {
+        registrations.push((Arc::new(wallpapers), config.providers.wallpapers));
+    }
     if config.providers.web.enabled {
         let web = launcher_agent::providers::web::WebProvider::new(
             platform.clone(),
@@ -267,12 +312,10 @@ fn live_apps(
     } else {
         None
     };
-    let service = Service::with_state(
-        registrations,
-        history,
-        Some(assets),
-        ThemerState::watch(theme_directory()?),
-    )?;
+    let service = Service::with_state(registrations, history, Some(assets), theme_state)?;
+    if let Some(install) = theme_install {
+        service.attach_theme_install(install)?;
+    }
     if let Some(frontend) = &frontend {
         service.attach_frontend(frontend.clone())?;
     }

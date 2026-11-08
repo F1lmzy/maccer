@@ -47,9 +47,15 @@ pub struct ThemerState {
 impl ThemerState {
     /// Deterministic in-memory palette for fixture services. Never touches disk.
     pub fn fixture() -> Arc<Self> {
+        Self::fixture_named("maccer-fixture")
+    }
+
+    /// The fixture palette published under `slug`, for tests that key off the
+    /// active theme's identity rather than its colors.
+    pub fn fixture_named(slug: &str) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(Inner {
-                current: Mutex::new(make_state(Some(fixture_palette()), None)),
+                current: Mutex::new(make_state(Some(fixture_palette(slug)), None)),
                 stop: AtomicBool::new(false),
                 worker: Mutex::new(None),
             }),
@@ -335,7 +341,7 @@ const FIXTURE_BAR: [&str; 10] = [
     "#9ece6a", "#e0af68",
 ];
 
-fn fixture_palette() -> ThemePalette {
+fn fixture_palette(slug: &str) -> ThemePalette {
     let mut palette = BTreeMap::new();
     palette.insert("background".into(), FIXTURE_ANSI[0].to_owned());
     palette.insert("foreground".into(), "#c0caf5".to_owned());
@@ -360,7 +366,7 @@ fn fixture_palette() -> ThemePalette {
     }
     ThemePalette {
         schema: 1,
-        slug: "maccer-fixture".into(),
+        slug: slug.into(),
         name: "Maccer Fixture".into(),
         variant: "dark".into(),
         alpha_byte: 230,
@@ -398,7 +404,7 @@ mod tests {
 
     #[test]
     fn projecting_a_document_keeps_only_documented_keys() {
-        let mut document = serde_json::to_value(fixture_palette()).unwrap();
+        let mut document = serde_json::to_value(fixture_palette("maccer-fixture")).unwrap();
         document["generated_by"] = serde_json::json!("mac-themer fixture");
         document["pack"] = serde_json::json!("themes/secret/../../escape");
         document["backgrounds"] = serde_json::json!("themes/secret/backgrounds");
@@ -413,7 +419,7 @@ mod tests {
 
     #[test]
     fn invalid_documents_are_rejected() {
-        let base = serde_json::to_value(fixture_palette()).unwrap();
+        let base = serde_json::to_value(fixture_palette("maccer-fixture")).unwrap();
         for mutate in [
             |v: &mut Value| v["schema"] = serde_json::json!(2),
             |v: &mut Value| v["variant"] = serde_json::json!("sepia"),

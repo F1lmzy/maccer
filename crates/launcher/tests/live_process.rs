@@ -60,7 +60,7 @@ fn native_host_starts_with_owned_configuration_and_history_then_stops_cleanly() 
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
-        "[providers.apps]\nenabled = false\n[providers.themes]\nenabled = false\n[providers.web]\nenabled = false\n[providers.clipboard]\nenabled = false\n",
+        "[providers.apps]\nenabled = false\n[providers.themes]\nenabled = false\n[providers.wallpapers]\nenabled = false\n[providers.web]\nenabled = false\n[providers.clipboard]\nenabled = false\n",
     )
     .unwrap();
     let history = dir.path().join("history.sqlite3");

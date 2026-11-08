@@ -1,0 +1,346 @@
+# maccer design system — values only.
+#
+# Rules that explain these numbers live in design/DESIGN.md.
+# The reference implementation is design.html; every value below is the value
+# that file uses. When a value changes, change design.html and this file in the
+# same commit, then run `node design/check.mjs`.
+
+system: maccer
+version: 1
+reference_implementation: design.html
+sources_of_truth:
+  ui: crates/launcher/src/ui/launcher.rs
+  theme: crates/launcher/src/ui/theme.rs
+  theme_catalog: crates/launcher/fixtures/theme-catalog.json
+  config: config/config.example.toml
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# grid
+# ─────────────────────────────────────────────────────────────────────────────
+
+grid:
+  base: 4
+  steps: [2, 4, 8, 12, 16, 20, 24, 28, 32, 40, 44, 48, 56, 64, 80, 96, 128]
+  notes:
+    - 2 is only for nudges inside a control (title/subtitle gap, selection bar, caret width)
+    - 22 is the footer height and 226 the wallpaper strip height; both are product
+      constants from launcher.rs, not spacing choices to imitate
+    - 1px is reserved for hairlines and borders
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# color — five roles, three derived washes, nothing else
+# ─────────────────────────────────────────────────────────────────────────────
+
+color:
+  roles:
+    surface: "#1a1a1a"   # window background
+    fg: "#bfbfbf"        # primary text
+    muted: "#a6a6a6"     # secondary text, subtitles, glyphs, placeholder, meta
+    accent: "#d9d9d9"    # selection bar, focused strip frame, caret
+    divider: "#3d3d3d"   # hairlines: window border, bar rule, row grid
+  derived:
+    selection: "accent 14%"     # selected row fill, confirm block fill
+    panel: "accent 6%"          # icon tile, inset panel, distant filmstrip frame
+    text_selection: "accent 35%" # marked text inside the search field
+  rule: "color-mix(in srgb, var(--accent) N%, transparent)"
+  text_roles: 3   # fg, muted, and the theme foreground inside a focused frame
+  accent_budget: "a few percent of the screen: one selected row, one border, one dot"
+  banned: [hue gradients, gradient text, glows, colored shadows, blobs, neon borders]
+  theme_overrides:
+    # a palette maps onto the five roles and nothing else; see design.html §8
+    required: [surface, fg, muted, accent, divider]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# type — one family, one weight class, four sizes
+# ─────────────────────────────────────────────────────────────────────────────
+
+type:
+  family: '"SF Mono", ui-monospace, "Menlo", "JetBrains Mono", monospace'
+  fallback_stack_note: "monospace for every string inside the popup, including counts and keys"
+  weights: [400]
+  scale:
+    search:      { size: 16, line: 22 }
+    row_title:   { size: 14, line: 18 }
+    row_sub:     { size: 11, line: 14 }
+    preview:     { size: 12, line: 17 }
+    preview_heading: { size: 10, line: 14 }
+    meta:        { size: 10, line: 14 }   # footer, confirm actions, strip edge dots label
+    strip_name:  { size: 13, line: 16 }   # focused frame, 11px at distance
+  case: sentence
+  letter_spacing: 0
+  numbers: tabular-nums
+  italic: never
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# geometry
+# ─────────────────────────────────────────────────────────────────────────────
+
+geometry:
+  window:
+    widths: [480, 760, 984]        # 480 list, 760 list + 280 preview, 984 wallpaper strip
+    preview_width: 280
+    border: 1
+    radius: 12
+    bar: 52
+    footer: 22
+    row: 44
+    icon: 24
+    row_radius: 8
+    icon_radius: 6
+    height_formula: "84 + rows * 44"    # 2 border + 52 bar + 8 body padding + 22 footer
+    height_clamp_max: 400
+    height_exception: "a staged confirmation adds its own block above the list (480 × 355)"
+
+  spacing:
+    gutter: 16            # inner left/right edge of every window surface
+    row_inset: 8          # where the selection fill starts
+    row_padding: 8        # row_inset + row_padding = gutter
+    icon_gap: 10          # icon box to title
+    nested_panel: 12      # padding inside a framed panel (.out, .preview)
+    confirm_padding: 8    # 8 margin + 8 padding = gutter
+    body_padding_y: 4
+    card_padding: 16      # gallery figure around a window
+    stage_padding: 4      # breathing room inside .stage
+
+  alignment:
+    # measured in design/check.mjs, relative to the window's inner edge
+    content_x: 16         # search text, icon box, footer text, error text, preview text
+    title_x: 50           # 16 + 24 icon + 10 gap
+    content_right: 16     # row text end, footer count, field end
+    row_fill: [8, "width - 8"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# components
+# ─────────────────────────────────────────────────────────────────────────────
+
+components:
+  bar:
+    height: 52
+    padding: [12, 16]     # 12 + 28 field + 12
+    field_height: 28
+    field_padding: 0      # the field starts on the gutter
+    placeholder: muted
+    caret: { width: 1.5, height: 24, blink: "1.06s" }
+
+  row:
+    height: 44
+    padding: [0, 8]
+    gap: 10
+    radius: 8
+    meta_gap: 2
+    icon:
+      box: 24
+      radius: 6
+      glyph_size: 11
+      glyph_color: muted
+      image: "24×24, object-fit contain"
+    selection:
+      fill: selection       # accent 14%
+      bar: { width: 2, inset_y: 12, radius: 2, color: accent }
+    action_row:             # .row.act — no icon
+      color: muted
+      color_selected: fg
+      padding: [0, 8]
+
+  states:
+    empty: { height: 44, align: center, size: 12, color: muted }
+    error: { height: 24, padding: [0, 16], size: 11, line: 14, color: muted }
+    searching_footer: "Searching… plus count"
+
+  preview:
+    width: 280
+    border_left: "1px divider"
+    padding: [12, 16]
+    text: { size: 12, line: 17 }
+    block_gap: 8
+    caption: { size: 10, line: 14, color: muted }
+    value: { size: 18, line: 24 }
+    height: "fills the list; never grows the window (contain: size)"
+    pinned_note: { padding: [20, 16, 12], background: surface }
+    figure: { art: [248, 165], page: [186, 240], page_padding: [20, 16], radius: 2 }
+
+  footer:
+    height: 22
+    padding: [0, 16]
+    gap: 12
+    text: { size: 10, line: 14, color: muted }
+    count: "right aligned, tabular-nums"
+
+  confirm:
+    margin: [8, 8, 0]
+    padding: 8
+    gap: 4
+    radius: 8
+    border: "1px divider"
+    fill: selection
+    message: { size: 12, line: 17, max_height: 128 }
+    actions: { size: 10, line: 14, gap: 12, color: muted }
+
+  output:
+    head: { height: 24, padding: [0, 16], size: 11, color: muted }
+    body:
+      margin: [0, 16, 12]
+      height: 240
+      padding: 12
+      radius: 8
+      border: "1px divider"
+      fill: panel
+      text: { size: 12, line: 18 }
+      window_height: 364
+
+  filmstrip:
+    # same component, two sizes; frames are butt-joined and centred on the strip's mid-line
+    strip_height: { wallpapers: 258, themes: 208 }
+    window: { wallpapers: [984, 334], themes: [760, 284] }
+    padding:
+      # the band has air above and below, none on the sides: the strip continues
+      # past both edges, so a frame may sit on the window's left/right edge
+      top: 16
+      bottom: 16
+      left: 0
+      right: 0
+    frames:
+      wallpapers: [{ w: 320, h: 226 }, { w: 190, h: 160 }, { w: 142, h: 120 }]   # centre, ±1, ±2
+      themes:     [{ w: 248, h: 176 }, { w: 146, h: 124 }, { w: 110, h: 92 }]
+    radius: { focused: 8, distance: 6 }
+    border: { focused: "1px accent of the thing it holds", distance: "1px divider" }
+    dim_wallpaper: [1.0, 0.72, 0.52]     # brightness toward the surface
+    theme_frame:
+      background: "theme surface when focused, panel when at distance"
+      dots:
+        size: [12, 8, 6]        # focused, ±1, ±2
+        gap: [8, 4, 4]
+        top: [72, 48, 32]       # from the frame's own top; lands every palette on y 94
+        radius: "50%"
+      name:
+        size: [13, 11]          # focused, ±1; the ±2 frames carry dots only
+        bottom: [32, 24]        # 18% and 19% of frame height, written as grid values
+        pad_x: [16, 12]
+      live_dot: { size: 5, inset: 10, color: "theme accent", meaning: "applied on the desktop" }
+
+  gallery:                                # design.html chrome, not the product
+    page_padding: [56, 40, 96]
+    section_gap: 56
+    section_head: { padding_top: 20, margin_bottom: 20 }
+    grid_gap: 20
+    card: { padding: 16, radius: 16, border: "1px #ddd8cf", caption_gap: 12 }
+    caption: { title: 12.5, size: 11, color: "#6d6a64" }
+    page: { background: "#f1efeb", ink: "#1b1a18", ink_2: "#6d6a64", hair: "#ddd8cf" }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# states inventory — every card in design.html, at its real size
+# ─────────────────────────────────────────────────────────────────────────────
+
+states:
+  search_and_shell:
+    - { card: "Search · default", size: [480, 348] }
+    - { card: "Search · empty (provider home)", size: [480, 348], rows: "title only, no icon, no subtitle" }
+    - { card: "Search · searching", size: [480, 348] }
+    - { card: "Search · no results", size: [480, 128] }
+    - { card: "Search · inline error", size: [480, 284] }
+    - { card: "Search · action running", size: [480, 216] }
+  providers:
+    - { card: "Applications", size: [480, 348] }
+    - { card: "Files", size: [480, 348] }
+    - { card: "Calculator", size: [480, 128] }
+    - { card: "Clipboard", size: [480, 348] }
+    - { card: "Shell / Commands", size: [480, 216] }
+    - { card: "Web search", size: [480, 172] }
+    - { card: "Themes", size: [480, 348] }
+  preview:
+    - { card: "Preview · text", size: [760, 348] }
+    - { card: "Preview · text, 64 KiB cap", size: [760, 348] }
+    - { card: "Preview · image", size: [760, 348] }
+    - { card: "Preview · PDF (Quick Look thumbnail)", size: [760, 348] }
+    - { card: "Preview · loading", size: [760, 348] }
+    - { card: "Preview · unavailable", size: [760, 348] }
+    - { card: "Preview · application details", size: [760, 348] }
+  actions:
+    - { card: "Actions · Applications", size: [480, 172] }
+    - { card: "Actions · Files", size: [480, 348] }
+    - { card: "Actions · Clipboard", size: [480, 304] }
+    - { card: "Actions · Shell", size: [480, 216] }
+    - { card: "Actions · Themes", size: [480, 128] }
+    - { card: "Actions · Wallpapers", size: [480, 128] }
+  output:
+    - { card: "Output · success", size: [480, 364] }
+    - { card: "Output · failure", size: [480, 364] }
+  confirm:
+    - { card: "Confirmation · theme apply", size: [480, 355] }
+  filmstrip:
+    - { card: "Wallpapers · filmstrip", size: [984, 334] }
+    - { card: "Themes · filmstrip", size: [760, 284] }
+  palette_variants:
+    - { card: "Theme · Catppuccin Mocha", size: [480, 172] }
+    - { card: "Theme · Gruvbox Dark", size: [480, 172] }
+    - { card: "Theme · Rosé Pine Dawn (light)", size: [480, 172] }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# copy
+# ─────────────────────────────────────────────────────────────────────────────
+
+copy:
+  case: sentence
+  trailing_period: never           # except paragraphs of several sentences
+  exclamation: never
+  placeholders: "Search…"          # one word, no "type anything"
+  counts: "1/12"                   # no "12 results"
+  footer_legends:
+    list: "↵ Open · ⌘K Actions · Esc Close"
+    actions: "↵ Run · Esc Back"
+    strip: "←→ Browse · ↵ Set · Esc Close"
+    themes_strip: "←→ Browse · ↵ Apply · Esc Close"
+  provider_subtitles: "what the provider holds, one line, no slug, no counts of wallpapers"
+  banned_words: [supercharge, seamless, unlock, magic, revolutionize, game-changing, AI-powered]
+  banned_claims: "anything the repo cannot show, e.g. invented theme counts or team totals"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# motion
+# ─────────────────────────────────────────────────────────────────────────────
+
+motion:
+  easing: "cubic-bezier(0.22, 1, 0.36, 1)"
+  durations: { feedback: 140, enter: 200, layout: 320 }
+  animate: [color, background, border-color, opacity, transform]
+  never_animate: [width, height, top, left, margin, blur]
+  loops_allowed: [caret blink]     # the search field is focused; nothing else loops
+  banned: [hover:scale, transition-all, springs, pulse, ping, parallax]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# signature — the details that make a screen maccer's
+# ─────────────────────────────────────────────────────────────────────────────
+
+signature:
+  - "2px accent bar on the selected row, inset 12 from the row's top and bottom"
+  - "keys as plain mono text in the footer: ↵ ⌘K Esc ←→"
+  - "a blinking 1.5 × 24 caret even on an empty field"
+  - "a 5px dot in the focused theme frame when that theme is on the desktop"
+  - "counts in the footer right corner, never in a badge"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# implementation — where these values live in the GPUI frontend
+# ─────────────────────────────────────────────────────────────────────────────
+
+implementation:
+  window: "crates/launcher/src/ui/launcher.rs — WindowBackgroundAppearance::Opaque, ROW_HEIGHT, ICON_SIZE, FOOTER_HEIGHT"
+  theme: "crates/launcher/src/ui/theme.rs — five roles; selection_fill() is a solid mix, panel_fill() and text_selection() stay washes because they sit over other content"
+  background:
+    window_appearance: opaque
+    surface_alpha: 1          # a palette's alpha_byte is validated but never painted
+  home_rows: "crates/launcher/src/ui/launcher.rs result_row — provider 'menu' draws title only"
+  filmstrip:
+    constants: "crates/launcher/src/ui/launcher.rs — StripGeometry, WALLPAPER_STRIP, THEME_STRIP, STRIP_INSET, STRIP_CHROME"
+    window_height: "band + 76"   # 2 border + 52 bar + 22 footer
+    wallpaper_frames: "GPUI images, dimmed toward the surface"
+    theme_cards: "ThemeSummary.card → ServiceBackend.theme_cards → palette tile; the strip is 760 wide, legend ←→ Browse · ↵ Apply · Esc Close"
+

@@ -42,11 +42,81 @@ actions!(
 );
 
 const ROW_HEIGHT: f32 = 44.;
+/// Rows and action buttons share one radius and icon slot so every screen
+/// lines up on the same 8-point grid.
+const ROW_RADIUS: f32 = 8.;
+const ICON_SIZE: f32 = 24.;
+/// Filmstrip geometry: exactly five frames — one focused, two shrinking on each
+/// side — butt-joined with no gaps so the row reads as one continuous strip, and
+/// as wide as the window so the last frame on each side ends at the edge. The
+/// band keeps 16 of air above and below the tallest frame, so the focused frame
+/// never touches the search rule or the footer.
+struct StripGeometry {
+    /// Height of the tallest (focused) frame.
+    frame_h: f32,
+    /// Frame width, height and centre offset by distance from the focused frame.
+    /// Offset 0 is the focused frame; neighbouring frames start exactly where the
+    /// previous one ends, which is what removes the gaps.
+    slot_w: [f32; 3],
+    slot_h: [f32; 3],
+    slot_cx: [f32; 3],
+    /// How much of a wallpaper survives at distance. Palette cards keep their
+    /// dots legible at every distance, so they use 1.
+    bright: [f32; 3],
+}
+const STRIP_INSET: f32 = 16.;
+/// Window height = 2 border + 52 bar + band + 22 footer.
+const STRIP_CHROME: f32 = 76.;
+const WALLPAPER_STRIP: StripGeometry = StripGeometry {
+    frame_h: 226.,
+    slot_w: [320., 190., 142.],
+    slot_h: [226., 160., 120.],
+    slot_cx: [0., 255., 421.],
+    bright: [1., 0.72, 0.52],
+};
+const THEME_STRIP: StripGeometry = StripGeometry {
+    frame_h: 176.,
+    slot_w: [248., 146., 110.],
+    slot_h: [176., 124., 92.],
+    slot_cx: [0., 197., 325.],
+    bright: [1., 1., 1.],
+};
+/// Palette card metrics by distance. Kept here rather than inside the tile so
+/// every frame lands its dots on the same line of the band.
+const THEME_DOTS: [f32; 3] = [12., 8., 6.];
+const THEME_DOT_GAP: [f32; 3] = [8., 4., 4.];
+const THEME_DOTS_TOP: [f32; 3] = [72., 48., 32.];
+const THEME_NAME: [f32; 3] = [13., 11., 11.];
+const THEME_NAME_BOTTOM: [f32; 3] = [32., 24., 24.];
+const THEME_NAME_PAD: [f32; 3] = [16., 12., 12.];
+
+impl StripGeometry {
+    /// The strip is exactly as wide as its frames: 984 for wallpapers, 760 for
+    /// palette cards.
+    fn width(&self) -> f32 {
+        let last = self.slot_w.len() - 1;
+        2. * self.slot_cx[last] + self.slot_w[last]
+    }
+    fn band(&self) -> f32 {
+        self.frame_h + STRIP_INSET * 2.
+    }
+    fn window_height(&self) -> f32 {
+        self.band() + STRIP_CHROME
+    }
+}
+/// Only the two frames on each side of the focused one are drawn.
+const FILMSTRIP_WINDOW: f32 = 2.;
+/// Wallpaper thumbnails held as decoded images before the oldest is dropped.
+const MAX_PREVIEW_CACHE: usize = 24;
+/// Frame time constant for the strip chase. Same feel as the reference.
+const FILMSTRIP_CHASE: f32 = 0.07;
 const MAX_ICON_LOADS: usize = 4;
 const MAX_SERVICE_ICON_CACHE: usize = 256;
 const PREVIEW_WIDTH: f32 = 280.;
 const FOOTER_HEIGHT: f32 = 22.;
 const MAX_WINDOW_HEIGHT: f32 = 400.;
+/// The launcher grows while the native web preview covers the body.
+const WEB_PREVIEW_HEIGHT: f32 = 560.;
 /// Delay between asking the paste target to activate and sending Command-V.
 const PASTE_DELAY_MS: u64 = 100;
 
@@ -75,6 +145,73 @@ impl Default for PasteBackend {
 pub struct LauncherOptions {
     pub width: f32,
     pub max_results: usize,
+    pub web: WebPreviewOptions,
+}
+
+impl Default for LauncherOptions {
+    fn default() -> Self {
+        Self {
+            width: 480.0,
+            max_results: 50,
+            web: WebPreviewOptions::default(),
+        }
+    }
+}
+
+/// How the launcher uses the native `WKWebView` panel.
+#[derive(Clone, Debug)]
+pub struct WebPreviewOptions {
+    /// Open web results in the native panel instead of the default browser.
+    pub inline: bool,
+    /// Create the view and load `about:blank` while the selection is a web
+    /// result. This removes WebKit process start-up from the frame where the
+    /// user presses Enter and costs its resident memory only while a web
+    /// result is selected. See `docs/web-preview-performance.md`.
+    pub prewarm: bool,
+    /// How long a hidden page is kept before its document is released. Zero
+    /// keeps the document until the launcher exits.
+    pub idle_release: std::time::Duration,
+}
+
+impl Default for WebPreviewOptions {
+    fn default() -> Self {
+        Self {
+            inline: true,
+            prewarm: true,
+            idle_release: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+impl WebPreviewOptions {
+    /// Prewarming earns its memory only when the selected row is the web
+    /// result the user is about to open. App, file and clipboard selections
+    /// never start WebKit.
+    pub fn should_prewarm(&self, selected: Option<&Item>) -> bool {
+        self.inline && self.prewarm && selected.is_some_and(|item| item.provider.0 == "web")
+    }
+}
+
+/// A provider-published field waiting for the user before its action may run.
+///
+/// The item and action travel with the field so the collected value returns to
+/// exactly the action that asked for it, and nothing is sent while the dialog
+/// is open.
+/// One row of the action panel: an action and the subject it runs against. A
+/// scope command's subject is the provider's own identity for it, so choosing
+/// one never runs against whatever happens to be selected.
+#[derive(Clone, Debug)]
+struct LauncherAction {
+    item: Item,
+    action: Action,
+}
+
+struct PendingInput {
+    item: Item,
+    action: Action,
+    field: crate::ui::service_backend::ServiceActionInput,
+    /// Chosen option for a select field; always 0 for text.
+    index: usize,
 }
 
 pub struct Launcher {
@@ -84,8 +221,20 @@ pub struct Launcher {
     options: LauncherOptions,
     focus_handle: FocusHandle,
     search_input: Entity<SearchInput>,
+    /// The text field a provider-published `text` input is typed into. It is
+    /// only focused and painted while a dialog is pending.
+    dialog_input: Entity<SearchInput>,
+    /// The provider dialog currently waiting for the user, if any.
+    pending_input: Option<PendingInput>,
+    /// True while the dialog's field owned the keyboard, so closing it hands
+    /// typing back to the search field exactly once.
+    dialog_was_focused: bool,
     state: LauncherState,
-    actions: Vec<Action>,
+    /// Last empty-query home snapshot. Reopening paints this immediately while
+    /// a replacement is fetched, so the home list never flashes through the
+    /// empty "Searching…" state.
+    home_items: Option<Vec<Item>>,
+    actions: Vec<LauncherAction>,
     action_item: Option<Item>,
     activation_serial: u64,
     activation_in_flight: Option<u64>,
@@ -116,6 +265,15 @@ pub struct Launcher {
     presentation_error: Option<String>,
     drag_start: Option<(Item, gpui::Point<gpui::Pixels>)>,
     icon_cache: HashMap<PathBuf, Arc<gpui::RenderImage>>,
+    /// Decoded wallpaper thumbnails, keyed by `image://maccer-previews/` source.
+    preview_cache: HashMap<PathBuf, Arc<gpui::RenderImage>>,
+    /// Animated strip position chasing the selected index, and the pointer
+    /// accumulators that turn wheel/trackpad deltas into single steps.
+    filmstrip_pos: f32,
+    /// Where the strip is heading, in continuous frames. Never wrapped, so
+    /// stepping past either end keeps rotating the same way.
+    filmstrip_target: f32,
+    filmstrip_wheel: f32,
     icon_failed: HashSet<PathBuf>,
     /// Native calls are not interruptible. Keep at most four active across query
     /// changes, and never queue a second load for the same bundle.
@@ -134,6 +292,12 @@ pub struct Launcher {
     /// not implement `Platform::hide`, so tests set this to false to exercise
     /// the rest of the hide path without the unsupported call.
     hide_window: bool,
+    /// Native AppKit host captured from the GPUI window. The web view itself
+    /// is created lazily so ordinary searches never load WebKit.
+    web_host: Option<crate::macos::WebHost>,
+    web_preview: Option<crate::macos::WebPreview>,
+    /// The pending idle release; dropping it cancels the release.
+    web_preview_idle: Option<gpui::Task<()>>,
 }
 
 pub fn open_launcher(
@@ -170,6 +334,15 @@ fn open_launcher_backend(
         KeyBinding::new("ctrl-n", MoveDown, Some("Launcher")),
         KeyBinding::new("up", MoveUp, Some("Launcher")),
         KeyBinding::new("ctrl-p", MoveUp, Some("Launcher")),
+        // The search field owns plain left/right for the caret, so the
+        // filmstrip steps with alt-arrows as well as up/down.
+        KeyBinding::new("alt-left", MoveUp, Some("Launcher")),
+        KeyBinding::new("alt-right", MoveDown, Some("Launcher")),
+        // The wallpaper strip reads left/right as "previous/next wallpaper".
+        // The input node swaps to this deeper context only in strip mode, so
+        // the caret keeps the plain arrows everywhere else.
+        KeyBinding::new("left", MoveUp, Some("Filmstrip")),
+        KeyBinding::new("right", MoveDown, Some("Filmstrip")),
         KeyBinding::new("enter", Confirm, Some("Launcher")),
         KeyBinding::new("cmd-enter", OpenActions, Some("Launcher")),
         KeyBinding::new("cmd-k", OpenActions, Some("Launcher")),
@@ -190,7 +363,8 @@ fn open_launcher_backend(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
-                window_background: WindowBackgroundAppearance::Transparent,
+                // Solid: the popup never lets the desktop through.
+                window_background: WindowBackgroundAppearance::Opaque,
                 focus: false,
                 show: false,
                 kind: WindowKind::PopUp,
@@ -201,6 +375,10 @@ fn open_launcher_backend(
             },
             move |_, cx| {
                 let search_input = cx.new(|cx| SearchInput::new(cx, input_tx));
+                // The dialog's field has its own channel; its events are not
+                // used, because a value is read once on submit.
+                let (dialog_tx, _dialog_rx) = async_channel::unbounded();
+                let dialog_input = cx.new(|cx| SearchInput::new(cx, dialog_tx));
                 let launcher = cx.new(|cx| Launcher {
                     coordinator,
                     history,
@@ -208,7 +386,11 @@ fn open_launcher_backend(
                     options,
                     focus_handle: cx.focus_handle(),
                     search_input,
+                    dialog_input,
+                    pending_input: None,
+                    dialog_was_focused: false,
                     state: LauncherState::default(),
+                    home_items: None,
                     actions: vec![],
                     action_item: None,
                     activation_serial: 0,
@@ -237,6 +419,10 @@ fn open_launcher_backend(
                     presentation_error: None,
                     drag_start: None,
                     icon_cache: HashMap::new(),
+                    preview_cache: HashMap::new(),
+                    filmstrip_pos: 0.,
+                    filmstrip_target: 0.,
+                    filmstrip_wheel: 0.,
                     icon_failed: HashSet::new(),
                     icon_loading: HashSet::new(),
                     icon_viewport: None,
@@ -245,6 +431,9 @@ fn open_launcher_backend(
                     paste_cancellation: None,
                     paste_backend,
                     hide_window: true,
+                    web_host: None,
+                    web_preview: None,
+                    web_preview_idle: None,
                 });
                 let refresh = launcher.downgrade();
                 let mut revisions: Vec<(String, u64)> = Vec::new();
@@ -288,11 +477,19 @@ fn open_launcher_backend(
                             event = latest;
                         }
                         let result = weak.update(cx, |this, cx| {
-                            let SearchInputEvent::Changed(query) = event;
-                            // The editor already holds this edit. Do not echo queued text
-                            // back and reset the caret or IME composition.
-                            this.query_changed(query, cx);
-                            this.start_search(cx);
+                            match event {
+                                SearchInputEvent::Changed(query) => {
+                                    // The editor already holds this edit. Do not echo queued
+                                    // text back and reset the caret or IME composition.
+                                    this.query_changed(query, cx);
+                                    this.start_search(cx);
+                                }
+                                // The strip is showing, so an arrow is a step through the
+                                // wallpapers rather than a caret move.
+                                SearchInputEvent::Navigate(delta) => {
+                                    this.step_filmstrip(delta, cx);
+                                }
+                            }
                             cx.notify();
                         });
                         if result.is_err() {
@@ -345,6 +542,8 @@ fn open_launcher_backend(
 
 impl Launcher {
     fn poll_service_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_filmstrip_keys(cx);
+        self.advance_filmstrip(cx);
         if !self.poll_service(cx) {
             return;
         }
@@ -408,6 +607,8 @@ impl Launcher {
                             self.theme = theme.clone();
                             // Update even while hidden so a later show is correct.
                             self.search_input
+                                .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+                            self.dialog_input
                                 .update(cx, |input, cx| input.set_theme(theme, cx));
                         }
                     }
@@ -480,6 +681,11 @@ impl Launcher {
                     cx.notify();
                 }
                 Some("results") if request == Some(self.state.generation) => {
+                    let home_route = event
+                        .get("route")
+                        .and_then(|route| route.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("home");
                     if let Some((_, items)) = self
                         .service
                         .as_mut()
@@ -496,6 +702,31 @@ impl Launcher {
                                     .filter_map(|source| {
                                         let pixels = service
                                             .icon(source.rsplit('/').next().unwrap_or_default())?;
+                                        let image = crate::ui::preview_image::PreparedPreview::new(
+                                            Preview::Pixels {
+                                                bgra: pixels.bgra,
+                                                width: pixels.width,
+                                                height: pixels.height,
+                                            },
+                                        )
+                                        .ok()?
+                                        .image?;
+                                        Some((PathBuf::from(source), image))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let prepared_previews: Vec<_> = self
+                            .service
+                            .as_ref()
+                            .map(|service| {
+                                service
+                                    .preview_sources
+                                    .values()
+                                    .filter_map(|source| {
+                                        let pixels = service.preview(
+                                            source.rsplit('/').next().unwrap_or_default(),
+                                        )?;
                                         let image = crate::ui::preview_image::PreparedPreview::new(
                                             Preview::Pixels {
                                                 bgra: pixels.bgra,
@@ -533,9 +764,15 @@ impl Launcher {
                         for (key, image) in prepared_icons {
                             self.cache_service_icon(key, image);
                         }
+                        for (key, image) in prepared_previews {
+                            self.cache_preview(key, image);
+                        }
                         items.truncate(result_limit(self.options.max_results));
                         self.state.apply_results(self.state.generation, items);
                         self.state.searching = false;
+                        if home_route && self.state.query.is_empty() {
+                            self.home_items = Some(self.state.items.clone());
+                        }
                         self.error = event
                             .get("errors")
                             .and_then(serde_json::Value::as_array)
@@ -543,8 +780,10 @@ impl Launcher {
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned);
                         self.activation_in_flight = None;
+                        self.pending_input = None;
                         self.refresh_actions();
                         self.keep_selection_visible();
+                        self.maybe_prewarm_web(cx);
                         cx.notify();
                     }
                 }
@@ -623,6 +862,45 @@ impl Launcher {
                     }
                     cx.notify();
                 }
+                Some("preview") if request == Some(self.state.generation) => {
+                    let source = event
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let token = source.rsplit('/').next().unwrap_or_default();
+                    let provider = event
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let id = event
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if let Some(service) = &mut self.service {
+                        service.record_preview_source(&provider, &id, token);
+                    }
+                    if let Some(pixels) = self
+                        .service
+                        .as_ref()
+                        .and_then(|service| service.preview(token))
+                    {
+                        let key = PathBuf::from(source);
+                        if let Some(image) =
+                            crate::ui::preview_image::PreparedPreview::new(Preview::Pixels {
+                                bgra: pixels.bgra,
+                                width: pixels.width,
+                                height: pixels.height,
+                            })
+                            .ok()
+                            .and_then(|prepared| prepared.image)
+                        {
+                            self.cache_preview(key, image);
+                        }
+                        cx.notify();
+                    }
+                }
                 Some("icon") if request == Some(self.state.generation) => {
                     let source = event
                         .get("source")
@@ -668,6 +946,319 @@ impl Launcher {
         present
     }
 
+    /// Keep the newest wallpaper thumbnails and drop the oldest source when the
+    /// budget is reached. Sources are revision-scoped, so an evicted one is
+    /// simply re-fetched if the strip scrolls back to it.
+    fn cache_preview(&mut self, key: PathBuf, image: Arc<gpui::RenderImage>) {
+        if !self.preview_cache.contains_key(&key)
+            && self.preview_cache.len() >= MAX_PREVIEW_CACHE
+            && let Some(evicted) = self.preview_cache.keys().next().cloned()
+        {
+            self.preview_cache.remove(&evicted);
+        }
+        self.preview_cache.insert(key, image);
+    }
+
+    fn preview_image(&self, item: &crate::core::Item) -> Option<Arc<gpui::RenderImage>> {
+        let service = self.service.as_ref()?;
+        let source = service
+            .preview_sources
+            .get(&(item.provider.0.clone(), item.id.0.clone()))?;
+        self.preview_cache.get(&PathBuf::from(source)).cloned()
+    }
+
+    /// Move the strip by `delta` frames, wrapping at both ends. Returns false
+    /// when the body is not a wallpaper strip, so the caller can fall through
+    /// to ordinary list movement.
+    fn step_filmstrip(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if !self.is_filmstrip() || self.state.screen != Some(Screen::Search) {
+            return false;
+        }
+        let count = self.state.items.len() as isize;
+        if count == 0 {
+            return true;
+        }
+        let current =
+            selected_result_index(&self.state.items, &self.state.selection).unwrap_or(0) as isize;
+        // A strip never ends: stepping past the last frame lands on the first
+        // one and keeps rotating in the same direction.
+        let next = (current + delta).rem_euclid(count) as usize;
+        let item = self.state.items[next].clone();
+        // Advance the running target by exactly one frame so the row keeps
+        // travelling forward across the wrap instead of rewinding.
+        self.filmstrip_target = self.filmstrip_target.round() + delta as f32;
+        self.state.select_item(&item);
+        self.refresh_actions();
+        cx.notify();
+        true
+    }
+
+    /// The strip owns the arrow keys while it is on screen; hand them back
+    /// when the body is a list again.
+    fn sync_filmstrip_keys(&mut self, cx: &mut Context<Self>) {
+        let filmstrip = self.is_filmstrip();
+        self.search_input.update(cx, |input, cx| {
+            input.set_filmstrip(filmstrip, cx);
+        });
+    }
+
+    /// Chase the selected index with the same exponential smoothing the
+    /// reference strip uses. One value animates the whole row, so fast input
+    /// stays bounded by a single chase instead of one animation per tile.
+    fn advance_filmstrip(&mut self, cx: &mut Context<Self>) {
+        if !self.is_filmstrip() {
+            self.filmstrip_pos = 0.;
+            self.filmstrip_target = 0.;
+            return;
+        }
+        let Some(index) = selected_result_index(&self.state.items, &self.state.selection) else {
+            return;
+        };
+        let count = self.state.items.len() as f32;
+        let selected = index as f32;
+        // The strip rotates forever, so a frame has many equivalent positions.
+        // The running target is the authority while the strip itself is being
+        // stepped; anything else that moves the selection (a click, a fresh
+        // snapshot, the query changing) re-anchors to the nearest lap.
+        if (self.filmstrip_target.rem_euclid(count) - selected).abs() > 0.5 {
+            let mut target = (self.filmstrip_pos / count).round() * count + selected;
+            if target - self.filmstrip_pos > count / 2. {
+                target -= count;
+            } else if target - self.filmstrip_pos < -count / 2. {
+                target += count;
+            }
+            self.filmstrip_target = target;
+        }
+        let target = self.filmstrip_target;
+        let delta = target - self.filmstrip_pos;
+        if delta.abs() < 0.002 {
+            if self.filmstrip_pos != target {
+                self.filmstrip_pos = target;
+                cx.notify();
+            }
+            return;
+        }
+        let k = 1. - (-(1. / 60.) / FILMSTRIP_CHASE).exp();
+        self.filmstrip_pos += delta * k;
+        cx.notify();
+    }
+
+    /// Which strip ladder this view uses. Palette cards are their own component:
+    /// the same five-frame strip at a smaller size.
+    fn strip_geometry(&self) -> &'static StripGeometry {
+        if self.is_palette_strip() {
+            &THEME_STRIP
+        } else {
+            &WALLPAPER_STRIP
+        }
+    }
+
+    /// The strip: a focused frame with shrinking neighbours, clipped at both
+    /// ends. Frames are absolutely placed so one animated value can move the
+    /// whole row.
+    fn filmstrip_body(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let geometry = self.strip_geometry();
+        let width = geometry.width();
+        let band = geometry.band();
+        // The outer frames' outer edges are the window edges, so the strip is
+        // exactly as wide as the window at full scale.
+        let scale = (self.effective_width() / width).clamp(0.35, 1.);
+        let pos = self.filmstrip_pos;
+        let selected = selected_result_index(&self.state.items, &self.state.selection);
+        let view = cx.entity().downgrade();
+        let mut strip = div()
+            .debug_selector(|| "filmstrip".into())
+            .relative()
+            .w_full()
+            .h(px(band))
+            .overflow_hidden();
+        // The strip is endless: the frames drawn are the slots nearest the
+        // animation position, and every slot wraps onto an item, so stepping
+        // past either end keeps rotating in the same direction.
+        let count = self.state.items.len() as f32;
+        let anchor = pos.round();
+        let half = FILMSTRIP_WINDOW as i32;
+        let mut slots: Vec<(f32, usize)> = (-half..=half)
+            .map(|step| {
+                let slot = anchor + step as f32;
+                (slot - pos, slot.rem_euclid(count) as usize)
+            })
+            .collect();
+        // Nearest first, and never the same wallpaper twice: a short strip has
+        // fewer frames to show than there are slots.
+        slots.sort_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+        let mut drawn: Vec<usize> = Vec::new();
+        slots.retain(|(_, index)| {
+            if drawn.contains(index) {
+                return false;
+            }
+            drawn.push(*index);
+            true
+        });
+        // Nearer tiles paint over farther ones, as in the reference: sort by
+        // distance so the focused card is always on top of its neighbours.
+        let mut tiles: Vec<(f32, gpui::Div)> = Vec::new();
+        for (offset, index) in slots {
+            let item = &self.state.items[index];
+            // Slots past the last distinct one keep its size, so the outer
+            // frames never pop while the row glides between them.
+            let distance = offset.abs().min(geometry.slot_w.len() as f32 - 1.);
+            let tile_w = filmstrip_slot(&geometry.slot_w, distance) * scale;
+            let tile_h = filmstrip_slot(&geometry.slot_h, distance) * scale;
+            let centre = filmstrip_slot(&geometry.slot_cx, distance) * scale;
+            let x = width / 2. + if offset < 0. { -centre } else { centre } - tile_w / 2.;
+            // Centred in the band, which keeps 16 of air above and below.
+            let y = STRIP_INSET + (geometry.frame_h - tile_h) / 2.;
+            let bright = filmstrip_slot(&geometry.bright, distance);
+            let focused = selected == Some(index);
+            // Small radii keep the joins tight; the strip reads as one band.
+            let radius = (if focused { 8. } else { 6. }) * scale;
+            let card = self.service.as_ref().and_then(|service| {
+                service
+                    .theme_cards
+                    .get(&(item.provider.0.clone(), item.id.0.clone()))
+                    .cloned()
+            });
+            let mut tile = div()
+                .debug_selector(move || format!("filmstrip-tile-{index}"))
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(tile_w))
+                .h(px(tile_h))
+                .rounded(px(radius))
+                .overflow_hidden()
+                .bg(theme.divider);
+            let focus_color = if let Some(card) = &card {
+                // The card is the theme itself while focused and a quiet panel
+                // at distance, so a light theme can never outshine the frame
+                // being looked at. The palette stays legible at every size.
+                tile = tile.bg(if focused {
+                    card.background
+                } else {
+                    theme.panel_fill()
+                });
+                let dots_top = filmstrip_slot(&THEME_DOTS_TOP, distance) * scale;
+                let dot = filmstrip_slot(&THEME_DOTS, distance) * scale;
+                let gap = filmstrip_slot(&THEME_DOT_GAP, distance) * scale;
+                tile = tile.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px(dots_top))
+                        .flex()
+                        .justify_center()
+                        .gap(px(gap))
+                        .children(
+                            card.swatches
+                                .iter()
+                                .map(|color| div().size(px(dot)).rounded_full().bg(*color)),
+                        ),
+                );
+                // The two frames at the edge are read as palettes, not names.
+                if distance < 1.5 {
+                    let bottom = filmstrip_slot(&THEME_NAME_BOTTOM, distance) * scale;
+                    tile = tile.child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .right(px(0.))
+                            .bottom(px(bottom))
+                            .px(px(filmstrip_slot(&THEME_NAME_PAD, distance) * scale))
+                            .text_center()
+                            .text_size(px(filmstrip_slot(&THEME_NAME, distance) * scale))
+                            .text_color(if focused {
+                                card.foreground
+                            } else {
+                                theme.muted
+                            })
+                            .truncate()
+                            .child(item.title.clone()),
+                    );
+                }
+                if card.applied {
+                    // The theme the desktop is wearing, in its own accent.
+                    tile = tile.child(
+                        div()
+                            .debug_selector(move || format!("filmstrip-live-{index}"))
+                            .absolute()
+                            .top(px(10. * scale))
+                            .right(px(10. * scale))
+                            .size(px(5. * scale))
+                            .rounded_full()
+                            .bg(card.accent),
+                    );
+                }
+                card.accent
+            } else {
+                let image = self.preview_image(item);
+                tile = match image {
+                    Some(image) => tile.child(
+                        gpui::img(image)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover),
+                    ),
+                    None => tile.child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme.muted)
+                            .text_size(px((13. * scale).max(8.)))
+                            // A provider option frame carries its own glyph;
+                            // a card-less theme frame falls back to its name.
+                            .child(icon_text(item).unwrap_or_else(|| {
+                                item.title.chars().next().unwrap_or('◧').to_string()
+                            })),
+                    ),
+                };
+                // Distance dims rather than desaturates: one overlay, no image
+                // filter. Fading toward the surface keeps light themes light.
+                tile = tile.child(div().absolute().inset_0().bg(gpui::Hsla {
+                    a: 1. - bright,
+                    ..theme.background
+                }));
+                theme.accent
+            };
+            tile = tile.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(radius))
+                    .border_1()
+                    .border_color(if focused { focus_color } else { theme.divider }),
+            );
+            let item_for_click = item.clone();
+            let view = view.clone();
+            tile = tile.on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if this.state.searching {
+                        return;
+                    }
+                    this.state.select_item(&item_for_click);
+                    this.refresh_actions();
+                    window.focus(&this.search_input.read(cx).focus_handle(cx));
+                    cx.notify();
+                });
+            });
+            tiles.push((distance, tile));
+        }
+        tiles.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, tile) in tiles {
+            strip = strip.child(tile);
+        }
+        div()
+            .debug_selector(|| "filmstrip-body".into())
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(strip)
+    }
+
     fn cache_service_icon(&mut self, key: PathBuf, image: Arc<gpui::RenderImage>) {
         let is_new = !self.icon_cache.contains_key(&key);
         let count = self
@@ -699,22 +1290,36 @@ impl Launcher {
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Remember which application the user was in before the launcher takes
         // focus. Never replace a captured target while already shown.
+        self.prepare_web_host(window);
         self.capture_paste_target();
         self.state.screen = Some(Screen::Search);
         self.was_active = false;
         self.clear_preview(cx);
-        self.state.items.clear();
-        self.state.selection.reconcile(&self.state.items);
         self.replace_query(String::new(), cx);
+        let showing_cached_home = self.home_items.is_some();
+        if let Some(items) = self.home_items.clone() {
+            self.state.items = items;
+            self.state.selection = Default::default();
+            self.state.selection.reconcile(&self.state.items);
+        } else {
+            self.state.items.clear();
+            self.state.selection.reconcile(&self.state.items);
+        }
         cx.activate(true);
         window.activate_window();
         window.focus(&self.search_input.read(cx).focus_handle(cx));
         self.resize_window(window);
-        self.start_search(cx);
+        self.start_home_search(cx);
+        if showing_cached_home {
+            // Keep the cached home list on screen while the replacement is in
+            // flight; the result handler will apply it when it arrives.
+            self.state.searching = false;
+        }
         cx.notify();
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.hide_web_preview(cx);
         self.state.screen = None;
         self.clear_preview(cx);
         // An in-flight icon load is left to finish and be cached; scheduling the
@@ -731,6 +1336,7 @@ impl Launcher {
         }
         self.actions.clear();
         self.action_item = None;
+        self.pending_input = None;
         self.invalidate_activation();
         if self.hide_window {
             cx.hide();
@@ -744,13 +1350,157 @@ impl Launcher {
             .update(cx, |input, cx| input.set_text(query, cx));
     }
 
-    fn query_changed(&mut self, query: String, _: &mut Context<Self>) {
+    fn query_changed(&mut self, query: String, cx: &mut Context<Self>) {
+        self.hide_web_preview(cx);
         self.drag_start = None;
         self.output = None;
         self.state.replace_query(query);
         self.actions.clear();
         self.action_item = None;
         self.invalidate_activation();
+    }
+
+    /// Capture the AppKit views for the retained window. Unit tests use GPUI's
+    /// test platform, which has no native handle.
+    fn prepare_web_host(&mut self, window: &mut Window) {
+        if self.web_host.is_some() || cfg!(test) {
+            return;
+        }
+        match crate::macos::WebHost::from_window(window) {
+            Ok(host) => self.web_host = Some(host),
+            Err(error) => tracing::debug!(%error, "web preview is unavailable"),
+        }
+    }
+
+    /// Create the native web view if it does not exist yet. The host is
+    /// captured when the launcher window is shown, so a launcher that never
+    /// shows cannot create one. Tests run against GPUI's test platform, which
+    /// has no native handle, and keep the field empty.
+    fn ensure_web_preview(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<&mut crate::macos::WebPreview> {
+        if self.web_preview.is_none() {
+            let host = self.web_host.as_ref()?;
+            let (sender, receiver) = async_channel::unbounded();
+            let started = std::time::Instant::now();
+            let preview = match crate::macos::WebPreview::new(host, sender) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    tracing::debug!(%error, "web preview could not be created");
+                    return None;
+                }
+            };
+            tracing::debug!(
+                stage = "web_preview_create",
+                duration_ms = started.elapsed().as_secs_f64() * 1000.,
+                "web preview created"
+            );
+            self.web_preview = Some(preview);
+            cx.spawn(async move |this, cx| {
+                while let Ok(event) = receiver.recv().await {
+                    if matches!(event, crate::macos::WebPreviewEvent::Hidden) {
+                        // The native key monitor hid the page before GPUI saw
+                        // the key, so the release is scheduled from here.
+                        let _ = this.update(cx, |this, cx| this.schedule_web_preview_release(cx));
+                    }
+                }
+            })
+            .detach();
+        }
+        self.web_preview.as_mut()
+    }
+
+    /// Pay WebKit's process start-up while the user is still reading results.
+    /// Only a selected web result is worth it: a launcher search that will open
+    /// an app or a file must not start WebKit. The first navigation is what
+    /// spawns the WebContent process, so the warm load is an empty document
+    /// rather than any search page.
+    fn maybe_prewarm_web(&mut self, cx: &mut Context<Self>) {
+        let selected = self.state.selection.current(&self.state.items);
+        if !self.options.web.should_prewarm(selected) {
+            return;
+        }
+        self.warm_web_preview(cx);
+    }
+
+    fn warm_web_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.ensure_web_preview(cx) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        match preview.warm() {
+            Ok(()) => tracing::debug!(
+                stage = "web_preview_warm",
+                duration_ms = started.elapsed().as_secs_f64() * 1000.,
+                "web preview warmed"
+            ),
+            Err(error) => tracing::debug!(%error, "web preview could not be warmed"),
+        }
+    }
+
+    /// Returns true when the page was placed in the launcher. A false result
+    /// lets the caller fall back to the normal browser action.
+    fn show_web_preview(&mut self, url: String, cx: &mut Context<Self>) -> bool {
+        if !self.options.web.inline {
+            return false;
+        }
+        // Showing the panel is an instant re-open, so a pending idle release
+        // must not drop the document underneath it.
+        self.web_preview_idle = None;
+        let Some(preview) = self.ensure_web_preview(cx) else {
+            return false;
+        };
+        match preview.show(&url) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(%error, "web preview could not load the page");
+                false
+            }
+        }
+    }
+
+    fn hide_web_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.web_preview else {
+            return;
+        };
+        if !preview.is_visible() {
+            return;
+        }
+        preview.hide();
+        self.schedule_web_preview_release(cx);
+    }
+
+    /// Release a hidden page's document once an immediate re-open is unlikely.
+    /// The WebKit processes stay warm, so the next search still skips start-up.
+    fn schedule_web_preview_release(&mut self, cx: &mut Context<Self>) {
+        let idle_release = self.options.web.idle_release;
+        if idle_release.is_zero() {
+            return;
+        }
+        let Some(preview) = &self.web_preview else {
+            return;
+        };
+        if preview.is_visible() {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        self.web_preview_idle = Some(cx.spawn(async move |_, cx| {
+            gpui::Timer::after(idle_release).await;
+            let _ = this.update(cx, |this, _| {
+                let Some(preview) = &mut this.web_preview else {
+                    return;
+                };
+                if preview.is_visible() {
+                    return;
+                }
+                preview.release_page();
+                tracing::debug!(
+                    stage = "web_preview_release",
+                    "web preview document released"
+                );
+            });
+        }));
     }
 
     fn clear_preview(&mut self, _cx: &mut Context<Self>) {
@@ -776,11 +1526,35 @@ impl Launcher {
             && self.preview_key.is_some()
     }
     fn effective_width(&self) -> f32 {
+        if self.is_filmstrip() {
+            return self.strip_geometry().width();
+        }
         if self.has_preview() {
             (self.options.width + PREVIEW_WIDTH).min(1200.)
         } else {
             self.options.width
         }
+    }
+
+    /// A wallpaper browse is a wide strip, not a list, and never a detail view.
+    fn is_filmstrip(&self) -> bool {
+        self.service.as_ref().is_some_and(|service| {
+            service.layout == crate::ui::service_backend::ServiceLayout::Filmstrip
+        }) && self.state.screen == Some(Screen::Search)
+            && !self.state.items.is_empty()
+    }
+    /// A strip whose frames are palette cards rather than wallpaper images.
+    ///
+    /// One card is enough to pick the ladder: the theme scope also publishes
+    /// plain option frames (install, uninstall), and those must be drawn at the
+    /// same scale as the palettes beside them rather than flipping the whole
+    /// strip to the larger wallpaper geometry.
+    fn is_palette_strip(&self) -> bool {
+        self.is_filmstrip()
+            && self
+                .service
+                .as_ref()
+                .is_some_and(|service| !service.theme_cards.is_empty())
     }
     fn on_toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
         self.preview_enabled = !self.preview_enabled;
@@ -800,14 +1574,17 @@ impl Launcher {
             .then(|| self.state.selection.current(&self.state.items).cloned())
             .flatten();
             let selected = selected.filter(|item| {
-                self.service.as_ref().is_some_and(|service| {
-                    service.has_details
-                        && service
-                            .details_available
-                            .get(&(item.provider.0.clone(), item.id.0.clone()))
-                            .copied()
-                            .unwrap_or(false)
-                })
+                // Application details repeat the row and force the window open
+                // wider. The result row already carries the name and type.
+                item.provider.0 != "apps"
+                    && self.service.as_ref().is_some_and(|service| {
+                        service.has_details
+                            && service
+                                .details_available
+                                .get(&(item.provider.0.clone(), item.id.0.clone()))
+                                .copied()
+                                .unwrap_or(false)
+                    })
             });
             let Some(item) = selected else {
                 if self.preview_key.is_some() {
@@ -1070,17 +1847,19 @@ impl Launcher {
             .h(px(height))
             .flex_shrink_0()
             .border_l_1()
-            .border_color(self.theme.border)
-            .p_3()
+            .border_color(self.theme.divider)
+            .px_4()
+            .py_3()
             .overflow_y_scroll()
             .track_scroll(&self.preview_scroll)
-            .text_sm();
+            .text_size(px(12.))
+            .line_height(px(17.));
         if let Some(preview) = self
             .service
             .as_ref()
             .and_then(|service| service.preview.as_ref())
         {
-            return panel.children(preview.elements(&self.icon_cache));
+            return panel.children(preview.elements(&self.icon_cache, &self.theme));
         }
         match &self.preview {
             Some(Preview::Text { text, truncated }) => {
@@ -1274,6 +2053,17 @@ impl Launcher {
     }
 
     fn start_search(&mut self, cx: &mut Context<Self>) {
+        self.start_search_with(cx, false);
+    }
+
+    /// Refresh the home view without depending on the route left by the last
+    /// provider scope. Callers that already display cached home rows use this
+    /// so the replacement cannot re-query an empty provider view.
+    fn start_home_search(&mut self, cx: &mut Context<Self>) {
+        self.start_search_with(cx, true);
+    }
+
+    fn start_search_with(&mut self, cx: &mut Context<Self>, home: bool) {
         if self.service.is_some() {
             // The service icon cache is already bounded. Query changes must not
             // evict the images still used by the displayed previous snapshot.
@@ -1282,7 +2072,11 @@ impl Launcher {
             self.state.searching = true;
         }
         if let Some(service) = &mut self.service {
-            let (request, result) = service.search(self.state.query.clone());
+            let (request, result) = if home {
+                service.search_home()
+            } else {
+                service.search(self.state.query.clone())
+            };
             self.state.generation = request;
             self.error = result.err();
             self.state.searching = self.error.is_none();
@@ -1309,12 +2103,16 @@ impl Launcher {
                 let result = this.update(cx, |this, cx| {
                     items.truncate(result_limit(this.options.max_results));
                     if this.state.apply_search_update(generation, items, complete) {
+                        if complete && this.state.query.is_empty() {
+                            this.home_items = Some(this.state.items.clone());
+                        }
                         this.error = errors.first().map(|failure| failure.message.clone());
                         if this.state.screen != Some(Screen::Actions) {
                             this.refresh_actions();
                         }
                         this.schedule_icon_loads(cx);
                         this.keep_selection_visible();
+                        this.maybe_prewarm_web(cx);
                         cx.notify();
                     }
                 });
@@ -1411,39 +2209,83 @@ impl Launcher {
             })
     }
 
+    /// The action panel: the selected row's own actions first, then whatever the
+    /// provider published for the whole scope. Every entry carries its subject.
     fn refresh_actions(&mut self) {
-        let Some(item) = self.state.selection.current(&self.state.items) else {
-            self.actions.clear();
-            return;
-        };
-        self.actions = if item.provider.0 == "picker" {
-            vec![Action {
-                id: ActionId("select-provider".into()),
-                title: "Select Provider".into(),
-            }]
-        } else {
-            self.service
-                .as_ref()
-                .and_then(|service| {
-                    service
-                        .authorized_actions
-                        .get(&(item.provider.0.clone(), item.id.0.clone()))
-                        .cloned()
-                })
-                .or_else(|| {
-                    self.coordinator.as_ref().and_then(|coordinator| {
-                        coordinator
-                            .registry
-                            .get(&item.provider)
-                            .map(|p| p.actions(item))
+        let mut actions: Vec<LauncherAction> = Vec::new();
+        if let Some(item) = self.state.selection.current(&self.state.items).cloned() {
+            if item.provider.0 == "picker" {
+                actions.push(LauncherAction {
+                    item,
+                    action: Action {
+                        id: ActionId("select-provider".into()),
+                        title: "Select Provider".into(),
+                    },
+                });
+            } else {
+                let own = self
+                    .service
+                    .as_ref()
+                    .and_then(|service| {
+                        service
+                            .authorized_actions
+                            .get(&(item.provider.0.clone(), item.id.0.clone()))
+                            .cloned()
                     })
-                })
-                .unwrap_or_default()
-        };
+                    .or_else(|| {
+                        self.coordinator.as_ref().and_then(|coordinator| {
+                            coordinator
+                                .registry
+                                .get(&item.provider)
+                                .map(|p| p.actions(&item))
+                        })
+                    })
+                    .unwrap_or_default();
+                actions.extend(own.into_iter().map(|action| LauncherAction {
+                    item: item.clone(),
+                    action,
+                }));
+            }
+        }
+        if let Some(service) = &self.service {
+            actions.extend(
+                service
+                    .scope_actions()
+                    .iter()
+                    .cloned()
+                    .map(|entry| LauncherAction {
+                        item: entry.item,
+                        action: entry.action,
+                    }),
+            );
+        }
+        self.actions = actions;
         self.state.action_index = self
             .state
             .action_index
             .min(self.actions.len().saturating_sub(1));
+    }
+
+    /// The panel labels `state` shows: the action titles, in panel order.
+    fn action_titles(&self) -> Vec<Action> {
+        self.actions
+            .iter()
+            .map(|entry| entry.action.clone())
+            .collect()
+    }
+
+    /// The actions of the selected row itself, ignoring scope commands. Tab and
+    /// Return work on those, so a provider command can never take over the
+    /// keyboard shortcut that runs the selection.
+    fn selected_actions(&self) -> Vec<LauncherAction> {
+        let Some(item) = self.state.selection.current(&self.state.items) else {
+            return Vec::new();
+        };
+        self.actions
+            .iter()
+            .filter(|entry| entry.item.provider == item.provider && entry.item.id == item.id)
+            .cloned()
+            .collect()
     }
 
     fn keep_selection_visible(&self) {
@@ -1456,6 +2298,39 @@ impl Launcher {
     }
 
     fn resize_window(&self, window: &mut Window) {
+        if self
+            .web_preview
+            .as_ref()
+            .is_some_and(|preview| preview.is_visible())
+        {
+            let desired = size(px(self.effective_width()), px(WEB_PREVIEW_HEIGHT));
+            let current = window.bounds().size;
+            if ((current.width - desired.width).abs() > px(1.)
+                || (current.height - desired.height).abs() > px(1.))
+                && window.resize_centered(desired).is_err()
+            {
+                window.resize(desired);
+            }
+            if let Some(preview) = &self.web_preview {
+                preview.update_frame();
+            }
+            return;
+        }
+        if self.is_filmstrip() {
+            let status = if self.visible_error().is_some() {
+                24.
+            } else {
+                0.
+            };
+            let desired = size(
+                px(self.effective_width()),
+                px(self.strip_geometry().window_height() + status),
+            );
+            if window.resize_centered(desired).is_err() {
+                window.resize(desired);
+            }
+            return;
+        }
         let mut row_count = if self.state.screen == Some(Screen::Actions) {
             visible_result_count(self.actions.len())
         } else {
@@ -1471,6 +2346,15 @@ impl Launcher {
             .is_some_and(|service| service.pending_confirmation.is_some())
         {
             row_count += 5;
+        }
+        // And for the provider dialog: a title, a label, the field and a hint.
+        if let Some(pending) = &self.pending_input {
+            row_count += if pending.field.is_select() {
+                // The list scrolls past six choices.
+                pending.field.options.len().min(6) + 4
+            } else {
+                5
+            };
         }
         let error_height = if self.visible_error().is_some()
             && self.state.screen == Some(Screen::Search)
@@ -1504,6 +2388,11 @@ impl Launcher {
     }
 
     fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // A provider dialog is modal while it is open: arrows move its choice
+        // list, never the results underneath it.
+        if self.move_input(delta, cx) {
+            return;
+        }
         // A staged confirmation is modal: selection cannot move out from under
         // the consent the user is being asked for.
         if self
@@ -1523,6 +2412,9 @@ impl Launcher {
             cx.notify();
             return;
         }
+        if self.step_filmstrip(delta, cx) {
+            return;
+        }
         if self.state.screen == Some(Screen::Actions) {
             if !self.actions.is_empty() {
                 let len = self.actions.len() as isize;
@@ -1533,6 +2425,7 @@ impl Launcher {
             self.state.move_selection(delta);
             self.refresh_actions();
             self.keep_selection_visible();
+            self.maybe_prewarm_web(cx);
         }
         self.resize_window(window);
         cx.notify();
@@ -1541,6 +2434,32 @@ impl Launcher {
     fn on_move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
+    /// One wheel notch steps one wallpaper. Trackpad pixel deltas and wheel
+    /// lines both accumulate here so a flick never skips several tiles.
+    fn on_scroll_wheel(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_filmstrip() {
+            return;
+        }
+        let (x, y) = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
+            gpui::ScrollDelta::Lines(delta) => (delta.x * 18., delta.y * 18.),
+        };
+        // A horizontal gesture wins when it is the larger one: the strip is a
+        // horizontal surface, but many mice only send vertical notches.
+        let step = if x.abs() > y.abs() { x } else { y };
+        self.filmstrip_wheel += step;
+        let notches = -(self.filmstrip_wheel / 24.).trunc();
+        if notches != 0. {
+            self.filmstrip_wheel += notches * 24.;
+            self.move_selection(notches as isize, window, cx);
+        }
+    }
+
     fn on_move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(1, window, cx);
     }
@@ -1552,6 +2471,25 @@ impl Launcher {
     }
 
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        // The native key monitor normally hides the page first. This covers
+        // Escape reaching GPUI after a click moved focus back to the input.
+        if self
+            .web_preview
+            .as_ref()
+            .is_some_and(|preview| preview.is_visible())
+        {
+            self.hide_web_preview(cx);
+            window.focus(&self.search_input.read(cx).focus_handle(cx));
+            self.resize_window(window);
+            cx.notify();
+            return;
+        }
+        // A provider dialog closes before anything else on screen.
+        if self.cancel_input(cx) {
+            window.focus(&self.search_input.read(cx).focus_handle(cx));
+            self.resize_window(window);
+            return;
+        }
         // Escape dismisses a staged confirmation without sending an operation.
         if let Some(service) = &mut self.service
             && service.pending_confirmation.is_some()
@@ -1612,7 +2550,10 @@ impl Launcher {
     }
 
     fn on_actions(&mut self, _: &OpenActions, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.screen == Some(Screen::Output) || self.state.searching {
+        if self.pending_input.is_some()
+            || self.state.screen == Some(Screen::Output)
+            || self.state.searching
+        {
             return;
         }
         if self
@@ -1624,13 +2565,16 @@ impl Launcher {
         }
         self.refresh_actions();
         self.action_item = self.state.selection.current(&self.state.items).cloned();
-        self.state.enter_actions(&self.actions);
+        self.state.enter_actions(&self.action_titles());
         self.resize_window(window);
         cx.notify();
     }
 
     fn on_next_action(&mut self, _: &NextAction, _: &mut Window, cx: &mut Context<Self>) {
-        if self.state.screen == Some(Screen::Output) || self.state.searching {
+        if self.pending_input.is_some()
+            || self.state.screen == Some(Screen::Output)
+            || self.state.searching
+        {
             return;
         }
         if self
@@ -1655,8 +2599,8 @@ impl Launcher {
             return;
         }
         self.refresh_actions();
-        if let Some(action) = self.actions.get(1).cloned() {
-            self.activate(item, action, cx);
+        if let Some(entry) = self.selected_actions().get(1).cloned() {
+            self.activate(entry.item, entry.action, cx);
         }
     }
 
@@ -1670,6 +2614,9 @@ impl Launcher {
     }
 
     fn on_provider_picker(&mut self, _: &ProviderPicker, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_input.is_some() {
+            return;
+        }
         if let Some(service) = &mut self.service {
             let (request, result) = service.home();
             self.state.generation = request;
@@ -1692,6 +2639,11 @@ impl Launcher {
     }
 
     fn on_confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        // A provider dialog is the innermost thing on screen: Return submits it.
+        if self.pending_input.is_some() {
+            self.submit_input(cx);
+            return;
+        }
         // A staged confirmation takes priority over every other Return target.
         if let Some(service) = &mut self.service
             && service.pending_confirmation.is_some()
@@ -1710,14 +2662,11 @@ impl Launcher {
             return;
         }
         if self.state.screen == Some(Screen::Actions) {
-            if let (Some(item), Some(action)) = (
-                self.action_item.clone(),
-                self.actions.get(self.state.action_index).cloned(),
-            ) {
-                if item.provider.0 == "picker" {
-                    self.select_provider(&item, cx);
+            if let Some(entry) = self.actions.get(self.state.action_index).cloned() {
+                if entry.item.provider.0 == "picker" {
+                    self.select_provider(&entry.item, cx);
                 } else {
-                    self.activate(item, action, cx);
+                    self.activate(entry.item, entry.action, cx);
                 }
             }
         } else if let Some(item) = self.state.selection.current(&self.state.items).cloned() {
@@ -1725,8 +2674,10 @@ impl Launcher {
                 self.select_provider(&item, cx);
             } else {
                 self.refresh_actions();
-                if let Some(action) = self.actions.first().cloned() {
-                    self.activate(item, action, cx);
+                // Return runs the selection's own first action, not a command
+                // the scope happens to publish before it.
+                if let Some(entry) = self.selected_actions().first().cloned() {
+                    self.activate(entry.item, entry.action, cx);
                 }
             }
         }
@@ -1736,8 +2687,127 @@ impl Launcher {
         if self.activation_in_flight.is_some() {
             return;
         }
+        // A provider that publishes a field decides it needs one collected
+        // first. Nothing is sent until the dialog is submitted.
+        if let Some(field) = self
+            .service
+            .as_ref()
+            .and_then(|service| service.action_input(&item, &action))
+        {
+            self.open_input(item, action, field, cx);
+            return;
+        }
+        self.activate_with_input(item, action, Default::default(), cx);
+    }
+
+    /// Open the provider's dialog. Every word in it is the provider's; the
+    /// frontend only knows how to draw a text field and a choice list.
+    fn open_input(
+        &mut self,
+        item: Item,
+        action: Action,
+        field: crate::ui::service_backend::ServiceActionInput,
+        cx: &mut Context<Self>,
+    ) {
+        self.error = None;
+        if !field.is_select() {
+            self.dialog_input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+        }
+        self.pending_input = Some(PendingInput {
+            item,
+            action,
+            field,
+            index: 0,
+        });
+        cx.notify();
+    }
+
+    /// Submit the pending dialog: collect the value, then send the action the
+    /// provider asked for. A published confirmation still stages first.
+    fn submit_input(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_input.take() else {
+            return;
+        };
+        let problem = |label: &str, empty: bool| {
+            if empty {
+                format!("{label} is required.")
+            } else {
+                format!("{label} has no choices.")
+            }
+        };
+        let value = if pending.field.is_select() {
+            match pending.field.options.get(pending.index) {
+                Some(option) => option.value.clone(),
+                None => {
+                    self.error = Some(problem(&pending.field.label, false));
+                    self.pending_input = Some(pending);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            let text = self.dialog_input.read(cx).text().trim().to_owned();
+            if text.is_empty() {
+                self.error = Some(problem(&pending.field.label, true));
+                self.pending_input = Some(pending);
+                cx.notify();
+                return;
+            }
+            text
+        };
+        let mut input = std::collections::BTreeMap::new();
+        input.insert(pending.field.id.clone(), value);
+        self.activate_with_input(pending.item, pending.action, input, cx);
+    }
+
+    /// Dismiss the dialog without sending anything.
+    fn cancel_input(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_input.take().is_none() {
+            return false;
+        }
+        self.error = None;
+        cx.notify();
+        true
+    }
+
+    /// Move the highlight in a choice dialog. A text field keeps the caret keys.
+    fn move_input(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_input.as_mut() else {
+            return false;
+        };
+        let count = pending.field.options.len();
+        if !pending.field.is_select() || count == 0 {
+            return true;
+        }
+        let len = count as isize;
+        pending.index = (pending.index as isize + delta).rem_euclid(len) as usize;
+        cx.notify();
+        true
+    }
+
+    fn activate_with_input(
+        &mut self,
+        item: Item,
+        action: Action,
+        input: std::collections::BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.activation_in_flight.is_some() {
+            return;
+        }
+        // A web search opens its page in the native panel instead of the
+        // browser. If WebKit or the AppKit host is unavailable, fall through
+        // to the provider's ordinary Open action.
+        if let Some(url) = web_search_url(&item, &action)
+            && self.show_web_preview(url, cx)
+        {
+            self.error = None;
+            cx.notify();
+            return;
+        }
         if let Some(service) = &mut self.service {
-            match service.activate(&item, &action) {
+            match service.activate(&item, &action, input) {
                 Ok(Some(request)) => {
                     self.activation_in_flight = Some(request);
                     self.error = None;
@@ -1849,6 +2919,15 @@ impl Render for Launcher {
         self.resize_window(window);
         let theme = self.theme.clone();
         let state = self.state.screen.clone();
+        let max_height = if self
+            .web_preview
+            .as_ref()
+            .is_some_and(|preview| preview.is_visible())
+        {
+            WEB_PREVIEW_HEIGHT
+        } else {
+            MAX_WINDOW_HEIGHT
+        };
         // A provider-published prompt staged by the last action selection. The
         // backend owns consent, so render only its plain text, never a slug.
         let confirmation = self
@@ -1857,6 +2936,15 @@ impl Render for Launcher {
             .and_then(|service| service.pending_confirmation.clone());
         if state == Some(Screen::Output) {
             window.focus(&self.focus_handle);
+        }
+        // The provider dialog is the focus while it is open: typing belongs in
+        // its field, and Return/Escape still reach the launcher's key context.
+        if self.pending_input.is_some() {
+            window.focus(&self.dialog_input.read(cx).focus_handle(cx));
+            self.dialog_was_focused = true;
+        } else if self.dialog_was_focused {
+            self.dialog_was_focused = false;
+            window.focus(&self.search_input.read(cx).focus_handle(cx));
         }
         let selected = self
             .state
@@ -1882,6 +2970,7 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_copy_output))
             .on_action(cx.listener(Self::on_toggle_preview))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(
                 gpui::MouseButton::Left,
@@ -1894,22 +2983,22 @@ impl Render for Launcher {
             .flex_col()
             .w(px(self.effective_width()))
             .h_full()
-            .max_h(px(MAX_WINDOW_HEIGHT))
+            .max_h(px(max_height))
             .overflow_hidden()
             .rounded(px(12.))
             .font_family("monospace")
             .text_size(px(14.))
             .line_height(px(18.))
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.divider)
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
                 div()
                     .h(px(52.))
                     .flex_shrink_0()
-                    .px_3()
-                    .py(px(10.))
+                    .px_4()
+                    .py(px(12.))
                     .border_b_1()
                     .border_color(theme.divider)
                     .child(self.search_input.clone()),
@@ -1928,16 +3017,15 @@ impl Render for Launcher {
                     .debug_selector(|| "service-confirmation".into())
                     .mx_2()
                     .mt_2()
-                    .px_3()
+                    .px_2()
                     .py_2()
-                    .rounded(px(6.))
+                    .rounded(px(ROW_RADIUS))
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.selected)
-                    .text_color(theme.selected_foreground)
+                    .border_color(theme.divider)
+                    .bg(theme.selection_fill())
                     .flex_shrink_0()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(px(4.))
                     .child(
                         div()
                             .id("service-confirmation-message")
@@ -1945,17 +3033,18 @@ impl Render for Launcher {
                             .max_h(px(128.))
                             .overflow_y_scroll()
                             .text_size(px(12.))
-                            .line_height(px(16.))
+                            .line_height(px(17.))
                             .child(pending.prompt.clone()),
                     )
                     .child(
                         div()
                             .flex()
+                            .items_center()
                             .gap(px(12.))
                             .text_size(px(10.))
                             .line_height(px(14.))
-                            .text_color(theme.selected_muted)
-                            .child(pending.action.title.clone())
+                            .text_color(theme.muted)
+                            .child(div().flex_1().child(pending.action.title.clone()))
                             .child(
                                 div()
                                     .id("service-confirmation-apply")
@@ -1982,25 +3071,177 @@ impl Render for Launcher {
             );
         }
 
+        // The provider's field, if it asked for one. Every word here comes
+        // from the provider; this only knows a text box from a choice list.
+        if state.is_some()
+            && let Some(pending) = self.pending_input.as_ref()
+        {
+            let field = pending.field.clone();
+            let chosen = pending.index;
+            let dialog_input = self.dialog_input.clone();
+            let empty = dialog_input.read(cx).text().trim().is_empty();
+            let view = cx.entity().downgrade();
+            let mut panel = div()
+                .debug_selector(|| "service-input-dialog".into())
+                .mx_2()
+                .mt_2()
+                .px_2()
+                .py_2()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .rounded(px(ROW_RADIUS))
+                .border_1()
+                .border_color(theme.divider)
+                .bg(theme.selection_fill())
+                .child(
+                    div()
+                        .id("service-input-title")
+                        .debug_selector(|| "service-input-title".into())
+                        .text_size(px(12.))
+                        .line_height(px(17.))
+                        .child(field.title.clone()),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "service-input-label".into())
+                        .text_size(px(11.))
+                        .line_height(px(15.))
+                        .text_color(theme.muted)
+                        .child(field.label.clone()),
+                );
+            if field.is_select() {
+                for (index, option) in field.options.iter().enumerate().take(6) {
+                    let selected = index == chosen;
+                    let view = view.clone();
+                    panel = panel.child(
+                        div()
+                            .debug_selector(move || format!("service-input-option-{index}"))
+                            .flex()
+                            .items_center()
+                            .h(px(26.))
+                            .px_2()
+                            .rounded(px(6.))
+                            .bg(if selected {
+                                theme.panel_fill()
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .text_color(if selected {
+                                theme.foreground
+                            } else {
+                                theme.muted
+                            })
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    if let Some(pending) = this.pending_input.as_mut() {
+                                        pending.index = index;
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .child(option.label.clone()),
+                    );
+                }
+                if field.options.len() > 6 {
+                    panel = panel.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme.muted)
+                            .child(format!("{} more…", field.options.len() - 6)),
+                    );
+                }
+            } else {
+                panel = panel.child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.divider)
+                        .bg(theme.panel_fill())
+                        .px_2()
+                        .py(px(2.))
+                        .child(dialog_input),
+                );
+                if empty && let Some(placeholder) = &field.placeholder {
+                    panel = panel.child(
+                        div()
+                            .debug_selector(|| "service-input-placeholder".into())
+                            .text_size(px(10.))
+                            .line_height(px(14.))
+                            .text_color(theme.muted)
+                            .child(placeholder.clone()),
+                    );
+                }
+            }
+            let cancel_view = cx.entity().downgrade();
+            root = root.child(
+                panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .text_size(px(10.))
+                        .line_height(px(14.))
+                        .text_color(theme.muted)
+                        .child(
+                            div()
+                                .debug_selector(|| "service-input-submit".into())
+                                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                    let _ = cancel_view.update(cx, |this, cx| {
+                                        this.on_confirm(&Confirm, window, cx)
+                                    });
+                                })
+                                .child(format!("↵ {}", field.submit_label)),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "service-input-cancel".into())
+                                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                    let _ = view
+                                        .update(cx, |this, cx| this.on_escape(&Escape, window, cx));
+                                })
+                                .child("Esc Cancel"),
+                        ),
+                ),
+            );
+        }
+
         if state.is_some() {
             if state == Some(Screen::Output) {
                 if let Some((title, text)) = &self.output {
                     root = root
-                        .child(div().px_3().h(px(28.)).child(title.clone()))
+                        .child(
+                            div()
+                                .h(px(24.))
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .child(title.clone()),
+                        )
                         .child(
                             div()
                                 .id("command-output")
-                                .mx_3()
-                                .h(px(260.))
+                                .mx_4()
+                                .mb_3()
+                                .h(px(240.))
+                                .rounded(px(ROW_RADIUS))
+                                .border_1()
+                                .border_color(theme.divider)
+                                .bg(theme.panel_fill())
+                                .p_3()
                                 .overflow_y_scroll()
                                 .track_scroll(&self.output_scroll)
                                 .font_family("monospace")
-                                .text_sm()
+                                .text_size(px(12.))
+                                .line_height(px(18.))
                                 .child(text.clone()),
                         );
                 }
             } else if state == Some(Screen::Actions) {
-                for (index, action) in actions
+                for (index, entry) in actions
                     .iter()
                     .enumerate()
                     .skip(action_index.saturating_sub(crate::ui::state::MAX_VISIBLE_RESULTS - 1))
@@ -2010,33 +3251,44 @@ impl Render for Launcher {
                     root = root.child(
                         div()
                             .debug_selector(|| format!("action-{index}"))
-                            .rounded(px(6.))
+                            .relative()
+                            .rounded(px(ROW_RADIUS))
                             .mx_2()
                             .h(px(ROW_HEIGHT))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
-                            .px_3()
+                            .px_2()
                             .bg(if selected {
-                                theme.selected
+                                theme.selection_fill()
                             } else {
-                                theme.background
+                                gpui::transparent_black()
                             })
                             .text_color(if selected {
-                                theme.selected_foreground
+                                theme.foreground
                             } else {
                                 theme.muted
                             })
-                            .child(action.title.clone()),
+                            .children(selected.then(|| {
+                                div()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .top(px(12.))
+                                    .bottom(px(12.))
+                                    .w(px(2.))
+                                    .rounded_full()
+                                    .bg(theme.accent)
+                            }))
+                            .child(entry.action.title.clone()),
                     );
                 }
             } else if items.is_empty() {
                 root = root.child(
                     div()
-                        .px_3()
                         .h(px(44.))
                         .flex()
                         .items_center()
+                        .justify_center()
                         .text_size(px(12.))
                         .text_color(theme.muted)
                         .child(self.visible_error().cloned().unwrap_or_else(|| {
@@ -2048,16 +3300,37 @@ impl Render for Launcher {
                             .into()
                         })),
                 );
+            } else if self.is_filmstrip() {
+                // A strip has no result list to carry a status line, and a
+                // failed install or removal must not look like nothing happened.
+                if let Some(error) = self.visible_error() {
+                    root = root.child(
+                        div()
+                            .debug_selector(|| "launcher-error".into())
+                            .px_4()
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(theme.muted)
+                            .truncate()
+                            .child(error.clone()),
+                    );
+                }
+                root = root.child(self.filmstrip_body(&theme, cx));
             } else {
                 if let Some(error) = self.visible_error() {
                     root = root.child(
                         div()
-                            .px_3()
+                            .px_4()
                             .h(px(24.))
                             .flex_shrink_0()
                             .text_size(px(11.))
                             .line_height(px(14.))
                             .text_color(theme.muted)
+                            .truncate()
                             .child(error.clone()),
                     );
                 }
@@ -2161,6 +3434,34 @@ impl Render for Launcher {
                 }
                 root = root.child(body);
             }
+            let hint = if confirmation.is_some() {
+                "↵ Apply · Esc Cancel".to_string()
+            } else if state == Some(Screen::Output) {
+                "⌘C Copy · Esc Back".to_string()
+            } else if self.state.searching {
+                "Searching…".to_string()
+            } else if self.activation_in_flight.is_some() {
+                "Running… · Esc Cancel".to_string()
+            } else if state == Some(Screen::Actions) {
+                "↵ Run · Esc Back".to_string()
+            } else if self.is_palette_strip() {
+                // The scope's frames are actions, not only "apply": name the
+                // one Return would run, in the provider's own words.
+                match self.selected_actions().first() {
+                    Some(entry) => format!(
+                        "←→ Browse · ↵ {} · ⌘K Actions · Esc Close",
+                        entry.action.title.trim_end_matches('…')
+                    ),
+                    None => "←→ Browse · ⌘K Actions · Esc Close".to_string(),
+                }
+            } else if self.is_filmstrip() {
+                "←→ Browse · ↵ Set · Esc Close".to_string()
+            } else {
+                "↵ Open · ⌘K Actions · Esc Close".to_string()
+            };
+            let position = selected_result_index(&self.state.items, &self.state.selection)
+                .map(|index| format!("{}/{}", index + 1, self.state.items.len()))
+                .unwrap_or_default();
             root = root.child(
                 div()
                     .h(px(FOOTER_HEIGHT))
@@ -2168,26 +3469,22 @@ impl Render for Launcher {
                     .mt_auto()
                     .flex()
                     .items_center()
-                    .px_3()
+                    .justify_between()
+                    .gap(px(12.))
+                    .px_4()
                     .text_size(px(10.))
                     .line_height(px(14.))
                     .text_color(theme.muted)
-                    .child(if confirmation.is_some() {
-                        "↵ Apply · Esc Cancel".to_string()
-                    } else if state == Some(Screen::Output) {
-                        "⌘C Copy · Esc Back".to_string()
-                    } else if self.state.searching {
-                        "Searching…".to_string()
-                    } else if self.activation_in_flight.is_some() {
-                        "Running… · Esc Cancel".to_string()
-                    } else if state == Some(Screen::Actions) {
-                        "↵ Run · Esc Back".to_string()
-                    } else {
-                        let position =
-                            selected_result_index(&self.state.items, &self.state.selection)
-                                .map_or(0, |index| index + 1);
-                        format!("{position}/{}", self.state.items.len())
-                    }),
+                    .child(hint)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(if state == Some(Screen::Search) {
+                                position
+                            } else {
+                                String::new()
+                            }),
+                    ),
             );
         }
         root
@@ -2198,20 +3495,111 @@ fn service_action_is_current(in_flight: Option<u64>, request: u64) -> bool {
     in_flight == Some(request)
 }
 
+/// The configured web provider's primary action carries the encoded search
+/// URL in its item payload. Service rows receive the same URL as `webLink`
+/// domain data, which `ServiceBackend` copies into this payload.
+fn web_search_url(item: &Item, action: &Action) -> Option<String> {
+    if item.provider.0 != "web" || action.id.0 != "search" {
+        return None;
+    }
+    let url = item
+        .payload
+        .get("url")
+        .and_then(serde_json::Value::as_str)?;
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    Some(url.to_owned())
+}
+
+/// Piecewise-linear lookup across the three strip slots, clamped at the last.
+/// A provider's own short glyph for an item, when it published one. Used where
+/// a row has no image to draw and its name would be the wrong label.
+fn icon_text(item: &Item) -> Option<String> {
+    match &item.icon {
+        Some(crate::core::IconDescriptor::Text(text)) if !text.starts_with("image://") => {
+            let text = text.trim();
+            (!text.is_empty() && text != "•").then(|| text.to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn filmstrip_slot(values: &[f32; 3], distance: f32) -> f32 {
+    let last = values.len() - 1;
+    if distance >= last as f32 {
+        return values[last];
+    }
+    let index = distance.floor().max(0.) as usize;
+    let fraction = distance - index as f32;
+    values[index] + (values[index + 1] - values[index]) * fraction
+}
+
+/// Rows without a subtitle show their source instead. Applications speak for
+/// themselves, so they stay single-line.
+fn provider_label(provider: &str) -> Option<String> {
+    if provider == "apps" || provider.is_empty() {
+        return None;
+    }
+    let mut chars = provider.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
+
 fn result_row(
     item: &Item,
     selected: bool,
     theme: &crate::ui::theme::Theme,
     image: Option<Arc<gpui::RenderImage>>,
 ) -> gpui::Div {
+    // The provider menu is navigation, not results: one name per row, no icon
+    // and no subtitle, so six providers read as six words.
+    if item.provider.0 == "menu" {
+        return div()
+            .debug_selector(|| format!("suggestion-{}", item.id.0))
+            .relative()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .rounded(px(ROW_RADIUS))
+            .text_color(theme.foreground)
+            .bg(if selected {
+                theme.selection_fill()
+            } else {
+                gpui::transparent_black()
+            })
+            .flex()
+            .items_center()
+            .children(selected.then(|| {
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(12.))
+                    .bottom(px(12.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(theme.accent)
+            }))
+            .child(
+                div()
+                    .debug_selector(|| format!("suggestion-title-{}", item.id.0))
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(14.))
+                    .line_height(px(18.))
+                    .truncate()
+                    .child(item.title.clone()),
+            );
+    }
     let secondary = item
         .subtitle
         .clone()
-        .unwrap_or_else(|| item.provider.0.clone());
+        .or_else(|| provider_label(&item.provider.0));
     let icon = if let Some(image) = image {
         Some(
             gpui::img(image)
-                .size(px(28.))
+                .size(px(ICON_SIZE))
                 .object_fit(gpui::ObjectFit::Contain)
                 .into_any_element(),
         )
@@ -2222,21 +3610,51 @@ fn result_row(
                     gpui::ImageFormat::Png,
                     png.to_vec(),
                 )))
-                .size(px(28.))
+                .size(px(ICON_SIZE))
                 .object_fit(gpui::ObjectFit::Contain)
                 .into_any_element(),
             ),
             Some(crate::core::IconDescriptor::Text(text)) if !text.starts_with("image://") => {
-                Some(div().child(text.clone()).into_any_element())
+                let text = text.trim();
+                // The service sends a bullet for glyph icons it cannot project.
+                // The title's initial keeps the slot informative.
+                let glyph = if text.is_empty() || text == "•" {
+                    item.title
+                        .chars()
+                        .next()
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_default()
+                } else {
+                    text.to_owned()
+                };
+                Some(
+                    div()
+                        .size(px(ICON_SIZE))
+                        .rounded(px(6.))
+                        .bg(theme.panel_fill())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.))
+                        .text_color(theme.muted)
+                        .truncate()
+                        .child(glyph)
+                        .into_any_element(),
+                )
             }
-            _ if item.provider.0 == "apps" => Some(div().child("□").into_any_element()),
-            _ => None,
+            _ => Some(
+                div()
+                    .size(px(ICON_SIZE))
+                    .rounded(px(6.))
+                    .bg(theme.panel_fill())
+                    .into_any_element(),
+            ),
         }
     };
     let icon_slot = icon.map(|icon| {
         div()
             .debug_selector(|| format!("suggestion-icon-{}", item.id.0))
-            .size(px(28.))
+            .size(px(ICON_SIZE))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -2245,24 +3663,30 @@ fn result_row(
     });
     div()
         .debug_selector(|| format!("suggestion-{}", item.id.0))
+        .relative()
         .w_full()
         .min_w_0()
-        .px_3()
-        .py(px(4.))
-        .rounded(px(6.))
-        .text_color(if selected {
-            theme.selected_foreground
-        } else {
-            theme.foreground
-        })
+        .px_2()
+        .rounded(px(ROW_RADIUS))
+        .text_color(theme.foreground)
         .bg(if selected {
-            theme.selected
+            theme.selection_fill()
         } else {
-            theme.background
+            gpui::transparent_black()
         })
         .flex()
         .items_center()
-        .gap(px(8.))
+        .gap(px(10.))
+        .children(selected.then(|| {
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(12.))
+                .bottom(px(12.))
+                .w(px(2.))
+                .rounded_full()
+                .bg(theme.accent)
+        }))
         .children(icon_slot)
         .child(
             div()
@@ -2281,20 +3705,16 @@ fn result_row(
                         .truncate()
                         .child(item.title.clone()),
                 )
-                .child(
+                .children(secondary.map(|secondary| {
                     div()
                         .debug_selector(|| format!("suggestion-type-{}", item.id.0))
                         .text_size(px(11.))
                         .line_height(px(14.))
                         .flex_shrink_0()
                         .truncate()
-                        .text_color(if selected {
-                            theme.selected_muted
-                        } else {
-                            theme.muted
-                        })
-                        .child(secondary),
-                ),
+                        .text_color(theme.muted)
+                        .child(secondary)
+                })),
         )
 }
 
@@ -2310,6 +3730,100 @@ mod tests {
         AvailableSpace, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn provider_labels_skip_applications_and_capitalize_sources() {
+        assert_eq!(provider_label("apps"), None);
+        assert_eq!(provider_label(""), None);
+        assert_eq!(provider_label("web").as_deref(), Some("Web"));
+        assert_eq!(provider_label("clipboard").as_deref(), Some("Clipboard"));
+    }
+
+    #[test]
+    fn prewarming_waits_for_a_selected_web_result_and_respects_both_opt_outs() {
+        let item = |provider: &str| Item {
+            id: ItemId(format!("{provider}:one")),
+            provider: ProviderId(provider.into()),
+            title: "Result".into(),
+            subtitle: None,
+            keywords: Vec::new(),
+            icon: None,
+            score: 0.0,
+            payload: serde_json::Value::Null,
+        };
+        let options = WebPreviewOptions::default();
+        // Nothing selected, or an app/file row: WebKit must stay unloaded.
+        assert!(!options.should_prewarm(None));
+        assert!(!options.should_prewarm(Some(&item("apps"))));
+        assert!(!options.should_prewarm(Some(&item("files"))));
+        assert!(options.should_prewarm(Some(&item("web"))));
+
+        let cold = WebPreviewOptions {
+            prewarm: false,
+            ..options.clone()
+        };
+        assert!(!cold.should_prewarm(Some(&item("web"))));
+        // Opening results in the browser makes a warm panel pure waste.
+        let external = WebPreviewOptions {
+            inline: false,
+            ..options
+        };
+        assert!(!external.should_prewarm(Some(&item("web"))));
+    }
+
+    #[test]
+    fn web_search_url_is_bound_to_the_web_provider_and_http_schemes() {
+        let item = |provider: &str, url: serde_json::Value| Item {
+            id: ItemId("web:google".into()),
+            provider: ProviderId(provider.into()),
+            title: "Search with Google".into(),
+            subtitle: Some("Web".into()),
+            keywords: Vec::new(),
+            icon: None,
+            score: 0.0,
+            payload: serde_json::json!({"url": url}),
+        };
+        let search = Action {
+            id: ActionId("search".into()),
+            title: "Search".into(),
+        };
+        assert_eq!(
+            web_search_url(
+                &item(
+                    "web",
+                    serde_json::json!("https://www.google.com/search?q=rust")
+                ),
+                &search
+            )
+            .as_deref(),
+            Some("https://www.google.com/search?q=rust")
+        );
+        assert!(
+            web_search_url(
+                &item("apps", serde_json::json!("https://example.com")),
+                &search
+            )
+            .is_none()
+        );
+        assert!(
+            web_search_url(
+                &item("web", serde_json::json!("file:///etc/passwd")),
+                &search
+            )
+            .is_none()
+        );
+        let copy = Action {
+            id: ActionId("copy-url".into()),
+            title: "Copy URL".into(),
+        };
+        assert!(
+            web_search_url(
+                &item("web", serde_json::json!("https://example.com")),
+                &copy
+            )
+            .is_none()
+        );
+    }
 
     struct FixtureService {
         dir: tempfile::TempDir,
@@ -2365,6 +3879,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -2558,7 +4073,12 @@ mod tests {
         cx.update(|cx| {
             window
                 .update(cx, |launcher, _, cx| {
-                    assert!(!launcher.actions.iter().any(|action| action.id.0 == "paste"));
+                    assert!(
+                        !launcher
+                            .actions
+                            .iter()
+                            .any(|entry| entry.action.id.0 == "paste")
+                    );
                     launcher.refresh_preview(cx);
                 })
                 .unwrap()
@@ -2574,7 +4094,13 @@ mod tests {
             let preview = launcher.service.as_ref().unwrap().preview.as_ref().unwrap();
             assert!(preview.blocks.iter().any(|block| matches!(block, crate::ui::service_preview::ServicePreviewBlock::Text { text, .. } if text.contains("Preview body"))));
             let item = launcher.state.items[0].clone();
-            let pin = launcher.actions.iter().find(|action| action.id.0 == "pin").unwrap().clone();
+            let pin = launcher
+                .actions
+                .iter()
+                .find(|entry| entry.action.id.0 == "pin")
+                .unwrap()
+                .action
+                .clone();
             launcher.activate(item, pin, cx);
         }).unwrap());
         poll_service_until(
@@ -2645,7 +4171,13 @@ mod tests {
             assert!(service.search_request.is_none());
             assert!(service.detail_selection.is_none());
             assert!(service.details_available.is_empty());
-            assert!(service.activate(&old_item, &Action { id: ActionId("copy".into()), title:"Copy".into() }).is_err());
+            assert!(service
+                .activate(
+                    &old_item,
+                    &Action { id: ActionId("copy".into()), title: "Copy".into() },
+                    Default::default(),
+                )
+                .is_err());
             assert!(service.apply_details(&serde_json::json!({"request":1,"detailRequest":1,"provider":"clipboard","id":"old","content":[]})).is_none());
             // When a replacement is delivered, old preview content must go away.
             let request = launcher.state.generation;
@@ -2666,6 +4198,7 @@ mod tests {
                 LauncherOptions {
                     width: 480.,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -2808,7 +4341,11 @@ mod tests {
                         .selection
                         .reconcile(std::slice::from_ref(&item));
                     launcher.refresh_actions();
-                    launcher.activate(item, launcher.actions[0].clone(), cx);
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
                 })
                 .unwrap()
         });
@@ -2941,6 +4478,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -2997,7 +4535,11 @@ mod tests {
                         .selection
                         .reconcile(std::slice::from_ref(&item));
                     launcher.refresh_actions();
-                    launcher.activate(item, launcher.actions[0].clone(), cx);
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
                     window.focus(&launcher.search_input.read(cx).focus_handle(cx));
                 })
                 .unwrap()
@@ -3119,8 +4661,61 @@ mod tests {
         catalog: Arc<crate::service::ThemeCatalog>,
         theme: Arc<crate::service::ThemerState>,
     ) -> FixtureService {
-        let provider: Arc<dyn crate::service::ServiceProvider> =
-            Arc::new(crate::service::ThemeServiceProvider::new(catalog));
+        catalog_service_with(catalog, theme, false)
+    }
+
+    /// The production shape of a theme scope: a card that can Apply and the two
+    /// page commands behind it.
+    fn catalog_service_with_apply(
+        catalog: Arc<crate::service::ThemeCatalog>,
+        theme: Arc<crate::service::ThemerState>,
+        install: bool,
+    ) -> FixtureService {
+        let provider = crate::service::ThemeServiceProvider::with_apply(
+            catalog,
+            crate::service::ThemeApply::new(std::path::PathBuf::from("/nonexistent/mac-themer")),
+        )
+        .with_theme(theme.clone());
+        let provider: crate::service::ThemeServiceProvider = if install {
+            provider.with_install(crate::service::ThemeInstall::new(std::path::PathBuf::from(
+                "/nonexistent/mac-themer",
+            )))
+        } else {
+            provider
+        };
+        let service = crate::service::Service::with_state(
+            vec![(
+                Arc::new(provider),
+                crate::core::ProviderConfig {
+                    enabled: true,
+                    max_results: 50,
+                    ..Default::default()
+                },
+            )],
+            Arc::new(HistoryStore::in_memory().unwrap()),
+            None,
+            theme.clone(),
+        )
+        .unwrap();
+        FixtureService::with_service(service)
+    }
+
+    /// A themes scope that also publishes install and remove, so a strip of
+    /// palette cards has to share its geometry with the page's commands.
+    fn catalog_service_with(
+        catalog: Arc<crate::service::ThemeCatalog>,
+        theme: Arc<crate::service::ThemerState>,
+        install: bool,
+    ) -> FixtureService {
+        let provider = crate::service::ThemeServiceProvider::new(catalog).with_theme(theme.clone());
+        let provider: crate::service::ThemeServiceProvider = if install {
+            provider.with_install(crate::service::ThemeInstall::new(std::path::PathBuf::from(
+                "/nonexistent/mac-themer",
+            )))
+        } else {
+            provider
+        };
+        let provider: Arc<dyn crate::service::ServiceProvider> = Arc::new(provider);
         let service = crate::service::Service::with_state(
             vec![(provider, crate::core::ProviderConfig::default())],
             Arc::new(HistoryStore::in_memory().unwrap()),
@@ -3190,6 +4785,546 @@ mod tests {
         }
     }
 
+    /// A browse provider whose `kind` is `wallpaper`, so the service publishes
+    /// a filmstrip for its results.
+    struct FilmstripProvider {
+        activations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Provider for FilmstripProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId("walls".into())
+        }
+        fn name(&self) -> &str {
+            "Walls"
+        }
+        fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+            Ok(["Wall A", "Wall B", "Wall C", "Wall D"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, title)| Item {
+                    id: ItemId(format!("walls:{index}")),
+                    provider: ProviderId("walls".into()),
+                    title: title.into(),
+                    subtitle: Some(format!("pack · {index}.webp")),
+                    keywords: vec![],
+                    icon: None,
+                    score: -(index as f64),
+                    payload: serde_json::Value::Null,
+                })
+                .collect())
+        }
+        fn actions(&self, _: &Item) -> Vec<Action> {
+            vec![Action {
+                id: ActionId("set".into()),
+                title: "Set wallpaper".into(),
+            }]
+        }
+        fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+            self.activations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ActionOutcome::KeepOpen("Wallpaper set.".into()))
+        }
+    }
+    impl crate::service::ServiceProvider for FilmstripProvider {
+        fn description(&self) -> &str {
+            "Browse every installed wallpaper."
+        }
+        fn kind(&self) -> &str {
+            "wallpaper"
+        }
+        fn presentation(&self, item: &Item) -> crate::service::ItemPresentation {
+            crate::service::ItemPresentation {
+                kind: "wallpaper".into(),
+                icon: Some(crate::protocol::Icon::Glyph {
+                    name: "wallpaper".into(),
+                    fallback_text: item.title.chars().next().unwrap_or('◧').to_string(),
+                }),
+                content: vec![],
+                data: Some(crate::protocol::DomainData::WallpaperSummary {
+                    schema_version: 1,
+                    theme_slug: "pack".into(),
+                    wallpaper_id: format!("{}.webp", item.title.replace(' ', "-").to_lowercase()),
+                }),
+            }
+        }
+    }
+
+    fn filmstrip_service(activations: Arc<std::sync::atomic::AtomicUsize>) -> FixtureService {
+        let provider: Arc<dyn crate::service::ServiceProvider> =
+            Arc::new(FilmstripProvider { activations });
+        let service = crate::service::Service::new(
+            vec![(
+                provider,
+                crate::core::ProviderConfig {
+                    // A picker is browsed by prefix, exactly like `/walls`.
+                    prefix: Some("/walls".into()),
+                    default_search: false,
+                    ..Default::default()
+                },
+            )],
+            Arc::new(HistoryStore::in_memory().unwrap()),
+        )
+        .unwrap();
+        FixtureService::with_service(service)
+    }
+
+    /// A theme scope is the same strip at its own size, drawing palette cards:
+    /// the theme's surface, its six accents, its name and a dot when the desktop
+    /// is wearing it.
+    #[gpui::test]
+    fn the_provider_menu_is_a_list_of_names_only(cx: &mut TestAppContext) {
+        let server = FixtureService::start();
+        let window = open_service(cx, &server.socket());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "home menu", |launcher| {
+            !launcher.state.searching && !launcher.state.items.is_empty()
+        });
+        let first = cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(
+                launcher
+                    .state
+                    .items
+                    .iter()
+                    .all(|item| item.provider.0 == "menu"),
+                "the home view is the provider menu"
+            );
+            launcher.state.items[0].id.0.clone()
+        });
+        let view = window.root(cx).unwrap();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+        visual.simulate_resize(bounds.size);
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(bounds.size.height),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        // A name, on the 16px gutter: no icon slot, no subtitle.
+        let row = visual
+            .debug_bounds(Box::leak(format!("suggestion-{first}").into_boxed_str()))
+            .expect("the provider row is painted");
+        let title = visual
+            .debug_bounds(Box::leak(
+                format!("suggestion-title-{first}").into_boxed_str(),
+            ))
+            .expect("the provider name is painted");
+        assert!(
+            visual
+                .debug_bounds(Box::leak(
+                    format!("suggestion-icon-{first}").into_boxed_str()
+                ))
+                .is_none(),
+            "the menu has no icon slot"
+        );
+        assert!(
+            (f32::from(title.left()) - (f32::from(row.left()) + 8.)).abs() < 1.,
+            "the name starts on the row's 8px padding: {:?}",
+            title
+        );
+        assert!(
+            (f32::from(title.size.height) - 18.).abs() < 1.,
+            "one line, no subtitle: {:?}",
+            title.size
+        );
+    }
+
+    #[gpui::test]
+    fn reopening_service_home_paints_cached_menu_before_the_refresh(cx: &mut TestAppContext) {
+        let server = FixtureService::start();
+        let window = open_service(cx, &server.socket());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "initial home menu", |launcher| {
+            !launcher.state.searching
+                && !launcher.state.items.is_empty()
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .all(|item| item.provider.0 == "menu")
+        });
+        let home_ids: Vec<_> = cx.read(|cx| {
+            window
+                .read(cx)
+                .unwrap()
+                .state
+                .items
+                .iter()
+                .map(|item| item.id.0.clone())
+                .collect()
+        });
+
+        // Enter a provider scope so reopening must not reuse that route.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| {
+                    let item = launcher
+                        .state
+                        .items
+                        .iter()
+                        .find(|item| item.id.0 == "apps")
+                        .unwrap()
+                        .clone();
+                    launcher
+                        .state
+                        .selection
+                        .reconcile(std::slice::from_ref(&item));
+                    launcher.refresh_actions();
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "provider scope", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .service
+                    .as_ref()
+                    .is_some_and(|service| service.provider_scope)
+        });
+
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, _, cx| launcher.hide(cx))
+                .unwrap()
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+
+        // The first frame after show must already be the home menu: no poll or
+        // IPC result has been processed yet, and no loading state is visible.
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(launcher.state.screen == Some(Screen::Search));
+            assert!(!launcher.state.searching);
+            assert!(!launcher.state.items.is_empty());
+            assert!(
+                launcher
+                    .state
+                    .items
+                    .iter()
+                    .all(|item| item.provider.0 == "menu"),
+                "reopening must paint the cached home menu, not provider rows"
+            );
+            assert_eq!(
+                launcher
+                    .state
+                    .items
+                    .iter()
+                    .map(|item| item.id.0.clone())
+                    .collect::<Vec<_>>(),
+                home_ids
+            );
+        });
+        let height = cx.update(|cx| {
+            window
+                .update(cx, |_, window, _| window.bounds().size.height)
+                .unwrap()
+        });
+        assert!(
+            height > px(120.),
+            "the cached home menu must paint at its list height immediately, got {height:?}"
+        );
+
+        // The background home search replaces the cache without changing the
+        // visible shape of the screen.
+        poll_service_until(cx, &window, "refreshed home menu", |launcher| {
+            !launcher.state.searching
+                && !launcher.state.items.is_empty()
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .all(|item| item.provider.0 == "menu")
+        });
+    }
+
+    #[gpui::test]
+    fn a_theme_picker_paints_palette_cards_on_the_smaller_strip(cx: &mut TestAppContext) {
+        let mut night = watched_palette("#010203", "#0d0e0f", "#101112");
+        night.slug = "night-blue".into();
+        night.name = "Night Blue".into();
+        let catalog = crate::service::ThemeCatalog::from_palettes(vec![night]).unwrap();
+        // The desktop already wears this one, so its card carries the marker.
+        let active = crate::service::ThemerState::fixture_named("night-blue");
+        let server = catalog_service(catalog, active);
+        let window = open_service(cx, &server.socket());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.options.width = 480.;
+                    launcher.show(window, cx);
+                    launcher.replace_query("night".into(), cx);
+                    launcher.start_search(cx);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "theme cards", |launcher| {
+            launcher.state.items.len() == 1
+        });
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(launcher.is_filmstrip(), "a theme scope is a filmstrip");
+            assert!(
+                launcher.is_palette_strip(),
+                "every frame carries a palette card"
+            );
+            assert_eq!(launcher.effective_width(), THEME_STRIP.width());
+            assert_eq!(THEME_STRIP.width(), 760.);
+            assert_eq!(
+                launcher.strip_geometry().window_height(),
+                THEME_STRIP.window_height()
+            );
+            // 2 border + 52 bar + 16 + 176 frame + 16 + 22 footer.
+            assert_eq!(THEME_STRIP.window_height(), 284.);
+        });
+
+        let view = window.root(cx).unwrap();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let width = THEME_STRIP.width();
+        let height = THEME_STRIP.window_height();
+        visual.simulate_resize(size(px(width), px(height)));
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(px(width)),
+                AvailableSpace::Definite(px(height)),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        let focused = visual
+            .debug_bounds("filmstrip-tile-0")
+            .expect("the palette card is painted");
+        assert!(
+            (f32::from(focused.size.width) - 248.).abs() < 1.,
+            "the focused card is 248 wide: {:?}",
+            focused.size
+        );
+        assert!(
+            (f32::from(focused.size.height) - 176.).abs() < 1.,
+            "the focused card is 176 tall: {:?}",
+            focused.size
+        );
+        // 1 border + 52 bar + 16 of air: the card never touches the search rule.
+        assert!(
+            (f32::from(focused.origin.y) - 69.).abs() < 1.,
+            "the card sits 16 below the bar rule: {:?}",
+            focused.origin
+        );
+        assert!(
+            visual.debug_bounds("filmstrip-live-0").is_some(),
+            "the applied theme is marked"
+        );
+    }
+
+    #[gpui::test]
+    fn a_wallpaper_picker_paints_a_filmstrip_and_steps_between_tiles(cx: &mut TestAppContext) {
+        let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = filmstrip_service(activations.clone());
+        let window = open_service(cx, &server.socket());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.options.width = 480.;
+                    launcher.show(window, cx);
+                    launcher.replace_query("/walls".into(), cx);
+                    launcher.start_search(cx);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "wallpaper tiles", |launcher| {
+            launcher.state.items.len() == 4
+        });
+        // The provider owns the body shape, and the strip is wider than a list.
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(launcher.is_filmstrip(), "a wallpaper scope is a filmstrip");
+            assert_eq!(launcher.effective_width(), WALLPAPER_STRIP.width());
+            assert_eq!(
+                launcher.service.as_ref().unwrap().layout,
+                crate::ui::service_backend::ServiceLayout::Filmstrip
+            );
+            assert_eq!(
+                selected_result_index(&launcher.state.items, &launcher.state.selection),
+                Some(0)
+            );
+        });
+
+        let body = |cx: &mut TestAppContext| {
+            let view = window.root(cx).unwrap();
+            let mut visual = VisualTestContext::from_window(*window, cx);
+            let height = WALLPAPER_STRIP.window_height();
+            visual.simulate_resize(size(px(WALLPAPER_STRIP.width()), px(height)));
+            visual.draw(
+                point(px(0.), px(0.)),
+                size(
+                    AvailableSpace::Definite(px(WALLPAPER_STRIP.width())),
+                    AvailableSpace::Definite(px(height)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+            visual
+        };
+        let mut visual = body(cx);
+        assert!(
+            visual.debug_bounds("filmstrip").is_some(),
+            "the strip is painted"
+        );
+        assert!(
+            visual.debug_bounds("filmstrip-tile-0").is_some(),
+            "the focused tile is painted"
+        );
+        assert!(
+            visual.debug_bounds("filmstrip-tile-1").is_some(),
+            "its neighbour is painted"
+        );
+        let focused = visual.debug_bounds("filmstrip-tile-0").unwrap();
+        let neighbour = visual.debug_bounds("filmstrip-tile-1").unwrap();
+        assert!(
+            focused.size.width > neighbour.size.width,
+            "the focused frame is the largest: {:?} vs {:?}",
+            focused.size,
+            neighbour.size
+        );
+        // The strip wraps: the last wallpaper sits to the left of the first,
+        // so a five-frame window is always full.
+        assert!(
+            visual.debug_bounds("filmstrip-tile-2").is_some(),
+            "the second frame to the right is painted"
+        );
+        assert!(
+            visual.debug_bounds("filmstrip-tile-3").is_some(),
+            "the strip rotates: the last wallpaper is already on the left"
+        );
+        // The frames butt-join: the neighbour starts exactly where the focused
+        // frame ends, which is what makes the row read as one continuous strip.
+        let gap: f32 = (neighbour.origin.x - (focused.origin.x + focused.size.width)).into();
+        assert!(gap.abs() < 1., "frames are continuous, gap was {gap}");
+
+        // Stepping right moves the selection; the chase settles on it.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_move_down(&MoveDown, window, cx)
+                })
+                .unwrap()
+        });
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert_eq!(
+                selected_result_index(&launcher.state.items, &launcher.state.selection),
+                Some(1)
+            );
+        });
+        for _ in 0..90 {
+            pump_service(cx, &window);
+        }
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(
+                (launcher.filmstrip_pos - 1.).abs() < 0.05,
+                "the strip settles on the selection, got {}",
+                launcher.filmstrip_pos
+            );
+        });
+        // Plain arrows belong to the strip, not to the caret, while it shows.
+        let mut visual = body(cx);
+        visual.simulate_keystrokes("right");
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert_eq!(
+                selected_result_index(&launcher.state.items, &launcher.state.selection),
+                Some(2),
+                "the right arrow steps the strip"
+            );
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_move_up(&MoveUp, window, cx)
+                })
+                .unwrap()
+        });
+
+        // Stepping past the last frame wraps to the first and keeps the strip
+        // travelling forward: an endless rotation, never a rewind.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    for _ in 0..3 {
+                        launcher.on_move_down(&MoveDown, window, cx);
+                    }
+                })
+                .unwrap()
+        });
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert_eq!(
+                selected_result_index(&launcher.state.items, &launcher.state.selection),
+                Some(0),
+                "the last frame wraps to the first"
+            );
+        });
+        for _ in 0..140 {
+            pump_service(cx, &window);
+        }
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert!(
+                launcher.filmstrip_pos > 3.9,
+                "the strip rotated forward past the end, got {}",
+                launcher.filmstrip_pos
+            );
+        });
+        // And the other way: from the first frame, left lands on the last one.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_move_up(&MoveUp, window, cx)
+                })
+                .unwrap()
+        });
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            assert_eq!(
+                selected_result_index(&launcher.state.items, &launcher.state.selection),
+                Some(3)
+            );
+        });
+
+        // Enter runs the wallpaper action, not a row confirmation.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_confirm(&Confirm, window, cx)
+                })
+                .unwrap()
+        });
+        pump_for(cx, &window, 300);
+        assert_eq!(
+            activations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "confirming a tile sets that wallpaper exactly once"
+        );
+    }
+
     fn confirmation_service(activations: Arc<std::sync::atomic::AtomicUsize>) -> FixtureService {
         let provider: Arc<dyn crate::service::ServiceProvider> =
             Arc::new(ConfirmationProvider { activations });
@@ -3208,6 +5343,7 @@ mod tests {
                 LauncherOptions {
                     width: 480.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -3290,7 +5426,11 @@ mod tests {
             .selection
             .reconcile(std::slice::from_ref(&item));
         launcher.refresh_actions();
-        launcher.activate(item, launcher.actions[0].clone(), cx);
+        launcher.activate(
+            launcher.actions[0].item.clone(),
+            launcher.actions[0].action.clone(),
+            cx,
+        );
     }
 
     #[gpui::test]
@@ -3404,6 +5544,847 @@ mod tests {
         });
     }
 
+    /// Values the option provider received, in the order it received them.
+    type Recorded =
+        Arc<std::sync::Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>>;
+
+    /// A provider whose two rows are options: one asks for a text value, one
+    /// asks which of two choices to run and then wants consent. Every word the
+    /// frontend draws comes from here, so a test that passes proves the dialog
+    /// is provider-driven rather than the launcher's own popup.
+    struct OptionProvider {
+        activated: Recorded,
+    }
+    impl Provider for OptionProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId("options".into())
+        }
+        fn name(&self) -> &str {
+            "Options"
+        }
+        fn search(&self, _: &SearchQuery, _: &SearchContext) -> Result<Vec<Item>> {
+            Ok([("ins", "Install an option"), ("rem", "Remove an option")]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (suffix, title))| Item {
+                    id: ItemId(format!("options:{suffix}")),
+                    provider: ProviderId("options".into()),
+                    title: title.into(),
+                    subtitle: Some("option".into()),
+                    keywords: vec![],
+                    icon: None,
+                    score: -(index as f64),
+                    payload: serde_json::Value::Null,
+                })
+                .collect())
+        }
+        fn actions(&self, item: &Item) -> Vec<Action> {
+            if item.id.0 == "options:new" {
+                return vec![Action {
+                    id: ActionId("add".into()),
+                    title: "Add an option from a link".into(),
+                }];
+            }
+            vec![Action {
+                id: ActionId("run".into()),
+                title: if item.id.0.ends_with("ins") {
+                    "Install from GitHub".into()
+                } else {
+                    "Remove it".into()
+                },
+            }]
+        }
+        fn activate(&self, _: &Item, _: &Action) -> Result<ActionOutcome> {
+            Ok(ActionOutcome::KeepOpen("activated without input".into()))
+        }
+        fn activate_with_input(
+            &self,
+            item: &Item,
+            _: &Action,
+            input: &std::collections::BTreeMap<String, String>,
+        ) -> Result<ActionOutcome> {
+            self.activated
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((item.id.0.clone(), input.clone()));
+            Ok(ActionOutcome::KeepOpen("done".into()))
+        }
+    }
+    impl crate::service::ServiceProvider for OptionProvider {
+        fn scope_actions(&self) -> Vec<Item> {
+            vec![Item {
+                id: ItemId("options:new".into()),
+                provider: ProviderId("options".into()),
+                title: "Add an option from a link".into(),
+                subtitle: Some("paste a link".into()),
+                keywords: vec![],
+                icon: None,
+                score: 0.,
+                payload: serde_json::Value::Null,
+            }]
+        }
+        fn description(&self) -> &str {
+            "Options that ask for a value"
+        }
+        fn kind(&self) -> &str {
+            "option"
+        }
+        fn presentation(&self, _: &Item) -> crate::service::ItemPresentation {
+            crate::service::ItemPresentation {
+                kind: "option".into(),
+                icon: None,
+                content: vec![],
+                data: None,
+            }
+        }
+        fn action_input(
+            &self,
+            item: &Item,
+            action: &Action,
+        ) -> Option<crate::protocol::ActionInput> {
+            if item.id.0 == "options:new" && action.id.0 == "add" {
+                return Some(crate::protocol::ActionInput {
+                    id: "link".into(),
+                    kind: crate::protocol::ACTION_INPUT_TEXT.into(),
+                    title: "Add an option".into(),
+                    label: "Option link".into(),
+                    placeholder: Some("https://example.com/<name>".into()),
+                    submit_label: "Add".into(),
+                    options: vec![],
+                });
+            }
+            if item.id.0.ends_with("ins") {
+                Some(crate::protocol::ActionInput {
+                    id: "url".into(),
+                    kind: crate::protocol::ACTION_INPUT_TEXT.into(),
+                    title: "Install an option".into(),
+                    label: "Repository URL".into(),
+                    placeholder: Some("https://github.com/<owner>/<repo>".into()),
+                    submit_label: "Install".into(),
+                    options: vec![],
+                })
+            } else {
+                Some(crate::protocol::ActionInput {
+                    id: "slug".into(),
+                    kind: crate::protocol::ACTION_INPUT_SELECT.into(),
+                    title: "Remove an option".into(),
+                    label: "Choose what to remove".into(),
+                    placeholder: None,
+                    submit_label: "Continue".into(),
+                    options: ["aura", "jade"]
+                        .into_iter()
+                        .map(|value| crate::protocol::ActionInputOption {
+                            value: value.into(),
+                            label: value.to_uppercase(),
+                        })
+                        .collect(),
+                })
+            }
+        }
+        fn action_confirmation(&self, item: &Item, _: &Action) -> Option<String> {
+            (!item.id.0.ends_with("ins"))
+                .then(|| "Are you sure you want to remove this option?".into())
+        }
+    }
+
+    fn option_service(activated: Recorded) -> FixtureService {
+        let provider: Arc<dyn crate::service::ServiceProvider> =
+            Arc::new(OptionProvider { activated });
+        let service = crate::service::Service::new(
+            vec![(provider, crate::core::ProviderConfig::default())],
+            Arc::new(HistoryStore::in_memory().unwrap()),
+        )
+        .unwrap();
+        FixtureService::with_service(service)
+    }
+
+    fn open_options(cx: &mut TestAppContext, server: &FixtureService) -> WindowHandle<Launcher> {
+        let window = open_service(cx, &server.socket());
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.show(window, cx);
+                    // "an" matches both option titles without naming the
+                    // provider, so the home view lists results rather than
+                    // narrowing to the provider row.
+                    launcher.replace_query("an".into(), cx);
+                    launcher.start_search(cx);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "option rows", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .filter(|item| item.provider.0 == "options")
+                    .count()
+                    == 2
+        });
+        window
+    }
+
+    /// Navigates from the home view into the options provider's own scope, which
+    /// is the only place its page commands are published.
+    fn enter_options_scope(cx: &mut TestAppContext, window: &WindowHandle<Launcher>) {
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.show(window, cx);
+                    launcher.replace_query(String::new(), cx);
+                    launcher.start_search(cx);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, window, "provider menu", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .any(|item| item.id.0 == "options")
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    let item = launcher
+                        .state
+                        .items
+                        .iter()
+                        .find(|item| item.id.0 == "options")
+                        .unwrap()
+                        .clone();
+                    launcher
+                        .state
+                        .selection
+                        .reconcile(std::slice::from_ref(&item));
+                    launcher.refresh_actions();
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, window, "options scope", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .filter(|item| item.provider.0 == "options")
+                    .count()
+                    == 2
+        });
+    }
+
+    fn select_option(launcher: &mut Launcher, id: &str) {
+        let item = launcher
+            .state
+            .items
+            .iter()
+            .find(|item| item.id.0 == id)
+            .unwrap()
+            .clone();
+        launcher
+            .state
+            .selection
+            .reconcile(std::slice::from_ref(&item));
+        launcher.refresh_actions();
+    }
+
+    #[gpui::test]
+    fn the_theme_scope_keeps_its_commands_out_of_the_strip(cx: &mut TestAppContext) {
+        let palette = watched_palette("#010203", "#7aa2f7", "#101112");
+        let catalog = crate::service::ThemeCatalog::from_palettes(vec![palette]).unwrap();
+        let active = crate::service::ThemerState::fixture();
+        let server = catalog_service_with_apply(catalog, active, true);
+        let window = open_service(cx, &server.socket());
+        let view = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "themes home row", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .any(|item| item.id.0 == "themes")
+        });
+        // Entering the scope lists the pack and only the pack: the two commands
+        // belong to the page, not to its strip.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    let item = launcher
+                        .state
+                        .items
+                        .iter()
+                        .find(|item| item.id.0 == "themes")
+                        .unwrap()
+                        .clone();
+                    launcher
+                        .state
+                        .selection
+                        .reconcile(std::slice::from_ref(&item));
+                    launcher.refresh_actions();
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "themes scope", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .service
+                    .as_ref()
+                    .is_some_and(|service| !service.scope_actions().is_empty())
+        });
+        cx.read(|cx| {
+            let launcher = window.read(cx).unwrap();
+            let ids: Vec<&str> = launcher
+                .state
+                .items
+                .iter()
+                .map(|item| item.id.0.as_str())
+                .collect();
+            assert_eq!(ids, ["themes:watched"], "the strip is palettes only");
+            assert!(launcher.is_filmstrip());
+            assert!(launcher.is_palette_strip());
+            assert_eq!(launcher.strip_geometry().width(), THEME_STRIP.width());
+
+            // The commands are the page's, in the provider's own words, and the
+            // selected card's Apply comes first so Return still applies.
+            let panel: Vec<String> = launcher
+                .actions
+                .iter()
+                .map(|entry| entry.action.title.clone())
+                .collect();
+            assert_eq!(
+                panel,
+                [
+                    "Apply theme…",
+                    "Install a theme from GitHub…",
+                    "Uninstall a theme…"
+                ]
+            );
+            assert_eq!(launcher.actions[1].item.id.0, "themes:install");
+            assert_eq!(launcher.actions[2].item.id.0, "themes:uninstall");
+        });
+        let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(bounds.size);
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(bounds.size.height),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        assert!(
+            visual
+                .debug_bounds(Box::leak("filmstrip-tile-0".to_string().into_boxed_str()))
+                .is_some(),
+            "the pack frame is painted"
+        );
+        assert!(
+            visual
+                .debug_bounds(Box::leak("filmstrip-tile-1".to_string().into_boxed_str()))
+                .is_none(),
+            "no command frame follows the pack"
+        );
+    }
+
+    #[gpui::test]
+    fn the_theme_scope_paints_a_failure_above_the_strip(cx: &mut TestAppContext) {
+        let palette = watched_palette("#010203", "#7aa2f7", "#101112");
+        let catalog = crate::service::ThemeCatalog::from_palettes(vec![palette]).unwrap();
+        let active = crate::service::ThemerState::fixture();
+        let server = catalog_service_with(catalog, active, true);
+        let window = open_service(cx, &server.socket());
+        let view = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| launcher.show(window, cx))
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "themes home row", |launcher| {
+            !launcher.state.searching
+                && launcher
+                    .state
+                    .items
+                    .iter()
+                    .any(|item| item.id.0 == "themes")
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    let item = launcher
+                        .state
+                        .items
+                        .iter()
+                        .find(|item| item.id.0 == "themes")
+                        .unwrap()
+                        .clone();
+                    launcher
+                        .state
+                        .selection
+                        .reconcile(std::slice::from_ref(&item));
+                    launcher.refresh_actions();
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "themes scope", |launcher| {
+            !launcher.state.searching && launcher.state.items.len() == 1
+        });
+        // A strip has no list to hang a status line on, so a failed command still
+        // gets its own line and the window grows to fit it.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, _| {
+                    launcher.error = Some("The theme helper failed or did not finish.".into());
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(bounds.size);
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(bounds.size.height),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        visual
+            .debug_bounds("launcher-error")
+            .expect("the failure is painted above the strip");
+        cx.read(|cx| {
+            assert_eq!(
+                window.read(cx).unwrap().strip_geometry().window_height() + 24.,
+                f32::from(bounds.size.height)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_scope_command_lives_in_the_actions_panel_and_opens_its_dialog(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_service(cx, &server.socket());
+        enter_options_scope(cx, &window);
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:ins");
+                    // The panel is the row's own actions first, then the page's.
+                    launcher.on_actions(&OpenActions, window, cx);
+                    let titles: Vec<&str> = launcher
+                        .actions
+                        .iter()
+                        .map(|entry| entry.action.title.as_str())
+                        .collect();
+                    assert_eq!(titles, ["Install from GitHub", "Add an option from a link"]);
+                    assert_eq!(launcher.state.screen, Some(Screen::Actions));
+
+                    // Choosing the command opens the field the provider published
+                    // for it, and the command — not the selected row — is its
+                    // subject.
+                    launcher.on_move_down(&MoveDown, window, cx);
+                    launcher.on_confirm(&Confirm, window, cx);
+                    let pending = launcher.pending_input.as_ref().expect("command dialog");
+                    assert_eq!(pending.item.id.0, "options:new");
+                    assert_eq!(pending.action.id.0, "add");
+                    assert_eq!(pending.field.id, "link");
+                    assert_eq!(
+                        launcher
+                            .state
+                            .selection
+                            .selected()
+                            .map(|(_, id)| id.to_owned()),
+                        Some("options:ins".to_string()),
+                        "a command runs without disturbing the selection"
+                    );
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn tab_and_return_still_belong_to_the_selected_row(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_service(cx, &server.socket());
+        enter_options_scope(cx, &window);
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:ins");
+                    assert_eq!(launcher.actions.len(), 2);
+                    // Tab is the shortcut for the selection's own action: with a
+                    // single one it does nothing, and it never opens a command.
+                    launcher.on_next_action(&NextAction, window, cx);
+                    assert!(launcher.pending_input.is_none());
+                    assert!(launcher.activation_in_flight.is_none());
+
+                    // Return runs the selection's first action, not the command
+                    // the page publishes behind it.
+                    launcher.on_confirm(&Confirm, window, cx);
+                    assert!(
+                        launcher.pending_input.is_some(),
+                        "own action asks for a value"
+                    );
+                    assert_eq!(
+                        launcher.pending_input.as_ref().unwrap().item.id.0,
+                        "options:ins"
+                    );
+                })
+                .unwrap()
+        });
+    }
+
+    #[gpui::test]
+    fn service_action_input_dialog_collects_a_text_value_before_invoking(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_options(cx, &server);
+
+        // The option is reachable through the actions panel, and choosing it
+        // opens the provider's dialog instead of sending anything.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:ins");
+                    launcher.on_actions(&OpenActions, window, cx);
+                    assert_eq!(launcher.state.screen, Some(Screen::Actions));
+                    assert_eq!(launcher.actions[0].action.title, "Install from GitHub");
+                    launcher.on_confirm(&Confirm, window, cx);
+                    let pending = launcher.pending_input.as_ref().expect("dialog opened");
+                    assert_eq!(pending.field.title, "Install an option");
+                    assert_eq!(pending.field.label, "Repository URL");
+                    assert!(launcher.service.as_ref().unwrap().pending_action.is_none());
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty(), "nothing is sent yet");
+
+        // Return with an empty field keeps the dialog up and says what is missing.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_confirm(&Confirm, window, cx);
+                    assert!(launcher.pending_input.is_some());
+                    assert_eq!(
+                        launcher.error.as_deref(),
+                        Some("Repository URL is required.")
+                    );
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty());
+
+        // Typing a value and pressing Return sends exactly it, once.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.dialog_input.update(cx, |input, cx| {
+                        input.set_text("https://github.com/owner/aura".into(), cx)
+                    });
+                    launcher.on_confirm(&Confirm, window, cx);
+                    assert!(launcher.pending_input.is_none());
+                    assert!(launcher.error.is_none());
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "text activation", |_| {
+            activated.lock().unwrap().len() == 1
+        });
+        cx.run_until_parked();
+        let recorded = activated.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "options:ins");
+        assert_eq!(
+            recorded[0].1,
+            [("url".to_owned(), "https://github.com/owner/aura".to_owned())]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[gpui::test]
+    fn service_choice_dialog_moves_then_consent_carries_the_choice(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_options(cx, &server);
+
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:rem");
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    let pending = launcher.pending_input.as_ref().expect("choice dialog");
+                    assert!(pending.field.is_select());
+                    assert_eq!(pending.field.options.len(), 2);
+                    // The choice list is modal: arrows move it, not the results.
+                    launcher.on_move_down(&MoveDown, window, cx);
+                    assert_eq!(launcher.pending_input.as_ref().unwrap().index, 1);
+                    launcher.on_move_down(&MoveDown, window, cx);
+                    assert_eq!(launcher.pending_input.as_ref().unwrap().index, 0);
+                    launcher.on_move_up(&MoveUp, window, cx);
+                    assert_eq!(launcher.pending_input.as_ref().unwrap().index, 1);
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty());
+
+        // Submitting the choice asks for consent, and the collected value is
+        // held with the staged action rather than sent early.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_confirm(&Confirm, window, cx);
+                    assert!(launcher.pending_input.is_none());
+                    let staged = launcher
+                        .service
+                        .as_ref()
+                        .unwrap()
+                        .pending_confirmation
+                        .clone()
+                        .expect("consent staged");
+                    assert_eq!(
+                        staged.prompt,
+                        "Are you sure you want to remove this option?"
+                    );
+                    assert_eq!(staged.input.get("slug").map(String::as_str), Some("jade"));
+                })
+                .unwrap()
+        });
+        assert!(
+            activated.lock().unwrap().is_empty(),
+            "consent is not implied"
+        );
+        // Escape drops the staged action; the value is gone with it.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    launcher.on_escape(&Escape, window, cx);
+                    assert!(
+                        launcher
+                            .service
+                            .as_ref()
+                            .unwrap()
+                            .pending_confirmation
+                            .is_none()
+                    );
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty());
+
+        // A second run confirms, and the invocation carries the choice.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:rem");
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.on_confirm(&Confirm, window, cx);
+                    launcher.on_confirm(&Confirm, window, cx);
+                })
+                .unwrap()
+        });
+        poll_service_until(cx, &window, "choice activation", |_| {
+            activated.lock().unwrap().len() == 1
+        });
+        cx.run_until_parked();
+        let recorded = activated.lock().unwrap().clone();
+        assert_eq!(recorded[0].0, "options:rem");
+        assert_eq!(
+            recorded[0].1,
+            [("slug".to_owned(), "aura".to_owned())]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[gpui::test]
+    fn service_action_input_dialog_paints_the_providers_words(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_options(cx, &server);
+        let view = window.root(cx).unwrap();
+
+        // The choice dialog: the provider's title, label, choices and submit text.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:rem");
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(bounds.size);
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(bounds.size.height),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        let dialog = visual
+            .debug_bounds("service-input-dialog")
+            .expect("the provider dialog is painted");
+        let title = visual.debug_bounds("service-input-title").unwrap();
+        let label = visual.debug_bounds("service-input-label").unwrap();
+        let first = visual.debug_bounds("service-input-option-0").unwrap();
+        let second = visual.debug_bounds("service-input-option-1").unwrap();
+        let submit = visual.debug_bounds("service-input-submit").unwrap();
+        assert!(title.top() >= dialog.top());
+        assert!(label.top() >= title.bottom() - px(1.));
+        assert!(first.top() >= label.bottom() - px(1.));
+        assert!(second.top() >= first.bottom() - px(1.));
+        assert!(submit.top() >= second.bottom() - px(1.));
+        assert!(submit.bottom() <= dialog.bottom() + px(1.));
+        // Both choices are on screen, so a picker never has to guess.
+        assert_eq!(first.size.height, second.size.height);
+    }
+
+    #[gpui::test]
+    fn service_text_dialog_paints_the_providers_placeholder(cx: &mut TestAppContext) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_options(cx, &server);
+        let view = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:ins");
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    launcher.resize_window(window);
+                })
+                .unwrap()
+        });
+        let bounds = cx.update(|cx| window.update(cx, |_, window, _| window.bounds()).unwrap());
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(bounds.size);
+        visual.draw(
+            point(px(0.), px(0.)),
+            size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(bounds.size.height),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        let dialog = visual
+            .debug_bounds("service-input-dialog")
+            .expect("the text dialog is painted");
+        // The dialog's own field owns the keyboard, so typing lands in the
+        // value that is sent back rather than in the search query.
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    assert!(
+                        launcher
+                            .dialog_input
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window),
+                        "the dialog field takes focus"
+                    );
+                })
+                .unwrap()
+        });
+        let placeholder = visual
+            .debug_bounds("service-input-placeholder")
+            .expect("the provider placeholder is painted");
+        assert!(placeholder.top() >= dialog.top());
+        // A text field carries no choices and no chooseable rows.
+        assert!(visual.debug_bounds("service-input-option-0").is_none());
+        assert!(visual.debug_bounds("service-input-submit").is_some());
+        assert!(visual.debug_bounds("service-input-cancel").is_some());
+        assert!(activated.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn service_action_input_dialog_is_cancelled_by_escape_and_blocks_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        let activated: Recorded = Default::default();
+        let server = option_service(activated.clone());
+        let window = open_options(cx, &server);
+
+        cx.update(|cx| {
+            window
+                .update(cx, |launcher, window, cx| {
+                    select_option(launcher, "options:ins");
+                    launcher.activate(
+                        launcher.actions[0].item.clone(),
+                        launcher.actions[0].action.clone(),
+                        cx,
+                    );
+                    assert!(launcher.pending_input.is_some());
+                    let selected = launcher
+                        .state
+                        .selection
+                        .selected()
+                        .map(|(provider, id)| (provider.to_owned(), id.to_owned()));
+                    launcher.on_move_down(&MoveDown, window, cx);
+                    assert_eq!(
+                        launcher
+                            .state
+                            .selection
+                            .selected()
+                            .map(|(provider, id)| (provider.to_owned(), id.to_owned())),
+                        selected,
+                        "the dialog freezes selection"
+                    );
+                    launcher.on_escape(&Escape, window, cx);
+                    assert!(launcher.pending_input.is_none());
+                })
+                .unwrap()
+        });
+        assert!(activated.lock().unwrap().is_empty());
+    }
+
     #[gpui::test]
     fn service_staged_confirmation_is_dropped_when_the_view_changes(cx: &mut TestAppContext) {
         let activations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3511,8 +6492,9 @@ mod tests {
                 launcher.theme_error.is_none(),
                 "the fixture palette is valid"
             );
-            // The fixture publishes alpha_byte 230, so only the background is translucent.
-            assert!((launcher.theme.background.a - 230.0 / 255.0).abs() < 1e-6);
+            // The window is solid: every role is opaque, including a palette
+            // that still carries an alpha byte.
+            assert_eq!(launcher.theme.background.a, 1.0);
             assert_eq!(launcher.theme.foreground.a, 1.0);
         });
     }
@@ -3695,6 +6677,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -3874,6 +6857,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -3939,8 +6923,9 @@ mod tests {
                     let open = launcher
                         .actions
                         .iter()
-                        .find(|action| action.id.0 == "open")
+                        .find(|entry| entry.action.id.0 == "open")
                         .unwrap()
+                        .action
                         .clone();
                     launcher.activate(item, open, cx);
                 })
@@ -4054,8 +7039,9 @@ mod tests {
                     let open = launcher
                         .actions
                         .iter()
-                        .find(|action| action.id.0 == "open")
+                        .find(|entry| entry.action.id.0 == "open")
                         .unwrap()
+                        .action
                         .clone();
                     launcher.activate(item, open, cx);
                 })
@@ -4140,6 +7126,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -4168,6 +7155,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -4201,6 +7189,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )
@@ -4313,10 +7302,10 @@ mod tests {
             let icon = visual
                 .debug_bounds("suggestion-icon-0")
                 .expect("application icon slot");
-            assert_eq!(icon.size, size(px(28.), px(28.)));
+            assert_eq!(icon.size, size(px(ICON_SIZE), px(ICON_SIZE)));
             assert!(icon.top() >= first.top() && icon.bottom() <= first.bottom());
             let title = visual.debug_bounds("suggestion-title-0").unwrap();
-            assert!(title.left() >= icon.right() + px(8.));
+            assert!(title.left() >= icon.right() + px(10.));
             if count > 1 {
                 let fallback = visual
                     .debug_bounds("suggestion-icon-1")
@@ -4801,9 +7790,21 @@ mod tests {
                     assert_eq!(window.bounds().size, size(px(480.), px(120.)));
                     launcher.state.screen = Some(Screen::Actions);
                     launcher.actions = (0..12)
-                        .map(|index| Action {
-                            id: ActionId(index.to_string()),
-                            title: format!("Action {index}"),
+                        .map(|index| LauncherAction {
+                            item: Item {
+                                id: ItemId("row".into()),
+                                provider: ProviderId("test".into()),
+                                title: "row".into(),
+                                subtitle: None,
+                                keywords: Vec::new(),
+                                icon: None,
+                                score: 0.,
+                                payload: serde_json::Value::Null,
+                            },
+                            action: Action {
+                                id: ActionId(index.to_string()),
+                                title: format!("Action {index}"),
+                            },
                         })
                         .collect();
                     launcher.state.action_index = 11;
@@ -5418,6 +8419,7 @@ mod tests {
                 LauncherOptions {
                     width: 680.0,
                     max_results: 50,
+                    ..Default::default()
                 },
                 cx,
             )

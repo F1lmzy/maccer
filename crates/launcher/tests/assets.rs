@@ -225,7 +225,10 @@ fn malformed_resolver_pixels_are_rejected_and_cached_capacity_evicts_old_refs() 
         missing: false,
     }));
     let reference = bad.reference(Path::new("/private/x.app"), 1);
-    assert!(bad.get(&reference.id, &reference.revision).is_err());
+    assert!(
+        bad.get(&reference.id, &reference.revision, "bgra8")
+            .is_err()
+    );
     let good = AssetStore::new(Arc::new(Resolver {
         calls: AtomicUsize::new(0),
         bad: false,
@@ -236,7 +239,7 @@ fn malformed_resolver_pixels_are_rejected_and_cached_capacity_evicts_old_refs() 
         good.reference(Path::new("/private/new.app"), n);
     }
     assert!(
-        good.get(&old.id, &old.revision)
+        good.get(&old.id, &old.revision, "bgra8")
             .unwrap_err()
             .to_string()
             .contains("ASSET_EXPIRED")
@@ -251,7 +254,7 @@ fn malformed_resolver_pixels_are_rejected_and_cached_capacity_evicts_old_refs() 
     for _ in 0..2 {
         assert!(
             missing
-                .get(&missing_ref.id, &missing_ref.revision)
+                .get(&missing_ref.id, &missing_ref.revision, "bgra8")
                 .unwrap_err()
                 .to_string()
                 .contains("ASSET_UNAVAILABLE")

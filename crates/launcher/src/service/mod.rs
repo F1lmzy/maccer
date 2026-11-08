@@ -9,8 +9,10 @@ mod server;
 mod session;
 mod theme_apply;
 mod theme_catalog;
+mod theme_install;
 mod themer;
 mod themes;
+mod wallpapers;
 mod web;
 
 use crate::core::{HistoryStore, Provider, ProviderConfig, ProviderRegistry, SearchCoordinator};
@@ -33,8 +35,10 @@ pub use server::{MAX_CLIENTS, Server};
 pub use session::Session;
 pub use theme_apply::ThemeApply;
 pub use theme_catalog::{CatalogSnapshot, ThemeCatalog};
+pub use theme_install::ThemeInstall;
 pub use themer::ThemerState;
 pub use themes::ThemeServiceProvider;
+pub use wallpapers::{WallpaperApply, WallpaperLocation, WallpaperServiceProvider};
 pub use web::WebServiceProvider;
 
 pub trait ServiceProvider: Provider {
@@ -44,6 +48,15 @@ pub trait ServiceProvider: Provider {
     fn description(&self) -> &str;
     fn kind(&self) -> &str;
     fn presentation(&self, item: &crate::core::Item) -> ItemPresentation;
+    /// Commands that belong to this provider's whole scope rather than to one
+    /// result. Each returned item is a command identity, not a row: the service
+    /// publishes it as a scope action and resolves its actions, field and
+    /// confirmation through [`ServiceProvider::action_input`],
+    /// [`ServiceProvider::action_confirmation`] and [`Provider::actions`], which
+    /// is the same authorization a result row goes through.
+    fn scope_actions(&self) -> Vec<crate::core::Item> {
+        Vec::new()
+    }
     /// Whether this result has lazily fetchable, provider-projected detail content.
     fn details_available(&self, _item: &crate::core::Item) -> bool {
         false
@@ -56,6 +69,16 @@ pub trait ServiceProvider: Provider {
         _item: &crate::core::Item,
         _action: &crate::core::Action,
     ) -> Option<String> {
+        None
+    }
+    /// Provider-published field the frontend must collect before it invokes
+    /// this action, or `None` when the action needs no input. The provider owns
+    /// every word in the dialog and the value it expects back.
+    fn action_input(
+        &self,
+        _item: &crate::core::Item,
+        _action: &crate::core::Action,
+    ) -> Option<crate::protocol::ActionInput> {
         None
     }
     /// Returns safe display blocks. The service enforces count and serialized-byte limits.
@@ -74,6 +97,9 @@ pub struct Service {
     pub(crate) history: Arc<HistoryStore>,
     pub(crate) assets: Option<Arc<AssetStore>>,
     pub(crate) theme: Option<Arc<ThemerState>>,
+    /// Attached after construction, like the frontend router: a caller that
+    /// never supplies one advertises no theme installation and starts nothing.
+    pub(crate) theme_install: std::sync::OnceLock<Arc<ThemeInstall>>,
     pub(crate) instance_id: String,
     pub(crate) frontend: std::sync::OnceLock<Arc<FrontendRouter>>,
     next_session: AtomicU64,
@@ -124,10 +150,20 @@ impl Service {
             history,
             assets,
             theme,
+            theme_install: std::sync::OnceLock::new(),
             instance_id: format!("{nonce:x}"),
             frontend: std::sync::OnceLock::new(),
             next_session: AtomicU64::new(1),
         }))
+    }
+    /// Attach the shared theme installer before serving clients.
+    ///
+    /// Without one, `themes.install` and `themes.uninstall` answer
+    /// `METHOD_NOT_FOUND` and no helper can be started from this protocol.
+    pub fn attach_theme_install(&self, install: Arc<ThemeInstall>) -> Result<()> {
+        self.theme_install
+            .set(install)
+            .map_err(|_| anyhow::anyhow!("theme installation is already attached"))
     }
     /// Attach the single configured frontend controller before serving clients.
     pub fn attach_frontend(&self, frontend: Arc<FrontendRouter>) -> Result<()> {

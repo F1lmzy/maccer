@@ -1,6 +1,6 @@
 # maccer
 
-A keyboard-first macOS launcher with an independent background service and removable GPUI or Pill/QML frontends. Shared-service mode supplies applications, web search, text clipboard history and themes. Embedded GPUI also supports files, calculator expressions and explicitly selected shell commands.
+A keyboard-first macOS launcher with an independent background service and removable GPUI or Pill/QML frontends. Shared-service mode supplies applications, web search, text clipboard history, themes (including installing and removing packs from a GitHub repository) and a wallpaper picker. Embedded GPUI also supports files, calculator expressions and explicitly selected shell commands.
 
 ## Run embedded GPUI
 
@@ -55,7 +55,7 @@ See the [setup and operations guide](docs/shared-service.md) for building both f
 
 ## Configuration
 
-Configuration is read from `~/.config/maccer/config.toml`. Start from [`config/config.example.toml`](config/config.example.toml). Partial files inherit defaults, so a file with only `[launcher]` keeps the default providers. Provider tables merge field by field: `[providers.calculator] priority = 123` keeps the calculator prefix, `default_search`, and result limit. Web search engines default to Google and DuckDuckGo; define `[[web.engines]]` tables to replace that list, and set `[web].default_engine` to one of the configured ids.
+Configuration is read from `~/.config/maccer/config.toml`. Start from [`config/config.example.toml`](config/config.example.toml). Partial files inherit defaults, so a file with only `[launcher]` keeps the default providers. Provider tables merge field by field: `[providers.calculator] priority = 123` keeps the calculator prefix, `default_search`, and result limit. Web search engines default to Google and DuckDuckGo; define `[[web.engines]]` tables to replace that list, and set `[web].default_engine` to one of the configured ids. A web result opens in a native panel inside the launcher; `[web].inline_preview = false` hands it to the default browser instead, `prewarm` starts WebKit while a web result is selected, and `idle_release_seconds` releases a hidden page. See [web preview cost](docs/web-preview-performance.md).
 
 Usage history is stored at `~/Library/Application Support/maccer/history.sqlite3`. maccer records an activation only after the action succeeds; each record includes the query text, the provider and item identifiers, the action, and a timestamp. Ranking uses per-item activation counts plus a bounded recency bonus. The database never leaves the machine; delete the file to clear history. Set `RUST_LOG=debug` for diagnostics. Startup failures display a native alert with the error chain and exit nonzero after dismissal. Hotkey conflicts display an alert but leave the app running, so Open Launcher and Quit remain available in the menu bar. Change `[launcher].hotkey` and restart to restore the shortcut. `--check` remains terminal-only and never opens an alert.
 

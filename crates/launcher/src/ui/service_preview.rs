@@ -1,4 +1,5 @@
 //! Bounded, frontend-neutral service preview decoding for the GPUI renderer.
+use crate::ui::theme::Theme;
 use serde_json::Value;
 
 pub(crate) const MAX_PREVIEW_BLOCKS: usize = 32;
@@ -54,11 +55,21 @@ impl ServicePreview {
 }
 
 impl ServicePreview {
+    /// Render bounded preview blocks. Labels stay small and muted, values carry
+    /// the reading weight, and swatches share the row radius.
     pub fn elements(
         &self,
         images: &std::collections::HashMap<std::path::PathBuf, std::sync::Arc<gpui::RenderImage>>,
+        theme: &Theme,
     ) -> Vec<gpui::AnyElement> {
         use gpui::{div, prelude::*, px};
+        let caption = |text: String| {
+            div()
+                .text_size(px(10.))
+                .line_height(px(14.))
+                .text_color(theme.muted)
+                .child(text)
+        };
         self.blocks
             .iter()
             .map(|block| {
@@ -68,19 +79,30 @@ impl ServicePreview {
                         base.child(text.clone()).into_any_element()
                     }
                     ServicePreviewBlock::Value { value, label, .. } => base
-                        .child(label.clone().unwrap_or_default())
-                        .child(div().text_lg().child(value.clone()))
+                        .children(label.clone().map(caption))
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .line_height(px(24.))
+                                .child(value.clone()),
+                        )
                         .into_any_element(),
                     ServicePreviewBlock::Metadata { entries, fallback } => {
                         if entries.is_empty() {
                             base.child(fallback.clone()).into_any_element()
                         } else {
-                            base.children(
-                                entries
-                                    .iter()
-                                    .map(|(label, value)| div().child(format!("{label}: {value}"))),
-                            )
-                            .into_any_element()
+                            base.flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(entries.iter().map(|(label, value)| {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.))
+                                        .child(caption(label.clone()))
+                                        .child(value.clone())
+                                }))
+                                .into_any_element()
                         }
                     }
                     ServicePreviewBlock::Palette { colors, fallback } => base
@@ -90,7 +112,13 @@ impl ServicePreview {
                                 let rgb =
                                     u32::from_str_radix(&color.trim_start_matches('#')[..6], 16)
                                         .unwrap_or(0);
-                                div().w(px(24.)).h(px(24.)).bg(gpui::rgb(rgb))
+                                div()
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(theme.divider)
+                                    .bg(gpui::rgb(rgb))
                             },
                         )))
                         .into_any_element(),
@@ -105,11 +133,12 @@ impl ServicePreview {
                         {
                             base.child(
                                 gpui::img(image.clone())
-                                    .w(px(64.))
-                                    .h(px(64.))
+                                    .w(px(72.))
+                                    .h(px(72.))
+                                    .rounded(px(4.))
                                     .object_fit(gpui::ObjectFit::Contain),
                             )
-                            .child(alt.clone())
+                            .child(caption(alt.clone()))
                             .into_any_element()
                         } else {
                             base.child(fallback.clone()).into_any_element()

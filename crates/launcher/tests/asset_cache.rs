@@ -25,13 +25,15 @@ fn unchanged_icon_references_are_shared_across_view_refreshes() {
     let resolver = Arc::new(Resolver(AtomicUsize::new(0)));
     let store = AssetStore::new(resolver.clone());
     let first = store.reference(Path::new("/private/app.app"), 1);
-    store.get(&first.id, &first.revision).unwrap();
+    store.get(&first.id, &first.revision, "bgra8").unwrap();
     let refreshed = store.reference(Path::new("/private/app.app"), 1);
     assert_eq!(
         first.id, refreshed.id,
         "unchanged views must reuse resolved icon assets"
     );
-    store.get(&refreshed.id, &refreshed.revision).unwrap();
+    store
+        .get(&refreshed.id, &refreshed.revision, "bgra8")
+        .unwrap();
     assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
     let changed = store.reference(Path::new("/private/app.app"), 2);
     assert_ne!(changed.id, first.id);
@@ -43,5 +45,5 @@ fn repeated_references_do_not_exhaust_the_asset_cache() {
     for _ in 0..1000 {
         store.reference(Path::new("/private/app.app"), 1);
     }
-    assert!(store.get(&first.id, &first.revision).is_ok());
+    assert!(store.get(&first.id, &first.revision, "bgra8").is_ok());
 }

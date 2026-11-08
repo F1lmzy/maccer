@@ -1,21 +1,24 @@
 //! Guarded, single-flight theme application for the shared service.
 //!
-//! mac-themer's `apply SLUG --expected-palette JSON --json` reloads and
-//! revalidates its catalog, compares the full resolved, path-free palette
-//! against the service's trusted copy, then applies the theme with wallpaper
-//! changes disabled. This module runs that one fixed command through the
-//! bounded subprocess runner under a single-flight lock and projects the fixed
-//! JSON response into a path-free result. Helper stderr, filesystem paths and
-//! client-supplied slugs never reach the caller.
+//! mac-themer's `apply SLUG --expected-palette JSON --json [--background ID]`
+//! reloads and revalidates its catalog, compares the full resolved, path-free
+//! palette against the service's trusted copy, then applies the theme. A
+//! wallpaper is only touched when `--background` names one of that pack's own
+//! images, and the change is reported rather than assumed. This module runs
+//! that one fixed command through the bounded subprocess runner under a
+//! single-flight lock and projects the fixed JSON response into a path-free
+//! result. Helper stderr, filesystem paths and client-supplied slugs never
+//! reach the caller.
 //!
-//! The expected palette is the only input and always comes from the service's
-//! own [`ThemeCatalog`](super::ThemeCatalog) snapshot, never from a frontend.
+//! The expected palette and the wallpaper identity are the only inputs, and
+//! both always come from the service's own
+//! [`ThemeCatalog`](super::ThemeCatalog) snapshot, never from a frontend.
 //! The producer rejects a mismatched palette before writing. This check is not
 //! a filesystem lock against another process editing user-managed pack files.
 
 use crate::core::CancellationToken;
 use crate::macos::process::run_bounded;
-use crate::protocol::ThemePalette;
+use crate::protocol::{ThemePalette, ThemeWallpaper, is_theme_slug, is_wallpaper_id};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::{
@@ -44,7 +47,7 @@ const PARTIAL_MESSAGE: &str = "The theme helper failed or did not finish. The th
 applied; check the active theme before retrying.";
 const INVALID_MESSAGE: &str = "The theme information is invalid.";
 /// Warning codes the producer may report without the change being a failure.
-const KNOWN_WARNINGS: [&str; 1] = ["ghosttyReloadFailed"];
+const KNOWN_WARNINGS: [&str; 2] = ["ghosttyReloadFailed", "wallpaperFailed"];
 
 /// Shared executor for confirmed theme application. Cheap to clone behind an
 /// `Arc`; only one apply may run at a time across every client.
@@ -75,16 +78,25 @@ impl ThemeApply {
         self.busy.load(Ordering::Acquire)
     }
 
-    /// Apply the exact catalog palette in `expected`. Returns a path-free,
-    /// frontend-safe success message. A concurrent attempt, an invalid
-    /// expected palette, or any helper failure is an error: helper failures
-    /// explicitly warn that the theme may be partly applied and never trigger
-    /// an automatic retry.
-    pub fn apply(&self, expected: &ThemePalette) -> Result<String> {
+    /// Apply the exact catalog palette in `expected`, and set `wallpaper` when
+    /// one is named. Returns a path-free, frontend-safe success message. A
+    /// concurrent attempt, an invalid expected palette, or any helper failure is
+    /// an error: helper failures explicitly warn that the theme may be partly
+    /// applied and never trigger an automatic retry.
+    pub fn apply(
+        &self,
+        expected: &ThemePalette,
+        wallpaper: Option<&ThemeWallpaper>,
+    ) -> Result<String> {
         expected
             .validate()
             .map_err(|_| anyhow::anyhow!(INVALID_MESSAGE))?;
-        if !valid_slug(&expected.slug) {
+        if !is_theme_slug(&expected.slug) {
+            bail!(INVALID_MESSAGE);
+        }
+        // The identity comes from the service's own catalog snapshot, but it is
+        // still the one argument that reaches a helper, so it is rechecked here.
+        if wallpaper.is_some_and(|wallpaper| !is_wallpaper_id(&wallpaper.id)) {
             bail!(INVALID_MESSAGE);
         }
         if self
@@ -96,10 +108,10 @@ impl ThemeApply {
         }
         // Resets the single-flight flag on every normal exit path.
         let _busy = BusyGuard(&self.busy);
-        self.run(expected)
+        self.run(expected, wallpaper)
     }
 
-    fn run(&self, expected: &ThemePalette) -> Result<String> {
+    fn run(&self, expected: &ThemePalette, wallpaper: Option<&ThemeWallpaper>) -> Result<String> {
         let expected_json =
             serde_json::to_string(expected).map_err(|_| anyhow::anyhow!(INVALID_MESSAGE))?;
         let mut command = Command::new(&self.helper);
@@ -107,8 +119,11 @@ impl ThemeApply {
             .arg("apply")
             .arg(&expected.slug)
             .arg("--expected-palette")
-            .arg(&expected_json)
-            .arg("--json");
+            .arg(&expected_json);
+        if let Some(wallpaper) = wallpaper {
+            command.arg("--background").arg(&wallpaper.id);
+        }
+        command.arg("--json");
         command.env("PATH", helper_path());
         // An accepted mutation must survive the query that produced it, so the
         // run is not tied to any session cancellation token.
@@ -122,9 +137,9 @@ impl ThemeApply {
         if !output.status.success() || output.stdout.len() > MAX_OUTPUT_BYTES {
             bail!(PARTIAL_MESSAGE);
         }
-        let warnings = warnings_from(&output.stdout, &expected.slug)
+        let warnings = warnings_from(&output.stdout, &expected.slug, wallpaper)
             .ok_or_else(|| anyhow::anyhow!(PARTIAL_MESSAGE))?;
-        Ok(message(expected, &warnings))
+        Ok(message(expected, wallpaper, &warnings))
     }
 
     /// A test-only handle to the private constructor, kept out of the public
@@ -150,13 +165,21 @@ struct Applied {
     schema: u16,
     status: String,
     theme: String,
+    /// The wallpaper the producer actually set, or `null` when it set none.
+    #[serde(default)]
+    wallpaper: Option<String>,
     #[serde(default)]
     warnings: Vec<String>,
 }
 
-/// Validate the producer's reply against the requested slug and the known
-/// warning set. Any mismatch is treated as a partial failure by the caller.
-fn warnings_from(bytes: &[u8], slug: &str) -> Option<Vec<String>> {
+/// Validate the producer's reply against the requested slug and wallpaper and
+/// the known warning set. Any mismatch is treated as a partial failure by the
+/// caller, so a helper cannot report a change the service never asked for.
+fn warnings_from(
+    bytes: &[u8],
+    slug: &str,
+    wallpaper: Option<&ThemeWallpaper>,
+) -> Option<Vec<String>> {
     let applied: Applied = serde_json::from_slice(bytes).ok()?;
     if applied.schema != 1 || applied.status != "applied" || applied.theme != slug {
         return None;
@@ -168,11 +191,41 @@ fn warnings_from(bytes: &[u8], slug: &str) -> Option<Vec<String>> {
     {
         return None;
     }
+    let failed = applied
+        .warnings
+        .iter()
+        .any(|warning| warning == "wallpaperFailed");
+    // A wallpaper failure is only meaningful for an apply that named one, and
+    // an apply that did not fail must report the exact wallpaper it set.
+    let expected = match wallpaper {
+        None if failed => return None,
+        None => None,
+        Some(_) if failed => None,
+        Some(wallpaper) => Some(wallpaper.id.as_str()),
+    };
+    if applied.wallpaper.as_deref() != expected {
+        return None;
+    }
     Some(applied.warnings)
 }
 
-fn message(expected: &ThemePalette, warnings: &[String]) -> String {
-    let mut text = format!("Applied {}. Wallpaper was not changed.", expected.name);
+fn message(
+    expected: &ThemePalette,
+    wallpaper: Option<&ThemeWallpaper>,
+    warnings: &[String],
+) -> String {
+    let failed = warnings.iter().any(|warning| warning == "wallpaperFailed");
+    let mut text = match wallpaper {
+        None => format!("Applied {}. Wallpaper was not changed.", expected.name),
+        Some(_) if failed => format!(
+            "Applied {}. The wallpaper could not be changed, so it may still show the previous one.",
+            expected.name
+        ),
+        Some(wallpaper) => format!(
+            "Applied {}. Wallpaper set to {}.",
+            expected.name, wallpaper.label
+        ),
+    };
     if warnings
         .iter()
         .any(|warning| warning == "ghosttyReloadFailed")
@@ -188,20 +241,6 @@ fn helper_path() -> OsString {
         path.push(existing);
     }
     path
-}
-
-/// `[a-z0-9][a-z0-9_-]{0,127}`, matching the producer and catalog contract.
-fn valid_slug(slug: &str) -> bool {
-    let bytes = slug.as_bytes();
-    if bytes.is_empty() || bytes.len() > 128 {
-        return false;
-    }
-    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
-        return false;
-    }
-    bytes[1..].iter().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
-    })
 }
 
 #[cfg(test)]
@@ -275,13 +314,16 @@ mod tests {
 
         // A slug that is not ASCII-safe fails the producer contract.
         assert_eq!(
-            apply.apply(&palette("Bad Slug")).unwrap_err().to_string(),
+            apply
+                .apply(&palette("Bad Slug"), None)
+                .unwrap_err()
+                .to_string(),
             INVALID_MESSAGE
         );
         // A padded/incomplete palette fails validate().
         let mut broken = palette("pack");
         broken.palette.remove("background");
-        assert!(apply.apply(&broken).is_err());
+        assert!(apply.apply(&broken, None).is_err());
         assert!(!dir.path().join("ran.txt").exists());
         assert!(!apply.is_busy());
     }
@@ -299,7 +341,7 @@ mod tests {
 
         let expected = palette("pack");
         assert_eq!(
-            apply.apply(&expected).unwrap(),
+            apply.apply(&expected, None).unwrap(),
             "Applied Test Pack. Wallpaper was not changed."
         );
         let recorded = read_args(&spacey);
@@ -313,6 +355,116 @@ mod tests {
     }
 
     #[test]
+    fn a_named_wallpaper_is_passed_as_a_fixed_argument_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let spacey = dir.path().join("with space");
+        let path = install_helper(&spacey, RECORDING_HELPER);
+        write_response(
+            &spacey,
+            r#"{"schema":1,"status":"applied","theme":"pack","wallpaper":"1-a.webp","warnings":[]}"#,
+        );
+        let apply = ThemeApply::new(path);
+
+        let expected = palette("pack");
+        let wallpaper = ThemeWallpaper::new("1-a.webp").unwrap();
+        assert_eq!(
+            apply.apply(&expected, Some(&wallpaper)).unwrap(),
+            "Applied Test Pack. Wallpaper set to A."
+        );
+        let recorded = read_args(&spacey);
+        assert_eq!(
+            recorded,
+            [
+                "apply",
+                "pack",
+                "--expected-palette",
+                &serde_json::to_string(&expected).unwrap(),
+                "--background",
+                "1-a.webp",
+                "--json",
+            ]
+        );
+        assert!(!apply.is_busy());
+    }
+
+    #[test]
+    fn a_wallpaper_change_the_service_did_not_ask_for_is_a_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_helper(dir.path(), RECORDING_HELPER);
+        // The producer claims a wallpaper change on an apply that named none.
+        write_response(
+            dir.path(),
+            r#"{"schema":1,"status":"applied","theme":"pack","wallpaper":"1-a.webp","warnings":[]}"#,
+        );
+        let apply = ThemeApply::new(path);
+        assert_eq!(
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
+            PARTIAL_MESSAGE
+        );
+        assert!(!apply.is_busy());
+    }
+
+    #[test]
+    fn a_requested_wallpaper_the_producer_did_not_set_is_a_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_helper(dir.path(), RECORDING_HELPER);
+        write_response(
+            dir.path(),
+            r#"{"schema":1,"status":"applied","theme":"pack","wallpaper":null,"warnings":[]}"#,
+        );
+        let apply = ThemeApply::new(path);
+        let wallpaper = ThemeWallpaper::new("1-a.webp").unwrap();
+        assert_eq!(
+            apply
+                .apply(&palette("pack"), Some(&wallpaper))
+                .unwrap_err()
+                .to_string(),
+            PARTIAL_MESSAGE
+        );
+    }
+
+    #[test]
+    fn a_wallpaper_that_could_not_be_set_is_reported_without_denying_the_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_helper(dir.path(), RECORDING_HELPER);
+        write_response(
+            dir.path(),
+            r#"{"schema":1,"status":"applied","theme":"pack","wallpaper":null,"warnings":["wallpaperFailed"]}"#,
+        );
+        let apply = ThemeApply::new(path);
+        let wallpaper = ThemeWallpaper::new("1-a.webp").unwrap();
+        let message = apply.apply(&palette("pack"), Some(&wallpaper)).unwrap();
+        assert!(message.starts_with("Applied Test Pack."));
+        assert!(message.contains("wallpaper could not be changed"));
+    }
+
+    #[test]
+    fn an_unpublishable_wallpaper_id_never_reaches_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_helper(
+            dir.path(),
+            "#!/bin/sh\nprintf 'ran' > \"$(dirname -- \"$0\")/ran.txt\"\n",
+        );
+        let apply = ThemeApply::new(path);
+        for id in ["", ".", "..", "../1-a.webp", "a/b.webp", "tab\tname"] {
+            let wallpaper = ThemeWallpaper {
+                id: id.into(),
+                label: "X".into(),
+            };
+            assert_eq!(
+                apply
+                    .apply(&palette("pack"), Some(&wallpaper))
+                    .unwrap_err()
+                    .to_string(),
+                INVALID_MESSAGE,
+                "{id:?}"
+            );
+        }
+        assert!(!dir.path().join("ran.txt").exists());
+        assert!(!apply.is_busy());
+    }
+
+    #[test]
     fn known_ghostty_warning_is_reported_without_claiming_complete_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = install_helper(dir.path(), RECORDING_HELPER);
@@ -321,7 +473,7 @@ mod tests {
             r#"{"schema":1,"status":"applied","theme":"pack","warnings":["ghosttyReloadFailed"]}"#,
         );
         let apply = ThemeApply::new(path);
-        let message = apply.apply(&palette("pack")).unwrap();
+        let message = apply.apply(&palette("pack"), None).unwrap();
         assert!(message.starts_with("Applied Test Pack."));
         assert!(message.contains("Ghostty did not reload"));
     }
@@ -340,7 +492,7 @@ mod tests {
             let path = install_helper(dir.path(), RECORDING_HELPER);
             let apply = ThemeApply::new(path);
             assert_eq!(
-                apply.apply(&palette("pack")).unwrap_err().to_string(),
+                apply.apply(&palette("pack"), None).unwrap_err().to_string(),
                 PARTIAL_MESSAGE,
                 "case {json}"
             );
@@ -349,7 +501,7 @@ mod tests {
         let failing = install_helper(dir.path(), "#!/bin/sh\nexit 3\n");
         let apply = ThemeApply::new(failing);
         assert_eq!(
-            apply.apply(&palette("pack")).unwrap_err().to_string(),
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
             PARTIAL_MESSAGE
         );
         assert!(!apply.is_busy());
@@ -364,7 +516,7 @@ mod tests {
         );
         let apply = ThemeApply::with_test_timeout(path, Duration::from_secs(10));
         assert_eq!(
-            apply.apply(&palette("pack")).unwrap_err().to_string(),
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
             PARTIAL_MESSAGE
         );
     }
@@ -378,13 +530,13 @@ mod tests {
             r#"{"schema":1,"status":"applied","theme":"pack","warnings":[]}"#,
         );
         let apply = ThemeApply::new(path);
-        let ok = apply.apply(&palette("pack")).unwrap();
+        let ok = apply.apply(&palette("pack"), None).unwrap();
         assert!(!ok.contains("/private/secret"));
         assert!(!ok.contains(&dir.path().display().to_string()));
 
         let failing = install_helper(dir.path(), "#!/bin/sh\necho /private/secret >&2\nexit 1\n");
         let apply = ThemeApply::new(failing);
-        let error = apply.apply(&palette("pack")).unwrap_err().to_string();
+        let error = apply.apply(&palette("pack"), None).unwrap_err().to_string();
         assert_eq!(error, PARTIAL_MESSAGE);
         assert!(!error.contains("/private/secret"));
         assert!(!error.contains(&dir.path().display().to_string()));
@@ -409,7 +561,7 @@ mod tests {
         let worker = {
             let apply = Arc::clone(&apply);
             let expected = palette("pack");
-            std::thread::spawn(move || apply.apply(&expected))
+            std::thread::spawn(move || apply.apply(&expected, None))
         };
         // Wait until the first apply owns the single-flight flag.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -421,7 +573,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            apply.apply(&palette("pack")).unwrap_err().to_string(),
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
             BUSY_MESSAGE
         );
         worker.join().unwrap().unwrap();
@@ -429,7 +581,7 @@ mod tests {
         // Not wedged: a later apply runs to completion instead of reporting
         // the busy message forever.
         assert_eq!(
-            apply.apply(&palette("pack")).unwrap(),
+            apply.apply(&palette("pack"), None).unwrap(),
             "Applied Test Pack. Wallpaper was not changed."
         );
     }
@@ -440,27 +592,27 @@ mod tests {
         let path = install_helper(dir.path(), "#!/bin/sh\nsleep 5\n");
         let apply = ThemeApply::with_test_timeout(path, Duration::from_millis(150));
         assert_eq!(
-            apply.apply(&palette("pack")).unwrap_err().to_string(),
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
             PARTIAL_MESSAGE
         );
         assert!(!apply.is_busy());
         // Still usable: the next attempt runs (and also times out) instead of
         // reporting the busy message forever.
         assert_ne!(
-            apply.apply(&palette("pack")).unwrap_err().to_string(),
+            apply.apply(&palette("pack"), None).unwrap_err().to_string(),
             BUSY_MESSAGE
         );
     }
 
     #[test]
     fn slug_validation_matches_the_producer_contract() {
-        assert!(valid_slug("a"));
-        assert!(valid_slug("a-b_c9"));
-        assert!(!valid_slug(""));
-        assert!(!valid_slug("A"));
-        assert!(!valid_slug("-lead"));
-        assert!(!valid_slug("bad space"));
-        assert!(!valid_slug(&"a".repeat(129)));
-        assert!(valid_slug(&"a".repeat(128)));
+        assert!(is_theme_slug("a"));
+        assert!(is_theme_slug("a-b_c9"));
+        assert!(!is_theme_slug(""));
+        assert!(!is_theme_slug("A"));
+        assert!(!is_theme_slug("-lead"));
+        assert!(!is_theme_slug("bad space"));
+        assert!(!is_theme_slug(&"a".repeat(129)));
+        assert!(is_theme_slug(&"a".repeat(128)));
     }
 }

@@ -100,7 +100,10 @@ impl LauncherState {
     }
 
     pub fn enter_actions(&mut self, actions: &[Action]) -> bool {
-        if self.searching || self.selection.current(&self.items).is_none() || actions.is_empty() {
+        // A scope may publish commands while it has no results at all — an empty
+        // theme collection still offers Install — so the panel needs an action
+        // list, not a selection.
+        if self.searching || actions.is_empty() {
             return false;
         }
         self.selection_explicit = true;
@@ -313,5 +316,21 @@ mod tests {
         assert_eq!(state.escape(), EscapeResult::Back);
         assert_eq!(state.escape(), EscapeResult::Cleared);
         assert_eq!(state.escape(), EscapeResult::Hide);
+    }
+
+    #[test]
+    fn a_scope_command_opens_the_panel_without_any_results() {
+        let mut state = LauncherState {
+            screen: Some(Screen::Search),
+            ..Default::default()
+        };
+        let actions = vec![Action {
+            id: crate::core::ActionId("install".into()),
+            title: "Install a theme from GitHub…".into(),
+        }];
+        assert!(state.enter_actions(&actions));
+        assert_eq!(state.screen, Some(Screen::Actions));
+        // An empty panel is still not a panel.
+        assert!(!state.enter_actions(&[]));
     }
 }

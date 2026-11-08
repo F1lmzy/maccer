@@ -3200,6 +3200,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "plist",
+ "raw-window-handle",
  "regex",
  "rusqlite",
  "serde",

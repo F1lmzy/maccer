@@ -245,6 +245,13 @@ fn run(args: Args) -> Result<()> {
             launcher_agent::ui::LauncherOptions {
                 width: config.launcher.width,
                 max_results: config.launcher.max_results,
+                web: launcher_agent::ui::WebPreviewOptions {
+                    inline: config.web.inline_preview,
+                    prewarm: config.web.prewarm,
+                    idle_release: std::time::Duration::from_secs(
+                        config.web.idle_release_seconds,
+                    ),
+                },
             },
             cx,
         ) {
@@ -402,6 +409,7 @@ fn run_service_frontend(socket: PathBuf, show_on_start: bool, check: bool) -> Re
             launcher_agent::ui::LauncherOptions {
                 width: 480.,
                 max_results: 50,
+                ..Default::default()
             },
             cx,
         ) {

@@ -108,6 +108,7 @@ fn live_catalog_uses_configured_helper_and_leaves_active_palette_unchanged() {
         action_ref: item.actions[0].action_ref.clone(),
         operation_id: "unconfirmed".into(),
         confirmed: false,
+        input: Default::default(),
     };
     let error = client.invoke(&unconfirmed).unwrap_err();
     assert_eq!(

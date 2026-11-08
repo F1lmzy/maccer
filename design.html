@@ -1,0 +1,1779 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maccer — design gallery</title>
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   maccer design gallery · free-form playground
+
+   Everything visual is driven by the tokens in :root.
+   Change --surface / --fg / --muted / --accent / --divider and all 34
+   cards follow. The .win block mirrors the GPUI root div in
+   crates/launcher/src/ui/launcher.rs (Render::render), one class per
+   GPUI call, so a rewrite can be read off this file.
+   ───────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* ── launcher palette (theme.rs defaults) ─────────────────────────────── */
+  --surface: #1a1a1a;   /* hsla(0,0,.10,1)  */
+  --fg:      #bfbfbf;   /* hsla(0,0,.75,1)  */
+  --muted:   #a6a6a6;   /* hsla(0,0,.65,1)  */
+  --accent:  #d9d9d9;   /* hsla(0,0,.85,1)  */
+  --divider: #3d3d3d;   /* hsla(0,0,.24,1)  */
+
+  /* ── geometry ─────────────────────────────────────────────────────────── */
+  --win-r:     12px;    /* rounded(px(12.))          */
+  --row-r:      8px;    /* ROW_RADIUS                */
+  --row-h:     44px;    /* ROW_HEIGHT                */
+  --icon:      24px;    /* ICON_SIZE                 */
+  --head-h:    52px;    /* search header             */
+  --foot-h:    22px;    /* FOOTER_HEIGHT             */
+  --preview-w: 280px;   /* PREVIEW_WIDTH             */
+  --fs:        14px;
+  --lh:        18px;
+
+  --font: "SF Mono", ui-monospace, "Menlo", "JetBrains Mono", monospace;
+
+  /* ── gallery page ─────────────────────────────────────────────────────── */
+  --page:  #f1efeb;
+  --card:  #fbfaf8;
+  --ink:   #1b1a18;
+  --ink-2: #6d6a64;
+  --hair:  #ddd8cf;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 56px 40px 96px;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.55 -apple-system, "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ══ page chrome ════════════════════════════════════════════════════════ */
+
+.page-head { max-width: 760px; margin: 0 0 44px; }
+.kicker { font-size: 12px; color: var(--ink-2); margin-bottom: 12px; }
+.page-head h1 {
+  margin: 0 0 12px;
+  font-size: 34px;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+.lede { margin: 0; font-size: 15px; line-height: 1.6; color: #3d3a35; max-width: 62ch; }
+.lede code { font-family: var(--font); font-size: 13px; background: #e8e4dd; padding: 1px 5px; border-radius: 4px; }
+
+section { margin: 0 0 56px; }
+.sec-head { margin: 0 0 20px; border-top: 1px solid var(--hair); padding-top: 20px; }
+.sec-head h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.sec-head p { margin: 0; font-size: 13px; color: var(--ink-2); max-width: 74ch; }
+.sec-head p code { font-family: var(--font); font-size: 12px; color: #4a4740; }
+
+.grid { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+
+/* ── card ─────────────────────────────────────────────────────────────── */
+
+.card {
+  flex: 0 0 auto;
+  max-width: 100%;
+  margin: 0;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--hair);
+  border-radius: 16px;
+  box-shadow: 0 1px 1px rgba(28,27,25,.03), 0 10px 24px -22px rgba(28,27,25,.5);
+}
+.card figcaption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.card figcaption b { font-size: 12.5px; font-weight: 600; letter-spacing: -0.01em; }
+.card figcaption span {
+  font-size: 11px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.stage { overflow-x: auto; overflow-y: hidden; padding: 4px; }
+
+/* ══ tokens strip ═══════════════════════════════════════════════════════ */
+
+.swatches { display: flex; flex-wrap: wrap; gap: 8px; }
+.swatch {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px 8px 8px;
+  background: var(--card);
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  font-size: 12px;
+}
+.swatch i {
+  width: 18px; height: 18px; border-radius: 6px; display: block;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.14);
+}
+.swatch em { font-style: normal; color: var(--ink-2); font-family: var(--font); font-size: 11px; }
+
+/* ══ the launcher window ════════════════════════════════════════════════ */
+
+.win {
+  /* derived tints resolve against this element's --accent, so a
+     [data-theme] override below retints everything for free */
+  --sel:   color-mix(in srgb, var(--accent) 14%, transparent); /* selection_fill() */
+  --panel: color-mix(in srgb, var(--accent)  6%, transparent); /* panel_fill()     */
+  --tsel:  color-mix(in srgb, var(--accent) 35%, transparent); /* text_selection() */
+
+  width: 480px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--divider);
+  border-radius: var(--win-r);
+  font-family: var(--font);
+  font-size: var(--fs);
+  line-height: var(--lh);
+  box-shadow: 0 2px 6px -2px rgba(0,0,0,.4);
+}
+.win.w760 { width: 760px; }   /* 480 + PREVIEW_WIDTH */
+.win.w984 { width: 984px; }   /* FILMSTRIP_WIDTH     */
+.win.h364 { height: 364px; }  /* Output screen       */
+
+/* ── search header ────────────────────────────────────────────────────── */
+
+.bar {
+  height: var(--head-h);
+  flex: none;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--divider);
+}
+.field {
+  height: 28px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: pre;
+  font-size: 16px;
+  line-height: 22px;
+}
+.field .ph { color: var(--muted); }
+.field mark { background: var(--tsel); color: inherit; }
+.caret {
+  width: 1.5px;
+  height: 24px;
+  flex: none;
+  background: var(--fg);
+  animation: blink 1.06s infinite;
+}
+@keyframes blink { 0%, 50% { opacity: 1 } 50.01%, 100% { opacity: 0 } }
+
+/* ── body / rows ──────────────────────────────────────────────────────── */
+
+.body { display: flex; padding: 4px 0; }
+.rows { flex: 1; min-width: 0; padding: 0 8px; }
+
+.row {
+  position: relative;
+  height: var(--row-h);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  border-radius: var(--row-r);
+  color: var(--fg);
+}
+.row.sel { background: var(--sel); }
+.row.sel::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 12px; bottom: 12px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.ico {
+  width: var(--icon);
+  height: var(--icon);
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1;
+  overflow: hidden;
+}
+.ico.glyph { background: var(--panel); color: var(--muted); }
+.ico.tile {
+  color: #fff;
+  font-weight: 600;
+  font-size: 11.5px;
+  background:
+    radial-gradient(120% 120% at 30% 18%,
+      color-mix(in srgb, var(--t) 52%, #fff) 0%,
+      var(--t) 58%,
+      color-mix(in srgb, var(--t) 74%, #000) 100%);
+}
+
+.meta { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+.title { font-size: 14px; line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub   { font-size: 11px; line-height: 14px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* action rows have no icon and go quiet until selected */
+.row.act { color: var(--muted); }
+.row.act.sel { color: var(--fg); }
+
+/* ── empty / error ────────────────────────────────────────────────────── */
+
+.empty {
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+.err {
+  height: 24px;
+  flex: none;
+  padding: 0 16px;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── preview pane ─────────────────────────────────────────────────────── */
+
+.preview {
+  position: relative;
+  width: var(--preview-w);
+  flex: none;
+  border-left: 1px solid var(--divider);
+  padding: 12px 16px;
+  overflow: hidden;
+  contain: size;
+  font-size: 12px;
+  line-height: 17px;
+}
+.preview.mono { font-family: var(--font); white-space: pre-wrap; word-break: break-word; }
+.preview .caption { font-size: 10px; line-height: 14px; color: var(--muted); }
+.preview .block { margin-bottom: 8px; }
+.preview .value { font-size: 18px; line-height: 24px; }
+.preview .trunc {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 20px 16px 12px;
+  background: var(--surface);
+  color: var(--muted); white-space: normal;
+}
+
+.figure { height: 240px; display: grid; place-items: center; }
+.figure .art {
+  width: 248px;
+  height: 165px;
+  border-radius: 2px;
+  background:
+    radial-gradient(80% 70% at 18% 12%, #f6d7a8 0%, transparent 60%),
+    radial-gradient(70% 60% at 88% 82%, #8c4a2f 0%, transparent 65%),
+    linear-gradient(165deg, #23304a 0%, #3d5a7a 46%, #c98a5c 100%);
+}
+.figure .page {
+  width: 186px;
+  height: 240px;
+  border-radius: 2px;
+  background: #f4f2ee;
+  box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.figure .page i { display: block; height: 3px; border-radius: 2px; background: #cfcbc4; }
+.figure .page i.t { height: 7px; width: 62%; background: #a9a49b; margin-bottom: 4px; }
+
+/* ── confirmation prompt ──────────────────────────────────────────────── */
+
+.confirm {
+  flex: none;
+  margin: 8px 8px 0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--divider);
+  border-radius: var(--row-r);
+  background: var(--sel);
+}
+.confirm .msg { font-size: 12px; line-height: 17px; max-height: 128px; overflow: hidden; }
+.confirm .acts {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--muted);
+}
+.confirm .acts .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── output screen ────────────────────────────────────────────────────── */
+
+.out-head {
+  height: 24px;
+  flex: none;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+.out {
+  margin: 0 16px 12px;
+  height: 240px;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--divider);
+  border-radius: var(--row-r);
+  background: var(--panel);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── footer ───────────────────────────────────────────────────────────── */
+
+.foot {
+  height: var(--foot-h);
+  flex: none;
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--muted);
+}
+.foot span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.foot .count { flex: none; font-variant-numeric: tabular-nums; }
+
+/* ── filmstrip ────────────────────────────────────────────────────────── */
+
+.strip { position: relative; height: var(--strip-h, 258px); overflow: hidden; }
+.frame { position: absolute; overflow: hidden; border: 1px solid var(--divider); border-radius: 6px; }
+.frame.on { border-color: var(--accent); border-radius: 8px; }
+.frame .art { position: absolute; inset: 0; }
+.frame .dim { position: absolute; inset: 0; background: var(--surface); }
+
+/* A theme frame is the card itself, but only while it holds focus: the theme's
+   own surface, its six accents, its name. Distance drops the frame back to a
+   neutral surface and keeps the palette, so a light theme at the edge can never
+   outshine the one you are looking at. The dot marks the theme the desktop is
+   wearing. */
+.frame.pal { background: var(--panel); color: var(--muted); }
+.frame.pal.on { background: var(--bg); color: var(--fg); }
+.frame.pal .dots {
+  position: absolute; left: 0; right: 0; top: var(--dots-top, 72px);
+  display: flex; justify-content: center;
+  gap: var(--dot-gap, 10px);
+}
+.frame.pal .dots i {
+  display: block;
+  width: var(--dot, 12px); height: var(--dot, 12px);
+  border-radius: 50%;
+}
+.frame.pal .nm {
+  position: absolute; left: 0; right: 0; bottom: var(--name-bottom, 32px);
+  padding: 0 var(--pad-x, 16px);
+  text-align: center;
+  font-size: var(--nm, 13px);
+  line-height: 1.25;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.frame.pal .live {
+  position: absolute; top: 10px; right: 10px;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent);
+}
+
+/* ══ palette overrides ══════════════════════════════════════════════════ */
+
+.win[data-theme="mocha"] {
+  --surface: #1e1e2e; --fg: #cdd6f4; --muted: #7f849c;
+  --accent: #cba6f7; --divider: #313244;
+}
+.win[data-theme="gruvbox"] {
+  --surface: #1d2021; --fg: #ebdbb2; --muted: #a89984;
+  --accent: #fabd2f; --divider: #3c3836;
+}
+.win[data-theme="dawn"] {
+  --surface: #faf4ed; --fg: #575279; --muted: #797593;
+  --accent: #907aa9; --divider: #dfdad9;
+}
+
+/* ══ colophon ═══════════════════════════════════════════════════════════ */
+
+.colophon {
+  max-width: 74ch;
+  margin-top: 8px;
+  padding-top: 20px;
+  border-top: 1px solid var(--hair);
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.colophon b { color: var(--ink); font-weight: 600; }
+.colophon code { font-family: var(--font); font-size: 12px; color: #4a4740; }
+</style>
+</head>
+<body>
+
+<header class="page-head">
+  <div class="kicker">maccer · GPUI frontend · crates/launcher/src/ui</div>
+  <h1>Design gallery</h1>
+  <p class="lede">
+    Every state the launcher can currently render, at its real size. Free-form — nothing here is
+    bound to GPUI. Edit the tokens in <code>:root</code> and all 34 cards follow; edit any card
+    in place to try a layout. The rules are in <code>design/DESIGN.md</code>, the values in
+    <code>design/design-system.yaml</code>, and <code>node design/check.mjs</code> fails when a
+    card claims a size it does not render or drifts off the 16px gutter. The eventual rewrite in <code>launcher.rs</code> reads straight
+    off the class names: <code>.win</code> is the root div, <code>.bar</code> the 52px search
+    header, <code>.row</code> a 44pt result, <code>.preview</code> the 280pt pane.
+  </p>
+</header>
+
+<section>
+  <div class="sec-head">
+    <h2>Palette</h2>
+    <p>The five semantic roles from <code>theme.rs</code>. A service palette maps onto these and
+       nothing else; row tints are derived from <code>--accent</code> at 14 / 6 / 35 %.</p>
+  </div>
+  <div class="swatches">
+    <div class="swatch"><i style="background:#1a1a1a"></i>surface <em>#1a1a1a</em></div>
+    <div class="swatch"><i style="background:#bfbfbf"></i>foreground <em>#bfbfbf</em></div>
+    <div class="swatch"><i style="background:#a6a6a6"></i>muted <em>#a6a6a6</em></div>
+    <div class="swatch"><i style="background:#d9d9d9"></i>accent <em>#d9d9d9</em></div>
+    <div class="swatch"><i style="background:#3d3d3d"></i>divider <em>#3d3d3d</em></div>
+    <div class="swatch"><i style="background:#2a2a2a"></i>selection 14% <em>accent</em></div>
+    <div class="swatch"><i style="background:#212121"></i>panel 6% <em>accent</em></div>
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     1 · search & shell states
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Search &amp; shell states</h2>
+    <p>The six things the popup can be doing while it is a list. Window height is
+       <code>84 + rows×44</code> clamped to 400, so the cards get shorter as results thin out.</p>
+  </div>
+  <div class="grid">
+
+    <!-- ── default ── -->
+    <figure class="card">
+      <figcaption><b>Search · default</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">s<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#3a76f0">S</span>
+                <div class="meta"><div class="title">Signal</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#f7b500">S</span>
+                <div class="meta"><div class="title">Sketch</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#611f69">S</span>
+                <div class="meta"><div class="title">Slack</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#1db954">S</span>
+                <div class="meta"><div class="title">Spotify</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta">
+                  <div class="title">Search with Google</div>
+                  <div class="sub">Web</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/12</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── provider home ── -->
+    <figure class="card">
+      <figcaption><b>Search · empty (provider home)</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field"><span class="caret"></span><span class="ph">Search…</span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel"><div class="title">Applications</div></div>
+              <div class="row"><div class="title">Web Search</div></div>
+              <div class="row"><div class="title">Files</div></div>
+              <div class="row"><div class="title">Clipboard</div></div>
+              <div class="row"><div class="title">Themes</div></div>
+              <div class="row"><div class="title">Wallpapers</div></div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/6</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── searching ── -->
+    <figure class="card">
+      <figcaption><b>Search · searching</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">doc<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#5c6bc0">D</span>
+                <div class="meta"><div class="title">Docker</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#2d3748">D</span>
+                <div class="meta"><div class="title">Dash</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#e05d44">D</span>
+                <div class="meta"><div class="title">Discord</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta">
+                  <div class="title">docs/</div>
+                  <div class="sub">~/Documents/maccer</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">design.html</div>
+                  <div class="sub">~/Documents/maccer</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta">
+                  <div class="title">Search with Google</div>
+                  <div class="sub">Web</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>Searching…</span><span class="count">1/8</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── no results ── -->
+    <figure class="card">
+      <figcaption><b>Search · no results</b><span>480 × 128</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">zzzz<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows"><div class="empty">No results</div></div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── inline error ── -->
+    <figure class="card">
+      <figcaption><b>Search · inline error</b><span>480 × 284</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">/ rep<span class="caret"></span></div></div>
+          <div class="err">files: fd not found — install it with brew install fd</div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">report.pdf</div>
+                  <div class="sub">~/Documents/2024</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta">
+                  <div class="title">reports/</div>
+                  <div class="sub">~/Documents/2024</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">replace-history.md</div>
+                  <div class="sub">~/Documents/maccer/docs</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">repo-index.sqlite3</div>
+                  <div class="sub">~/Library/Caches/maccer</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/4</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── in flight ── -->
+    <figure class="card">
+      <figcaption><b>Search · action running</b><span>480 × 216</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">> npm run build<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Run: npm run build</div>
+                  <div class="sub">Explicit shell command · 30s timeout</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Deploy staging</div>
+                  <div class="sub">Configured shell command</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Open dotfiles</div>
+                  <div class="sub">Configured shell command</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>Running… · Esc Cancel</span><span class="count">1/3</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     2 · provider result lists
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Providers</h2>
+    <p>One card per result source. Applications suppress their subtitle (the name is the whole
+       row); everything else shows a subtitle, falling back to a capitalised provider name.
+       Glyph icons live in a 24pt tile at 11px; real app icons are 24×24 images.</p>
+  </div>
+  <div class="grid">
+
+    <!-- ── applications ── -->
+    <figure class="card">
+      <figcaption><b>Applications</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">saf<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#3a76f0">S</span>
+                <div class="meta"><div class="title">Signal</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#f7b500">S</span>
+                <div class="meta"><div class="title">Sketch</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#611f69">S</span>
+                <div class="meta"><div class="title">Slack</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#1db954">S</span>
+                <div class="meta"><div class="title">Spotify</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#2a475e">S</span>
+                <div class="meta"><div class="title">Steam</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/10</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── files ── -->
+    <figure class="card">
+      <figcaption><b>Files</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">/ rpt<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">q4-report.pdf</div>
+                  <div class="sub">~/Documents/2024</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">q3-report.pdf</div>
+                  <div class="sub">~/Documents/2024</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta">
+                  <div class="title">reports/</div>
+                  <div class="sub">~/Documents</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">report-template.md</div>
+                  <div class="sub">~/Documents/maccer/docs</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">rcpt-2024-11.png</div>
+                  <div class="sub">~/Pictures/Receipts</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">rpt.rb</div>
+                  <div class="sub">~/src/tools</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── calculator ── -->
+    <figure class="card">
+      <figcaption><b>Calculator</b><span>480 × 128</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">= 17*84<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">=</span>
+                <div class="meta">
+                  <div class="title">1428</div>
+                  <div class="sub">Calculator</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/1</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── clipboard ── -->
+    <figure class="card">
+      <figcaption><b>Clipboard</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">:<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▸</span>
+                <div class="meta">
+                  <div class="title">https://github.com/zed-industries/gpui</div>
+                  <div class="sub">Text clipboard</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">cargo run -p launcher -- --show</div>
+                  <div class="sub">Text clipboard</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI…</div>
+                  <div class="sub">Pinned</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">Let me check the render path first — the row tint looks…</div>
+                  <div class="sub">Text clipboard</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta">
+                  <div class="title">~/Documents/maccer</div>
+                  <div class="sub">Text clipboard</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta">
+                  <div class="title">2024-11-05T14:17:03Z</div>
+                  <div class="sub">Text clipboard</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/6</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── shell ── -->
+    <figure class="card">
+      <figcaption><b>Shell / Commands</b><span>480 × 216</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">><span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Deploy staging</div>
+                  <div class="sub">Configured shell command</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Open dotfiles</div>
+                  <div class="sub">Configured shell command</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">›</span>
+                <div class="meta">
+                  <div class="title">Rebuild file index</div>
+                  <div class="sub">Configured shell command</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/3</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── web ── -->
+    <figure class="card">
+      <figcaption><b>Web search</b><span>480 × 172</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">rust async<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">↗</span>
+                <div class="meta">
+                  <div class="title">Search with Google</div>
+                  <div class="sub">Web</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta">
+                  <div class="title">Search with DuckDuckGo</div>
+                  <div class="sub">Web</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/2</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── themes ── -->
+    <figure class="card">
+      <figcaption><b>Themes</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">themes<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Catppuccin Mocha</div>
+                  <div class="sub">catppuccin-mocha · dark · preview · 4 wallpapers</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Catppuccin Latte</div>
+                  <div class="sub">catppuccin-latte · light · preview · 4 wallpapers</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Gruvbox Dark</div>
+                  <div class="sub">gruvbox-dark · dark · preview · 1 wallpaper</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Nord</div>
+                  <div class="sub">nord · dark · preview · no wallpaper</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Rosé Pine Dawn</div>
+                  <div class="sub">rose-pine-dawn · light · preview · 2 wallpapers</div>
+                </div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta">
+                  <div class="title">Tokyo Night</div>
+                  <div class="sub">tokyo-night · dark · preview · 3 wallpapers</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/9</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     3 · preview pane
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Preview pane</h2>
+    <p>Cmd-Shift-P adds a 280pt pane to the right and grows the window to 760. The pane is
+       <code>border-left: 1px divider</code>, 16px side padding, 12px text on 17px. At least
+       five rows stay visible so the list never collapses under it.</p>
+  </div>
+  <div class="grid">
+
+    <!-- ── text ── -->
+    <figure class="card">
+      <figcaption><b>Preview · text</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ config<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">config.example.toml</div><div class="sub">~/Documents/maccer/config</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">config.toml</div><div class="sub">~/.config/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">config/</div><div class="sub">~/Documents/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">config.rs</div><div class="sub">~/Documents/maccer/crates/launcher/src</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">configuration.md</div><div class="sub">~/Documents/maccer/docs</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">conf.d/</div><div class="sub">/opt/homebrew/etc</div></div>
+              </div>
+            </div>
+            <div class="preview mono">[launcher]
+hotkey = "alt-space"
+width = 480
+max_results = 50
+
+[providers.apps]
+enabled = true
+prefix = "/apps"
+priority = 100
+default_search = true
+max_results = 10
+
+[providers.files]
+enabled = true
+prefix = "/"
+priority = 80</div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── text truncated ── -->
+    <figure class="card">
+      <figcaption><b>Preview · text, 64 KiB cap</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ log<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">service.log</div><div class="sub">~/Library/Logs/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">launcher.log</div><div class="sub">~/Library/Logs/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">install.log</div><div class="sub">/var/log</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">logs/</div><div class="sub">~/Documents/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">login-items.plist</div><div class="sub">~/Library/LaunchAgents</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">logrotate.conf</div><div class="sub">/opt/homebrew/etc</div></div>
+              </div>
+            </div>
+            <div class="preview mono">2024-11-05T14:17:03Z DEBUG ui_render_wait stage="ui_apply"
+  duration_ms=0.41 elapsed_ms=1.02
+2024-11-05T14:17:03Z DEBUG preview stage="ui_apply"
+  duration_ms=0.88 elapsed_ms=2.14
+2024-11-05T14:17:04Z DEBUG icon loaded bundle="Safari.app"
+  bytes=3184 elapsed_ms=6.20
+2024-11-05T14:17:04Z WARN  hotkey conflict: alt-space
+  already registered by "Raycast"
+2024-11-05T14:17:05Z DEBUG search delivered generation=41
+  items=12 elapsed_ms=0.71<div class="trunc">First 64 KiB shown. Use Quick Look for the full file.</div></div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── image ── -->
+    <figure class="card">
+      <figcaption><b>Preview · image</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ shot<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">shot-2024-11-05.png</div><div class="sub">~/Desktop</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">shot-2024-11-04.png</div><div class="sub">~/Desktop</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">shot-2024-11-03.png</div><div class="sub">~/Desktop</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">screenshots/</div><div class="sub">~/Pictures</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">shot-2024-10-29.png</div><div class="sub">~/Desktop</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">shot-2024-10-28.png</div><div class="sub">~/Desktop</div></div>
+              </div>
+            </div>
+            <div class="preview">
+              <div class="figure"><div class="art"></div></div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── pdf ── -->
+    <figure class="card">
+      <figcaption><b>Preview · PDF (Quick Look thumbnail)</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ report<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">q4-report.pdf</div><div class="sub">~/Documents/2024</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">q3-report.pdf</div><div class="sub">~/Documents/2024</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">report-template.md</div><div class="sub">~/Documents/maccer/docs</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">reports/</div><div class="sub">~/Documents</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">annual-report-2023.pdf</div><div class="sub">~/Documents/Archive</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">report.typ</div><div class="sub">~/src/paper</div></div>
+              </div>
+            </div>
+            <div class="preview">
+              <div class="figure"><div class="page">
+                <i class="t"></i>
+                <i style="width:100%"></i><i style="width:92%"></i><i style="width:97%"></i><i style="width:70%"></i>
+                <i style="width:100%;margin-top:8px"></i><i style="width:88%"></i><i style="width:94%"></i><i style="width:52%"></i>
+                <i style="width:100%;margin-top:8px"></i><i style="width:81%"></i><i style="width:96%"></i><i style="width:64%"></i>
+              </div></div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── loading ── -->
+    <figure class="card">
+      <figcaption><b>Preview · loading</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ video<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">demo.mov</div><div class="sub">~/Movies</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">demo-2.mov</div><div class="sub">~/Movies</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">videos/</div><div class="sub">~/Documents/maccer/docs</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">demo.gif</div><div class="sub">~/Desktop</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">video-preview.mp4</div><div class="sub">~/Downloads</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">demo.srt</div><div class="sub">~/Movies</div></div>
+              </div>
+            </div>
+            <div class="preview">Loading preview…</div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── unavailable ── -->
+    <figure class="card">
+      <figcaption><b>Preview · unavailable</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/ archive<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">backup-2024.tar.zst</div><div class="sub">~/Archives</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▸</span>
+                <div class="meta"><div class="title">archives/</div><div class="sub">~/Documents</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">Archive.zip</div><div class="sub">~/Downloads</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">maccer-0.4.2.dmg</div><div class="sub">~/Downloads</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">archive-index.bin</div><div class="sub">~/Library/Caches/maccer</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">▤</span>
+                <div class="meta"><div class="title">.archives.json</div><div class="sub">~/Documents</div></div>
+              </div>
+            </div>
+            <div class="preview">No preview available</div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/50</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <!-- ── application details ── -->
+    <figure class="card">
+      <figcaption><b>Preview · application details</b><span>760 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">safari<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari Technology Preview</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#f7b500">S</span>
+                <div class="meta"><div class="title">Sketch</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#3a76f0">S</span>
+                <div class="meta"><div class="title">Signal</div></div>
+              </div>
+              <div class="row">
+                <span class="ico tile" style="--t:#611f69">S</span>
+                <div class="meta"><div class="title">Slack</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta"><div class="title">Search with Google</div><div class="sub">Web</div></div>
+              </div>
+            </div>
+            <div class="preview">
+              <div class="block"><div class="caption">Name</div><div>Safari</div></div>
+              <div class="block"><div class="caption">Type</div><div>Application</div></div>
+              <div class="block"><div class="caption">Application ID</div><div>app_7f3c9a21e0</div></div>
+              <div class="block"><div class="caption">Description</div><div>Web browser</div></div>
+              <div class="block">
+                <div style="width:72px;height:72px;border-radius:4px;background:radial-gradient(120% 120% at 30% 18%,#8fc3ff,#0a84ff 58%,#0055b3)"></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/4</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     4 · action menus
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Action menus · ⌘K</h2>
+    <p>Same 44pt rows, no icons. Unselected actions go muted so the highlighted one carries the
+       weight. Six visible at a time — the Files menu has seven and scrolls. Footer switches to
+       <code>↵ Run · Esc Back</code>.</p>
+  </div>
+  <div class="grid">
+
+    <figure class="card">
+      <figcaption><b>Actions · Applications</b><span>480 × 172</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">safari<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Open</div>
+              <div class="row act">Reveal in Finder</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Actions · Files</b><span>480 × 348</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">/ q4-report<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Open</div>
+              <div class="row act">Reveal in Finder</div>
+              <div class="row act">Open Containing Folder</div>
+              <div class="row act">Quick Look</div>
+              <div class="row act">Copy Path</div>
+              <div class="row act">Copy File</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Actions · Clipboard</b><span>480 × 304</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">:<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Copy</div>
+              <div class="row act">Paste</div>
+              <div class="row act">Pin</div>
+              <div class="row act">Delete</div>
+              <div class="row act">Clear History</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Actions · Shell</b><span>480 × 216</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">> deploy<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Execute and Show Output</div>
+              <div class="row act">Copy Command</div>
+              <div class="row act">Copy Last Output</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Actions · Themes</b><span>480 × 128</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">themes<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Apply theme…</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Actions · Wallpapers</b><span>480 × 128</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">/walls<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row act sel">Set wallpaper</div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Run · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     5 · output
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Output screen</h2>
+    <p>Shell execution replaces the list with a 24pt title row and a 240pt scrollable box on
+       <code>panel_fill</code>. The window pins to 364. stderr is appended to stdout; a non-zero
+       exit appends <code>Process exited with …</code>.</p>
+  </div>
+  <div class="grid">
+
+    <figure class="card">
+      <figcaption><b>Output · success</b><span>480 × 364</span></figcaption>
+      <div class="stage">
+        <div class="win h364">
+          <div class="bar"><div class="field">> git log --oneline -6<span class="caret"></span></div></div>
+          <div class="out-head">Command output</div>
+          <div class="out">4b2f1c9  design: add the gallery page
+9e01a74  ui: tint rows from the palette accent
+c37d2e5  service: publish wallpaper previews
+8a6f0b3  ui: keep prior rows while a query loads
+1d5c8e2  provider: bound the file candidate pool
+7f4a901  macos: single-flight application icons</div>
+          <div class="foot"><span>⌘C Copy · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Output · failure</b><span>480 × 364</span></figcaption>
+      <div class="stage">
+        <div class="win h364">
+          <div class="bar"><div class="field">> cargo test -p launcher<span class="caret"></span></div></div>
+          <div class="out-head">Command output</div>
+          <div class="out">   Compiling launcher v0.4.2
+    Finished `test` profile [unoptimized] target(s)
+     Running tests/frontend.rs
+
+running 3 tests
+test search_lists_apps ... ok
+test preview_panel_opens ... FAILED
+test action_menu_runs ... ok
+
+failures:
+
+---- preview_panel_opens ----
+thread 'preview_panel_opens' panicked at
+tests/frontend.rs:112:5:
+expected 280pt pane, got 0
+
+test result: FAILED. 2 passed; 1 failed
+
+Process exited with exit status: 101</div>
+          <div class="foot"><span>⌘C Copy · Esc Back</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     6 · confirmation
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Confirmation prompt</h2>
+    <p>The backend owns consent. When an action carries a prompt the launcher stages it instead
+       of sending it: a tinted card under the search bar, mouse targets that route through the
+       same Return/Escape handlers, and a footer that switches to Apply/Cancel. Row clicks go
+       inert until it resolves.</p>
+  </div>
+  <div class="grid">
+
+    <figure class="card">
+      <figcaption><b>Confirmation · theme apply</b><span>480 × 355</span></figcaption>
+      <div class="stage">
+        <div class="win">
+          <div class="bar"><div class="field">themes<span class="caret"></span></div></div>
+          <div class="confirm">
+            <div class="msg">Apply "Catppuccin Mocha"? This writes theme files, updates app settings, reloads apps and sets the desktop wallpaper to "Mocha Mauve".</div>
+            <div class="acts">
+              <span class="name">Apply theme…</span>
+              <span>↵ Apply</span>
+              <span>Esc Cancel</span>
+            </div>
+          </div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico glyph">◐</span>
+                <div class="meta"><div class="title">Catppuccin Mocha</div><div class="sub">catppuccin-mocha · dark · preview · 4 wallpapers</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta"><div class="title">Catppuccin Latte</div><div class="sub">catppuccin-latte · light · preview · 4 wallpapers</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta"><div class="title">Gruvbox Dark</div><div class="sub">gruvbox-dark · dark · preview · 1 wallpaper</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">◐</span>
+                <div class="meta"><div class="title">Nord</div><div class="sub">nord · dark · preview · no wallpaper</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Apply · Esc Cancel</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     7 · filmstrip
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Filmstrip</h2>
+    <p>The wide browse is a strip, not a list: five frames on a perspective row, the focused one
+       largest, centres at 0/255/421 from the middle. The band is inset 16 above and below, bleeds
+       past both side edges, and only the focused frame carries an accent border. Wallpapers run
+       984×334 with 320/190/142 frames of 226/160/120, dimmed toward the surface as they recede
+       (1.0 / 0.72 / 0.52). Themes run 760×284 with 248/146/110 frames of 176/124/92. A theme frame
+       is the card itself — the theme's surface, its six accents, its name — so at distance the
+       surface drops back to the panel and only the palette stays, and a light theme never
+       outshines the one in focus. The dot marks the theme the desktop is wearing.</p>
+  </div>
+  <div class="grid">
+
+    <figure class="card">
+      <figcaption><b>Wallpapers · filmstrip</b><span>984 × 334</span></figcaption>
+      <div class="stage">
+        <div class="win w984">
+          <div class="bar"><div class="field">/walls<span class="caret"></span></div></div>
+          <div class="strip">
+            <!-- slot −2 -->
+            <div class="frame" style="left:0;top:69px;width:142px;height:120px">
+              <div class="art" style="background:linear-gradient(175deg,#07101f 0%,#123047 52%,#2f6a63 78%,#9dbfae 100%)"></div>
+              <div class="dim" style="opacity:.48"></div>
+            </div>
+            <!-- slot −1 -->
+            <div class="frame" style="left:142px;top:49px;width:190px;height:160px">
+              <div class="art" style="background:linear-gradient(160deg,#2b1a3d 0%,#5c2b57 44%,#b05a6e 74%,#e8a87c 100%)"></div>
+              <div class="dim" style="opacity:.28"></div>
+            </div>
+            <!-- slot 0 · focused -->
+            <div class="frame on" style="left:332px;top:16px;width:320px;height:226px">
+              <div class="art" style="background:
+                radial-gradient(90% 60% at 22% 88%,rgba(255,183,124,.55) 0%,transparent 62%),
+                radial-gradient(70% 50% at 78% 12%,rgba(120,90,200,.42) 0%,transparent 66%),
+                linear-gradient(168deg,#100c1c 0%,#241a3a 46%,#4a2f4e 72%,#8d5a52 100%)"></div>
+            </div>
+            <!-- slot +1 -->
+            <div class="frame" style="left:652px;top:49px;width:190px;height:160px">
+              <div class="art" style="background:linear-gradient(150deg,#0d1b2a 0%,#1b3a4b 48%,#3f7c7a 76%,#a8d5ba 100%)"></div>
+              <div class="dim" style="opacity:.28"></div>
+            </div>
+            <!-- slot +2 -->
+            <div class="frame" style="left:842px;top:69px;width:142px;height:120px">
+              <div class="art" style="background:linear-gradient(185deg,#1a1208 0%,#3d2a12 50%,#7a5220 78%,#c9a227 100%)"></div>
+              <div class="dim" style="opacity:.48"></div>
+            </div>
+          </div>
+          <div class="foot"><span>←→ Browse · ↵ Set · Esc Close</span><span class="count">1/4</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Themes · filmstrip</b><span>760 × 284</span></figcaption>
+      <div class="stage">
+        <div class="win w760">
+          <div class="bar"><div class="field">/themes<span class="caret"></span></div></div>
+          <div class="strip" style="--strip-h:208px">
+            <!-- slot −2 · Catppuccin Latte -->
+            <div class="frame pal" style="--bg:#eff1f5;--fg:#4c4f69;--dot:6px;--dot-gap:4px;--dots-top:32px;left:0;top:58px;width:110px;height:92px">
+              <div class="dots"><i style="background:#d20f39"></i><i style="background:#40a02b"></i><i style="background:#df8e1d"></i><i style="background:#1e66f5"></i><i style="background:#ea76cb"></i><i style="background:#179299"></i></div>
+            </div>
+            <!-- slot −1 · Gruvbox Dark -->
+            <div class="frame pal" style="--bg:#282828;--fg:#ebdbb2;--dot:8px;--dot-gap:4px;--dots-top:48px;--nm:11px;--name-bottom:24px;--pad-x:12px;left:110px;top:42px;width:146px;height:124px">
+              <div class="dots"><i style="background:#cc241d"></i><i style="background:#98971a"></i><i style="background:#d79921"></i><i style="background:#458588"></i><i style="background:#b16286"></i><i style="background:#689d6a"></i></div>
+              <div class="nm">Gruvbox Dark</div>
+            </div>
+            <!-- slot 0 · Nord, focused, and the one the desktop is wearing -->
+            <div class="frame pal on" style="--bg:#2e3440;--fg:#d8dee9;--accent:#88c0d0;--dot:12px;--dot-gap:8px;--dots-top:72px;--name-bottom:32px;--pad-x:16px;left:256px;top:16px;width:248px;height:176px">
+              <div class="dots"><i style="background:#bf616a"></i><i style="background:#a3be8c"></i><i style="background:#ebcb8b"></i><i style="background:#81a1c1"></i><i style="background:#b48ead"></i><i style="background:#88c0d0"></i></div>
+              <div class="nm">Nord</div>
+              <div class="live"></div>
+            </div>
+            <!-- slot +1 · Rosé Pine Dawn -->
+            <div class="frame pal" style="--bg:#faf4ed;--fg:#575279;--dot:8px;--dot-gap:4px;--dots-top:48px;--nm:11px;--name-bottom:24px;--pad-x:12px;left:504px;top:42px;width:146px;height:124px">
+              <div class="dots"><i style="background:#b4637a"></i><i style="background:#286983"></i><i style="background:#ea9d34"></i><i style="background:#d7827e"></i><i style="background:#907aa9"></i><i style="background:#56949f"></i></div>
+              <div class="nm">Rosé Pine Dawn</div>
+            </div>
+            <!-- slot +2 · Tokyo Night -->
+            <div class="frame pal" style="--bg:#1a1b26;--fg:#c0caf5;--dot:6px;--dot-gap:4px;--dots-top:32px;left:650px;top:58px;width:110px;height:92px">
+              <div class="dots"><i style="background:#f7768e"></i><i style="background:#9ece6a"></i><i style="background:#e0af68"></i><i style="background:#7aa2f7"></i><i style="background:#bb9af7"></i><i style="background:#7dcfff"></i></div>
+            </div>
+          </div>
+          <div class="foot"><span>←→ Browse · ↵ Apply · Esc Close</span><span class="count">4/6</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     8 · palette variants
+     ══════════════════════════════════════════════════════════════════════ -->
+<section>
+  <div class="sec-head">
+    <h2>Palette variants</h2>
+    <p>The same markup with four token overrides. This is the whole theming contract: a service
+       palette maps to surface / label / muted / accent / outline_variant and nothing else
+       changes. Rows re-tint themselves because the selection and panel washes are
+       <code>color-mix()</code> of <code>--accent</code>.</p>
+  </div>
+  <div class="grid">
+
+    <figure class="card">
+      <figcaption><b>Theme · Catppuccin Mocha</b><span>480 × 172</span></figcaption>
+      <div class="stage">
+        <div class="win" data-theme="mocha">
+          <div class="bar"><div class="field">s<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta"><div class="title">Search with Google</div><div class="sub">Web</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/12</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Theme · Gruvbox Dark</b><span>480 × 172</span></figcaption>
+      <div class="stage">
+        <div class="win" data-theme="gruvbox">
+          <div class="bar"><div class="field">s<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta"><div class="title">Search with Google</div><div class="sub">Web</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/12</span></div>
+        </div>
+      </div>
+    </figure>
+
+    <figure class="card">
+      <figcaption><b>Theme · Rosé Pine Dawn (light)</b><span>480 × 172</span></figcaption>
+      <div class="stage">
+        <div class="win" data-theme="dawn">
+          <div class="bar"><div class="field">s<span class="caret"></span></div></div>
+          <div class="body">
+            <div class="rows">
+              <div class="row sel">
+                <span class="ico tile" style="--t:#0a84ff">S</span>
+                <div class="meta"><div class="title">Safari</div></div>
+              </div>
+              <div class="row">
+                <span class="ico glyph">↗</span>
+                <div class="meta"><div class="title">Search with Google</div><div class="sub">Web</div></div>
+              </div>
+            </div>
+          </div>
+          <div class="foot"><span>↵ Open · ⌘K Actions · Esc Close</span><span class="count">1/12</span></div>
+        </div>
+      </div>
+    </figure>
+
+  </div>
+</section>
+
+
+<footer class="colophon">
+  <p><b>34 states, zero JavaScript.</b> Tokens live in <code>:root</code>; the derived row tints
+  are declared on <code>.win</code> so a <code>[data-theme]</code> override re-tints the whole
+  card. Geometry tokens (<code>--row-h</code>, <code>--icon</code>, <code>--preview-w</code>,
+  <code>--win-r</code>) are the GPUI constants verbatim, so a change here has one obvious
+  destination in <code>launcher.rs</code>.</p>
+  <p>Not modelled: live filtering, keyboard navigation, the Pill/QML frontend, and the web
+  preview iframe (<code>WEB_PREVIEW_HEIGHT = 560</code>). Everything else the launcher can draw
+  is on this page.</p>
+</footer>
+
+</body>
+</html>

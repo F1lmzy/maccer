@@ -335,7 +335,14 @@ fn facade_surfaces_confirmation_and_requires_activate_confirmed() {
 
     // Confirmed invocation executes exactly once.
     connection
-        .activate_confirmed(3, 1, "confirming".into(), "one".into(), "apply".into())
+        .activate_confirmed(
+            3,
+            1,
+            "confirming".into(),
+            "one".into(),
+            "apply".into(),
+            Default::default(),
+        )
         .unwrap();
     let outcome = wait_for(&connection, "outcome");
     assert_eq!(outcome["request"], 3);

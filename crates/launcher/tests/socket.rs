@@ -75,6 +75,7 @@ fn two_clients_share_backend_but_not_views_or_actions() {
         action_ref: theme.actions[0].action_ref.clone(),
         operation_id: "navigate-themes".into(),
         confirmed: false,
+        input: Default::default(),
     };
     let other_home = qml.open_view(Route::Home, "", 20).unwrap();
     let forged = InvokeActionParams {

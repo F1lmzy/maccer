@@ -99,6 +99,8 @@ pub struct ProvidersConfig {
     pub clipboard: ProviderConfig,
     /// Shared-service read-only theme browsing; ignored by embedded frontends.
     pub themes: ProviderConfig,
+    /// Shared-service wallpaper picker; explicit scope only.
+    pub wallpapers: ProviderConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -106,6 +108,14 @@ pub struct ProvidersConfig {
 pub struct WebConfig {
     pub default_engine: String,
     pub engines: Vec<WebEngine>,
+    /// Open a web result in the native panel instead of the default browser.
+    pub inline_preview: bool,
+    /// Start WebKit while a web result is listed, so Enter does not pay
+    /// process start-up. Ignored when `inline_preview` is false.
+    pub prewarm: bool,
+    /// Seconds a hidden page is kept before its document is released. Zero
+    /// keeps the document until maccer exits.
+    pub idle_release_seconds: u64,
 }
 
 /// Application catalog discovery settings. The system application roots are
@@ -266,6 +276,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             shell: ProviderOverrides,
             clipboard: ProviderOverrides,
             themes: ProviderOverrides,
+            wallpapers: ProviderOverrides,
         }
         let raw = Raw::deserialize(deserializer)?;
         let defaults = ProvidersConfig::default();
@@ -277,6 +288,7 @@ impl<'de> Deserialize<'de> for ProvidersConfig {
             shell: raw.shell.apply(defaults.shell),
             clipboard: raw.clipboard.apply(defaults.clipboard),
             themes: raw.themes.apply(defaults.themes),
+            wallpapers: raw.wallpapers.apply(defaults.wallpapers),
         })
     }
 }
@@ -335,6 +347,14 @@ impl Default for ProvidersConfig {
                 default_search: true,
                 max_results: 50,
             },
+            wallpapers: ProviderConfig {
+                enabled: true,
+                prefix: Some("/walls".into()),
+                priority: 40,
+                // A picker is browsed, never mixed into ordinary search.
+                default_search: false,
+                max_results: 50,
+            },
             web: ProviderConfig {
                 enabled: true,
                 prefix: Some("?".into()),
@@ -350,6 +370,9 @@ impl Default for WebConfig {
         Self {
             default_engine: "google".into(),
             engines: WebProvider::default_engines(),
+            inline_preview: true,
+            prewarm: true,
+            idle_release_seconds: 300,
         }
     }
 }
@@ -402,6 +425,9 @@ impl Config {
         if !(1..=50).contains(&self.launcher.max_results) {
             bail!("launcher.max_results must be between 1 and 50");
         }
+        if self.web.idle_release_seconds > 86_400 {
+            bail!("web.idle_release_seconds must be at most 86400 (24 hours)");
+        }
         let providers = [
             ("apps", &self.providers.apps),
             ("calculator", &self.providers.calculator),
@@ -410,6 +436,7 @@ impl Config {
             ("shell", &self.providers.shell),
             ("clipboard", &self.providers.clipboard),
             ("themes", &self.providers.themes),
+            ("wallpapers", &self.providers.wallpapers),
         ];
         for (name, provider) in providers.iter().copied() {
             if !(1..=100).contains(&provider.max_results) {
@@ -469,6 +496,33 @@ pub fn history_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_preview_defaults_are_inline_prewarmed_and_released_after_five_minutes() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.web.inline_preview);
+        assert!(config.web.prewarm);
+        assert_eq!(config.web.idle_release_seconds, 300);
+
+        let parsed: Config = toml::from_str(
+            "[web]\ninline_preview = false\nprewarm = false\nidle_release_seconds = 0\n",
+        )
+        .unwrap();
+        assert!(!parsed.web.inline_preview);
+        assert!(!parsed.web.prewarm);
+        assert_eq!(parsed.web.idle_release_seconds, 0);
+        assert_eq!(parsed.web.default_engine, "google");
+        assert_eq!(parsed.web.engines, WebProvider::default_engines());
+    }
+
+    #[test]
+    fn web_preview_idle_release_is_bounded() {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.web.idle_release_seconds = 86_401;
+        assert!(config.validate().is_err());
+        config.web.idle_release_seconds = 86_400;
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn check_rejects_invalid_custom_commands_before_starting_the_app() {
@@ -669,6 +723,32 @@ mod tests {
         let invalid: Config = toml::from_str("[providers.themes]\nmax_results = 0\n").unwrap();
         assert!(invalid.validate().is_err());
         let duplicate: Config = toml::from_str("[providers.themes]\nprefix = '/apps'\n").unwrap();
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn wallpaper_picker_defaults_to_an_explicit_scope_only() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.providers.wallpapers.prefix.as_deref(),
+            Some("/walls")
+        );
+        assert!(defaults.providers.wallpapers.enabled);
+        assert!(
+            !defaults.providers.wallpapers.default_search,
+            "a picker must never join mixed search"
+        );
+        defaults.validate().unwrap();
+        let configured: Config =
+            toml::from_str("[providers.wallpapers]\nenabled = false\n").unwrap();
+        assert!(!configured.providers.wallpapers.enabled);
+        assert_eq!(
+            configured.providers.wallpapers.prefix,
+            defaults.providers.wallpapers.prefix
+        );
+        // Sharing a prefix with another provider stays an error.
+        let duplicate: Config =
+            toml::from_str("[providers.wallpapers]\nprefix = '/themes'\n").unwrap();
         assert!(duplicate.validate().is_err());
     }
 

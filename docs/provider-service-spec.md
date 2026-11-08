@@ -24,6 +24,12 @@ Public objects include provider descriptors, routes, snapshots, result items, co
 | 3 | `state.theme`, negotiated `themeState`, independent of view generations |
 | 4 | Optional action confirmation prompt, explicit `confirmed` consent and `actionConfirmation` |
 | 5 | `frontend.poll`, negotiated `frontendControl` |
+| 6 | `themeWallpapers` capability; each theme's wallpapers in `themeSummary`, applied by the existing confirmed Apply |
+| 7 | Wallpapers provider, `previewAssetsBgra8` capability and the `previewBgra8` asset representation, `filmstrip` section layout hint |
+| 7 | Optional `webLink` domain data carrying a provider-validated URL for a frontend-rendered web preview |
+| 8 | `themes.install` and `themes.uninstall`, negotiated `themeInstall` |
+| 9 | Provider-published action `input` field, collected by the frontend and returned on `actions.invoke` |
+| 10 | `viewSnapshot.scopeActions`: provider-published commands for the whole scope, invoked with their own `actionRef` |
 
 Capabilities identify what is implemented. Clients must not assume optional operations exist. Unknown optional fields are additive. Ordinary actions omit false consent fields for compatibility with older strict decoders. Streaming, generic state subscriptions and durable operation lookup/cancellation are not implemented.
 
@@ -49,6 +55,10 @@ Clipboard management's internal `RefreshSearch` maps to a same-query `SetQuery` 
 
 Negotiated icon retrieval returns correlated JSON metadata followed by a separate binary frame. Icons are straight-alpha, top-to-bottom, tightly packed BGRA8, at most 64x64 and 16,384 bytes. A session may retrieve only assets advertised in its current view. Search results never embed full image bytes. QML alone turns opaque resource IDs into `image://` URLs.
 
+A second size class carries wallpaper thumbnails: `previewBgra8` is straight-alpha BGRA8 at most 384 on each edge, within a 640 KiB frame, and is authorized by the `previewAssetsBgra8` capability. Each asset reference advertises exactly one representation, so a caller cannot ask the 64px icon slot for 512px pixels or the reverse; the service rejects a mismatch with `UNSUPPORTED_REPRESENTATION`. Both size classes use the same lazy store, which resolves pixels on first request and caches them per (path, revision).
+
+Section `layoutHint` values are `list` (default) and `filmstrip`. The hint describes the published snapshot only; a client that does not understand it must render a list.
+
 Lazy details support bounded text, values, metadata, palettes and small cached images. Unknown blocks render their fallback text. Expired assets permit one explicit read-only view refresh with a fresh request ID, never an action retry. Large service previews and additional image formats remain unfinished. Local icon caches are bounded and may evict tokens.
 
 ## Native presentation and process lifecycle
@@ -69,11 +79,29 @@ Clipboard capture runs on the backend's main-thread timer independently of front
 
 mac-themer remains authoritative for palette derivation and desktop effects. The backend watches the state directory, reads bounded `current.json`, periodically reconciles and retains last-good colors. Theme state updates are independent of search revisions. Each frontend maps the same validated semantic palette to its own color types. Preview selection never installs an active palette.
 
-Catalog loading uses `catalog --json`, bounded to 128 path-free schema-1 resolved palettes, with a three-second process deadline and two-MiB output limit. Failures retain last-good entries but invalidate obsolete detail/action authority. Read-only constructors authorize no Apply action; live construction supplies a shared single-flight executor.
+Catalog loading uses `catalog --json`, bounded to 128 path-free schema-1 resolved palettes, with a three-second process deadline and two-MiB output limit. The same document carries a per-pack `wallpapers` map of filenames; identities are validated (no separator, no control byte, 128-byte cap), capped at 64 per pack and must name a published pack. Failures retain last-good entries but invalidate obsolete detail/action authority. Read-only constructors authorize no Apply action; live construction supplies a shared single-flight executor.
 
-Apply invokes `apply SLUG --expected-palette JSON --json` using the same helper/root, an exact slug, a private catalog-revision pin and fresh expected-palette validation. It has a 30-second deadline, 64 KiB output cap and no automatic retry. It leaves wallpaper unchanged and reports possible partial effects rather than claiming rollback. Applied state reconciles independently of the action result.
+Apply invokes `apply SLUG --expected-palette JSON [--background ID] --json` using the same helper/root, an exact slug, a private catalog-revision pin and fresh expected-palette validation. The wallpaper identity comes from the service's own snapshot and is rechecked before it becomes an argument. It has a 30-second deadline, 64 KiB output cap and no automatic retry. The reply must name the exact wallpaper that was requested, otherwise it is a partial failure; a `wallpaperFailed` warning leaves the palette applied and reports the picture separately. Partial effects are reported rather than claimed as rollback. Applied state reconciles independently of the action result.
 
-Apply is not transactional. Concurrent theme-pack replacement after validation remains a producer write-boundary risk; external tools and other daemon instances do not share an execution lock. A helper may outlive a daemon crash, and its timeout requires a living supervisor. Wallpaper catalogs, per-display wallpaper operations and native desktop Apply acceptance are unfinished.
+Theme acquisition needs a value no retained action can carry: a repository URL, or one of the installed packs. An action descriptor may therefore publish an `input` field — `{id, kind, title, label, placeholder?, submitLabel, options?}` — where `kind` is `text` or `select`, the provider writes every word, and `options` is the provider's own list. The frontend draws that dialog, collects one value, and sends it back as `input` (a bounded map of field id to value) on `actions.invoke`; a dialog with no field is an ordinary action. The service validates the bounds and the provider revalidates the value, exactly as it does for a wallpaper identity. An option that needs no consent carries none; one that does carries the existing `confirmation` prompt, and the collected value is staged with the consent so it cannot be sent before the prompt has been shown.
+
+A command that belongs to a whole scope rather than to one row is published as a scope action. `viewSnapshot.scopeActions` carries `{providerId, id, actionId, actionRef, title, confirmation?, input?}`: the same field and confirmation a row action carries, its own `actionRef`, and a subject identity (`id`) instead of a row. It is invoked through `actions.invoke` exactly like a row action and revalidated the same way. Only an explicit provider route publishes scope actions — a mixed home search has no single page whose commands they would be.
+
+The Themes scope publishes its two acquisition commands this way: "Install a theme from GitHub…" with a `text` field named `url`, and "Uninstall a theme…" with a `select` field named `slug` whose choices are the catalog's own packs, plus a confirmation prompt. They never appear as rows, so a strip of palettes stays a strip of palettes; the frontend lists them in its action panel beside the selected row's own actions, and a frontend that has no row selected (an empty collection) can still open that panel. The provider runs the same executor and the same catalog reload as the two RPC methods below. A read-only service publishes neither command.
+
+Acquisition is also available without a scope row: `themes.install` takes a whole `https://github.com/<owner>/<repo>` URL plus optional `all` (a collection repository) and `force` (replace a pack the producer did not install itself); `themes.uninstall` takes one exact catalog slug. The service revalidates both, refuses anything but one GitHub repository over https before a helper runs, and passes them as fixed arguments to `theme-install URL [--ALL] [--FORCE] --json` and `theme-uninstall SLUG --json`.
+
+Install has a 120-second deadline, removal 30 seconds, and both share a 64 KiB output cap and one single-flight lock. A reply must be schema 1 with the exact status, a bounded list of valid, distinct slugs and names, exactly one pack unless `all` was asked for, and — for a removal — the exact slug that was requested; anything else is a failure. The result is a summary (slug, name, wallpaper count, whether a pack was replaced), never a path, and the producer's stderr is never forwarded. A failed install may have fetched a repository, so its message says a theme may be partly installed instead of claiming nothing happened. The catalog is reloaded before the reply, so the pack is searchable immediately rather than up to one refresh interval later. Installing is not an action: it has no operation table, no confirmation prompt and no automatic retry, and the frontend is responsible for confirming the removal it offers.
+
+Apply is not transactional. Concurrent theme-pack replacement after validation remains a producer write-boundary risk; external tools and other daemon instances do not share an execution lock. A pack is replaced by rename, so Apply either reads the pack it validated or fails its own palette recheck. A helper may outlive a daemon crash, and its timeout requires a living supervisor. Picking a wallpaper other than the theme's first, per-display wallpaper operations and native desktop Apply acceptance are unfinished.
+
+## Wallpapers
+
+A wallpaper is published as one result per image the *active* theme ships, with the pack slug, the wallpaper identity and a `wallpaperSummary` domain record; the active theme is read from the same `current.json` reader that publishes theme state, and the provider revision mixes in its slug so a theme switch re-searches the strip. Without an active theme every pack is listed. Results are explicit-scope only and stay in catalog order: the shared ranker sorts by score with a positional tiebreak, so the positional term is what keeps the strip's order stable while a typed query narrows it.
+
+The service resolves `<themes>/<slug>/backgrounds/<id>` itself, using the same override chain as mac-themer's `paths.py`, and refuses any identity whose resolved file leaves that directory. The private path is used only to produce a preview asset; it never enters the protocol. Wallpaper identities are the ones the catalog published, so a caller still cannot name a path.
+
+Set invokes `wallpaper SLUG --id ID --json` through the shared single-flight executor with a 30-second deadline and 64 KiB output cap. It writes no theme file and no application setting, so it carries no confirmation prompt; the reply must name exactly the requested theme and wallpaper, and a `wallpaperFailed` warning is reported as a desktop-picture failure rather than a rejected identity. There is no rollback of a picture that did change.
 
 ## Testing boundaries
 

@@ -52,7 +52,7 @@
             "subtitle": "Dark theme",
             "icon": {"type": "glyph", "name": "palette", "fallbackText": "T"},
             "content": [{"type": "colorPalette", "colors": [{"role": "background", "value": "#1e1e2e"}, {"role": "accent", "value": "#cba6f7"}], "fallbackText": "Dark theme with a purple accent"}],
-            "data": {"type": "themeSummary", "schemaVersion": 1, "slug": "catppuccin", "variant": "dark"},
+            "data": {"type": "themeSummary", "schemaVersion": 1, "slug": "catppuccin", "variant": "dark", "wallpapers": [{"id": "1-totoro.webp", "label": "Totoro"}, {"id": "2-waves.webp", "label": "Waves"}], "card": {"background": "#1e1e2e", "foreground": "#cdd6f4", "accent": "#cba6f7", "swatches": ["#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5"], "applied": true}},
             "actions": [{"id": "apply", "actionRef": "ref-theme-apply", "title": "Apply theme", "isPrimary": true, "kind": "invoke", "confirmation": "Apply Catppuccin? It changes the desktop theme."}],
             "detailsAvailable": true
           },

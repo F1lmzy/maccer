@@ -7,7 +7,7 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill,
-    point, prelude::*, px, relative, rgba, size,
+    point, prelude::*, px, relative, size,
 };
 
 use crate::ui::theme::Theme;
@@ -36,6 +36,9 @@ gpui::actions!(
 #[derive(Clone, Debug)]
 pub(crate) enum SearchInputEvent {
     Changed(String),
+    /// The strip owns the arrow keys, so the caret hands a left/right press
+    /// to the launcher instead of moving through the text.
+    Navigate(isize),
 }
 
 pub(crate) struct SearchInput {
@@ -52,6 +55,9 @@ pub(crate) struct SearchInput {
     /// Palette owned by this input's window. Defaults to the embedded theme so
     /// a launcher without service state keeps its current appearance.
     theme: Theme,
+    /// True while the launcher shows the wallpaper strip. The strip owns the
+    /// arrow keys there, so this input stops claiming them for the caret.
+    filmstrip: bool,
 }
 
 pub(crate) fn bind_keys(cx: &mut App) {
@@ -92,6 +98,7 @@ impl SearchInput {
             horizontal_offset: px(0.),
             events,
             theme: crate::ui::theme::theme(),
+            filmstrip: false,
         }
     }
 
@@ -104,10 +111,24 @@ impl SearchInput {
         }
     }
 
+    /// Hand the arrow keys to the wallpaper strip (or take them back).
+    pub(crate) fn set_filmstrip(&mut self, filmstrip: bool, cx: &mut Context<Self>) {
+        if self.filmstrip != filmstrip {
+            self.filmstrip = filmstrip;
+            cx.notify();
+        }
+    }
+
     /// Test-only view of the palette this input paints with.
     #[cfg(test)]
     pub(crate) fn theme_matches(&self, theme: &Theme) -> bool {
         self.theme == *theme
+    }
+
+    /// The text this input currently holds. The provider dialog reads it on
+    /// submit; nothing else depends on the caret or the selection.
+    pub(crate) fn text(&self) -> String {
+        self.content.to_string()
     }
 
     pub(crate) fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
@@ -174,6 +195,10 @@ impl SearchInput {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filmstrip {
+            let _ = self.events.try_send(SearchInputEvent::Navigate(-1));
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -181,6 +206,10 @@ impl SearchInput {
         }
     }
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.filmstrip {
+            let _ = self.events.try_send(SearchInputEvent::Navigate(1));
+            return;
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.cursor_offset()), cx);
         } else {
@@ -532,7 +561,7 @@ impl Element for SearchInputElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x336c7fb8),
+                    self.theme.text_selection(),
                 )),
             )
         };
@@ -598,7 +627,13 @@ impl Focusable for SearchInput {
 impl Render for SearchInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .key_context("Launcher")
+            // A deeper context than the launcher's own so the strip's
+            // left/right bindings win while it is on screen.
+            .key_context(if self.filmstrip {
+                "Filmstrip"
+            } else {
+                "Launcher"
+            })
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -623,10 +658,9 @@ impl Render for SearchInput {
             .text_size(px(16.))
             .child(
                 div()
-                    .h(px(30.))
+                    .h(px(28.))
                     .w_full()
                     .overflow_x_hidden()
-                    .px_1()
                     .child(SearchInputElement {
                         input: cx.entity(),
                         theme: self.theme.clone(),

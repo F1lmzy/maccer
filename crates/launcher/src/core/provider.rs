@@ -118,6 +118,23 @@ pub trait Provider: Send + Sync {
     fn search(&self, query: &SearchQuery, ctx: &SearchContext) -> Result<Vec<Item>>;
     fn actions(&self, item: &Item) -> Vec<Action>;
     fn activate(&self, item: &Item, action: &Action) -> Result<ActionOutcome>;
+    /// Act on an action that published an input field, with the values the
+    /// user supplied keyed by that field's id.
+    ///
+    /// The default refuses input outright: a provider that publishes no field
+    /// cannot be reached with a value it never asked for. Guards first, so an
+    /// action that needs no input still refuses one.
+    fn activate_with_input(
+        &self,
+        item: &Item,
+        action: &Action,
+        input: &std::collections::BTreeMap<String, String>,
+    ) -> Result<ActionOutcome> {
+        if !input.is_empty() {
+            bail!("this action does not take input");
+        }
+        self.activate(item, action)
+    }
     /// Long-running actions should override this and cooperate with cancellation.
     fn activate_with_cancellation(
         &self,

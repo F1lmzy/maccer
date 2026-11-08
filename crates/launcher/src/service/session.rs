@@ -92,63 +92,70 @@ impl Session {
     }
     fn asset_response(&mut self, request: RpcRequest) -> (RpcResponse, Option<Vec<u8>>) {
         let id = request.id.clone();
-        let result = (|| {
-            if !self.hello {
-                return Err(err(
-                    -32001,
-                    "HELLO_REQUIRED",
-                    "hello must be the first request",
-                ));
-            }
-            let params: GetAssetParams = parse(request.params)?;
-            if params.representation != "bgra8" {
-                return Err(err(
-                    -32602,
-                    "UNSUPPORTED_REPRESENTATION",
-                    "only bgra8 is supported",
-                ));
-            }
-            if self.view.is_none() {
-                return Err(err(-32004, "VIEW_NOT_FOUND", "no active view"));
-            }
-            let (provider_id, provider_revision) = self
-                .asset_grants
-                .get(&(params.asset_id.clone(), params.revision.clone()))
-                .ok_or_else(|| {
-                    err(
+        let result =
+            (|| {
+                if !self.hello {
+                    return Err(err(
+                        -32001,
+                        "HELLO_REQUIRED",
+                        "hello must be the first request",
+                    ));
+                }
+                let params: GetAssetParams = parse(request.params)?;
+                if AssetLimits::for_representation(&params.representation).is_none() {
+                    return Err(err(
+                        -32602,
+                        "UNSUPPORTED_REPRESENTATION",
+                        "only bgra8 and previewBgra8 are supported",
+                    ));
+                }
+                if self.view.is_none() {
+                    return Err(err(-32004, "VIEW_NOT_FOUND", "no active view"));
+                }
+                let (provider_id, provider_revision) = self
+                    .asset_grants
+                    .get(&(params.asset_id.clone(), params.revision.clone()))
+                    .ok_or_else(|| {
+                        err(
+                            -32009,
+                            "ASSET_NOT_AUTHORIZED",
+                            "asset was not advertised in the current view",
+                        )
+                    })?;
+                let provider =
+                    self.service.registry.get(provider_id).ok_or_else(|| {
+                        err(-32009, "ASSET_EXPIRED", "asset provider is unavailable")
+                    })?;
+                if provider.revision() != *provider_revision {
+                    return Err(err(
                         -32009,
-                        "ASSET_NOT_AUTHORIZED",
-                        "asset was not advertised in the current view",
-                    )
-                })?;
-            let provider = self
-                .service
-                .registry
-                .get(provider_id)
-                .ok_or_else(|| err(-32009, "ASSET_EXPIRED", "asset provider is unavailable"))?;
-            if provider.revision() != *provider_revision {
-                return Err(err(
-                    -32009,
-                    "ASSET_EXPIRED",
-                    "provider data changed after the asset was advertised",
-                ));
-            }
-            let store =
-                self.service.assets.as_ref().ok_or_else(|| {
+                        "ASSET_EXPIRED",
+                        "provider data changed after the asset was advertised",
+                    ));
+                }
+                let store = self.service.assets.as_ref().ok_or_else(|| {
                     err(-32601, "METHOD_NOT_FOUND", "asset transfer is unavailable")
                 })?;
-            let (metadata, bytes) = store.get(&params.asset_id, &params.revision).map_err(|e| {
-                let text = e.to_string();
-                if text == "ASSET_EXPIRED" {
-                    err(-32009, "ASSET_EXPIRED", "asset reference expired")
-                } else if text == "ASSET_UNAVAILABLE" {
-                    err(-32004, "ASSET_UNAVAILABLE", "asset could not be resolved")
-                } else {
-                    err(-32603, "ASSET_FAILED", "asset resolution failed")
-                }
-            })?;
-            Ok((serde_json::to_value(metadata).map_err(internal)?, bytes))
-        })();
+                let (metadata, bytes) = store
+                    .get(&params.asset_id, &params.revision, &params.representation)
+                    .map_err(|e| {
+                        let text = e.to_string();
+                        if text == "ASSET_EXPIRED" {
+                            err(-32009, "ASSET_EXPIRED", "asset reference expired")
+                        } else if text == "ASSET_UNAVAILABLE" {
+                            err(-32004, "ASSET_UNAVAILABLE", "asset could not be resolved")
+                        } else if text == "ASSET_UNSUPPORTED_REPRESENTATION" {
+                            err(
+                                -32602,
+                                "UNSUPPORTED_REPRESENTATION",
+                                "asset does not carry that representation",
+                            )
+                        } else {
+                            err(-32603, "ASSET_FAILED", "asset resolution failed")
+                        }
+                    })?;
+                Ok((serde_json::to_value(metadata).map_err(internal)?, bytes))
+            })();
         match result {
             Ok((metadata, bytes)) => (RpcResponse::success(id, metadata), Some(bytes)),
             Err(error) => (RpcResponse::failure(id, error), None),
@@ -182,9 +189,18 @@ impl Session {
                 let mut h = crate::service::hello(&self.service.instance_id, &self.id, p)?;
                 if self.service.assets.is_some() {
                     h.capabilities.push("iconAssetsBgra8".into());
+                    h.capabilities.push("previewAssetsBgra8".into());
                 }
                 if self.service.theme.is_some() {
                     h.capabilities.push("themeState".into());
+                    // The theme provider publishes each pack's wallpapers with
+                    // the palette it applies, so Apply can change both.
+                    h.capabilities.push("themeWallpapers".into());
+                }
+                if self.service.theme_install.get().is_some() {
+                    // Installing and removing packs is a mutation outside the
+                    // action table: it needs a URL, which no action carries.
+                    h.capabilities.push("themeInstall".into());
                 }
                 if self.service.frontend.get().is_some() {
                     h.capabilities.push("frontendControl".into());
@@ -291,6 +307,34 @@ impl Session {
                         err(-32601, "METHOD_NOT_FOUND", "theme state is unavailable")
                     })?;
                 serde_json::to_value(theme.snapshot()).map_err(internal)
+            }
+            "themes.install" => {
+                let params: ThemeInstallParams = parse(request.params)?;
+                let install = self.service.theme_install.get().ok_or_else(|| {
+                    err(
+                        -32601,
+                        "METHOD_NOT_FOUND",
+                        "theme installation is not configured",
+                    )
+                })?;
+                let result = install
+                    .install(&params.url, params.all, params.force)
+                    .map_err(|error| err(-32000, "THEME_INSTALL_FAILED", error.to_string()))?;
+                serde_json::to_value(result).map_err(internal)
+            }
+            "themes.uninstall" => {
+                let params: ThemeUninstallParams = parse(request.params)?;
+                let install = self.service.theme_install.get().ok_or_else(|| {
+                    err(
+                        -32601,
+                        "METHOD_NOT_FOUND",
+                        "theme installation is not configured",
+                    )
+                })?;
+                let result = install
+                    .uninstall(&params.slug)
+                    .map_err(|error| err(-32000, "THEME_UNINSTALL_FAILED", error.to_string()))?;
+                serde_json::to_value(result).map_err(internal)
             }
             _ => Err(err(-32601, "METHOD_NOT_FOUND", "method is not available")),
         }
@@ -412,9 +456,11 @@ impl Session {
         let query = view.query.clone();
         let limit = view.limit;
         let mut sections = Vec::new();
+        let mut scope_actions = Vec::new();
         let mut errors = Vec::new();
         let mut truncated = false;
         if route == Route::Home {
+            let browsing = query.trim().is_empty();
             let mut menu_items = Vec::new();
             for reg in self.service.providers.iter().filter(|r| r.config.enabled) {
                 let id = reg.provider.id().0;
@@ -424,12 +470,19 @@ impl Session {
                 if let Some(score) =
                     menu::score(&query, &format!("{name} {description} {kind} {id}"))
                 {
+                    let direct = !browsing && menu::direct_match(&query, &name, &kind, &id);
                     let item = menu::menu_item(&id, &name, &description);
-                    menu_items.push((score, reg.config.priority, item, kind));
+                    menu_items.push((score, reg.config.priority, item, kind, direct));
                 }
             }
+            // Naming a provider narrows the menu to that provider. Every other
+            // match came from prose, so it must not outrank real search results.
+            let direct = menu_items.iter().any(|entry| entry.4);
+            if direct {
+                menu_items.retain(|entry| entry.4);
+            }
             menu_items.sort_by(|a, b| {
-                if query.trim().is_empty() {
+                if browsing {
                     b.1.cmp(&a.1).then_with(|| a.2.title.cmp(&b.2.title))
                 } else {
                     a.0.cmp(&b.0)
@@ -437,10 +490,10 @@ impl Session {
                         .then_with(|| a.2.title.cmp(&b.2.title))
                 }
             });
-            truncated = menu_items.len() > limit;
+            let menu_len = menu_items.len();
             let selected: Vec<_> = menu_items.into_iter().take(limit).collect();
             let mut items = Vec::new();
-            for (_, _, item, kind) in selected {
+            for (_, _, item, kind, _) in selected {
                 let provider_id = item.id.0.clone();
                 items.push(self.project_item(
                     item,
@@ -450,22 +503,49 @@ impl Session {
                     Some(Route::Provider { provider_id }),
                 )?)
             }
-            if !items.is_empty() {
-                sections.push(Section {
-                    id: "providers".into(),
-                    title: "Providers".into(),
-                    layout_hint: Some("list".into()),
-                    items,
-                })
-            }
-            if !query.trim().is_empty() {
-                let remaining = limit.saturating_sub(sections.iter().map(|s| s.items.len()).sum());
+            let menu = (!items.is_empty()).then(|| Section {
+                id: "providers".into(),
+                title: "Providers".into(),
+                layout_hint: Some("list".into()),
+                items,
+            });
+
+            if browsing {
+                if let Some(section) = menu {
+                    truncated |= menu_len > limit;
+                    sections.push(section);
+                }
+            } else {
+                let remaining = if direct {
+                    limit.saturating_sub(menu.as_ref().map_or(0, |section| section.items.len()))
+                } else {
+                    limit
+                };
                 let snapshot =
                     self.search(&view_id, &revision, Route::Home, query.clone(), remaining)?;
+                let mut results = Vec::new();
                 if let Some(s) = snapshot {
                     truncated |= s.truncated;
                     errors.extend(s.errors);
-                    sections.extend(s.sections.into_iter().filter(|s| s.id == "results"));
+                    results = s
+                        .sections
+                        .into_iter()
+                        .filter(|section| section.id == "results")
+                        .collect();
+                }
+                if direct {
+                    if let Some(section) = menu {
+                        truncated |= menu_len > limit;
+                        sections.push(section);
+                    }
+                    sections.extend(results);
+                } else if results.iter().any(|section| !section.items.is_empty()) {
+                    // A weak provider match loses to real results.
+                    sections.extend(results);
+                } else if let Some(section) = menu {
+                    // Nothing else matched, so keep fuzzy provider navigation.
+                    truncated |= menu_len > limit;
+                    sections.push(section);
                 }
             }
         } else {
@@ -474,6 +554,7 @@ impl Session {
                 truncated = s.truncated;
                 errors = s.errors;
                 sections = s.sections;
+                scope_actions = s.scope_actions;
             }
         }
         Ok(ViewSnapshot {
@@ -482,6 +563,7 @@ impl Session {
             route,
             query,
             sections,
+            scope_actions,
             complete: true,
             truncated,
             errors,
@@ -530,6 +612,19 @@ impl Session {
         let truncated = update.items.len() > limit;
         let mut ranked = update.items;
         ranked.truncate(limit);
+        // A browse surface owns the shape of its results, and the frontend can
+        // reach it by prefix on the home route as well as through a provider
+        // route. Decide from the items themselves so both paths agree. The
+        // wallpaper picker and the theme picker are strips; a theme strip draws
+        // palette cards instead of images.
+        let filmstrip = !ranked.is_empty()
+            && ranked.iter().all(|item| {
+                self.service.providers.iter().any(|registration| {
+                    registration.provider.id() == item.provider
+                        && matches!(registration.provider.kind(), "wallpaper" | "theme")
+                })
+            });
+        let layout_hint = if filmstrip { "filmstrip" } else { "list" };
         for item in ranked {
             let Some(reg) = self
                 .service
@@ -560,9 +655,17 @@ impl Session {
             vec![Section {
                 id: "results".into(),
                 title: "Results".into(),
-                layout_hint: Some("list".into()),
+                layout_hint: Some(layout_hint.to_owned()),
                 items,
             }]
+        };
+        // Only an explicit scope owns commands: a mixed home search has no one
+        // provider whose page a command would belong to.
+        let scope_actions = match &route {
+            Route::Provider { provider_id } => {
+                self.scope_actions(view_id, revision, provider_id)?
+            }
+            Route::Home => Vec::new(),
         };
         Ok(Some(ViewSnapshot {
             view_id: view_id.into(),
@@ -570,10 +673,94 @@ impl Session {
             route,
             query,
             sections,
+            scope_actions,
             complete: update.complete,
             truncated,
             errors,
         }))
+    }
+    /// Commands a provider publishes for its whole scope, authorized the same
+    /// way its results are: the provider decides which ones exist, what they
+    /// are called, whether one needs a value and whether it needs consent.
+    fn scope_actions(
+        &mut self,
+        view_id: &str,
+        revision: &str,
+        provider_id: &str,
+    ) -> Result<Vec<ScopeAction>, RpcError> {
+        let Some(registration) = self
+            .service
+            .providers
+            .iter()
+            .find(|r| r.config.enabled && r.provider.id().0 == provider_id)
+        else {
+            return Ok(Vec::new());
+        };
+        let provider = registration.provider.clone();
+        let commands =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.scope_actions()))
+                .map_err(|_| err(-32603, "PROVIDER_PANIC", "provider scope actions panicked"))?;
+        let mut published = Vec::new();
+        for item in commands {
+            let source =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.actions(&item)))
+                    .map_err(|_| {
+                        err(-32603, "PROVIDER_PANIC", "provider action listing panicked")
+                    })?;
+            for action in source {
+                let (confirmation, input) = self.action_meta(Some(&provider), &item, &action)?;
+                let action_ref = self.issue_action(
+                    view_id,
+                    revision,
+                    item.clone(),
+                    action.clone(),
+                    None,
+                    confirmation.is_some(),
+                );
+                published.push(ScopeAction {
+                    provider_id: item.provider.0.clone(),
+                    id: item.id.0.clone(),
+                    action_id: action.id.0,
+                    action_ref,
+                    title: action.title,
+                    confirmation,
+                    input,
+                });
+            }
+        }
+        Ok(published)
+    }
+    /// The provider-authored prompt and field an action carries, validated so a
+    /// frontend never draws a broken dialog.
+    fn action_meta(
+        &self,
+        provider: Option<&Arc<dyn crate::service::ServiceProvider>>,
+        item: &Item,
+        action: &Action,
+    ) -> Result<(Option<String>, Option<ActionInput>), RpcError> {
+        let confirmation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.and_then(|p| p.action_confirmation(item, action))
+        }))
+        .map_err(|_| {
+            err(
+                -32603,
+                "PROVIDER_PANIC",
+                "provider confirmation lookup panicked",
+            )
+        })?;
+        // A field the producer publishes is part of the display contract, so an
+        // unusable one fails the snapshot instead of reaching a frontend that
+        // would draw a broken dialog.
+        let input = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.and_then(|p| p.action_input(item, action))
+        }))
+        .map_err(|_| err(-32603, "PROVIDER_PANIC", "provider input lookup panicked"))?;
+        if let Some(input) = &input {
+            input
+                .validate()
+                .map_err(|_| err(-32603, "PROVIDER_INVALID", "provider input is invalid"))?;
+        }
+        Ok((confirmation, input))
     }
     fn project_item(
         &mut self,
@@ -603,6 +790,7 @@ impl Session {
                 is_primary: true,
                 kind: "navigate".into(),
                 confirmation: None,
+                input: None,
             }]
         } else {
             let Some(provider) = self.service.registry.get(&item.provider) else {
@@ -625,18 +813,8 @@ impl Session {
                 .find(|r| r.config.enabled && r.provider.id() == item.provider)
                 .map(|r| r.provider.clone());
             for action in source {
-                let confirmation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    service_provider
-                        .as_ref()
-                        .and_then(|p| p.action_confirmation(&item, &action))
-                }))
-                .map_err(|_| {
-                    err(
-                        -32603,
-                        "PROVIDER_PANIC",
-                        "provider confirmation lookup panicked",
-                    )
-                })?;
+                let (confirmation, input) =
+                    self.action_meta(service_provider.as_ref(), &item, &action)?;
                 let id = self.issue_action(
                     view_id,
                     revision,
@@ -652,6 +830,7 @@ impl Session {
                     is_primary: actions.is_empty(),
                     kind: "invoke".into(),
                     confirmation,
+                    input,
                 })
             }
             actions
@@ -892,8 +1071,14 @@ impl Session {
                     "this action requires explicit confirmation",
                 ));
             }
+            // The values a frontend collected for a published field are
+            // bounded here and revalidated by the provider, exactly like the
+            // wallpaper identity on Apply.
+            if let Err(message) = crate::protocol::validate_action_input(&p.input) {
+                return Err(err(-32602, "INVALID_ACTION_INPUT", message));
+            }
             let activation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                provider.activate(&reference.item, &reference.action)
+                provider.activate_with_input(&reference.item, &reference.action, &p.input)
             }));
             let outcome = match activation {
                 Ok(Ok(outcome)) => outcome,

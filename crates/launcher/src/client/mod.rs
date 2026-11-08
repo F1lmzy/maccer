@@ -1,8 +1,8 @@
 //! Unix-socket client for the standalone Maccer service.
 use crate::protocol::{
-    AssetData, AssetMetadata, AssetRef, CloseViewParams, FrontendPollParams, FrontendPollResult,
-    GetAssetParams, GetDetailsParams, HelloParams, HelloResult, InvokeActionParams, ItemDetails,
-    MAX_ASSET_BYTES, MAX_ICON_EDGE, OpenViewParams, OperationResult, PROTOCOL_MAJOR,
+    AssetData, AssetLimits, AssetMetadata, AssetRef, CloseViewParams, FrontendPollParams,
+    FrontendPollResult, GetAssetParams, GetDetailsParams, HelloParams, HelloResult,
+    InvokeActionParams, ItemDetails, OpenViewParams, OperationResult, PROTOCOL_MAJOR,
     PROTOCOL_MINOR, ProviderDescriptor, QueryViewParams, Route, RpcError, RpcRequest, RpcResponse,
     ThemeState, ViewSnapshot, framing,
 };
@@ -178,19 +178,29 @@ impl Client {
         Ok(details)
     }
 
-    /// Fetches one negotiated, bounded BGRA8 asset. Any malformed response poisons the
-    /// single-flight stream, so the connection is closed before returning an error.
+    /// Fetches one negotiated, bounded BGRA8 asset in the representation the
+    /// reference advertises. Any malformed response poisons the single-flight
+    /// stream, so the connection is closed before returning an error.
     pub fn get_asset(&mut self, asset: &AssetRef) -> Result<AssetData> {
+        let (representation, limits) = asset
+            .representations
+            .iter()
+            .find_map(|name| {
+                AssetLimits::for_representation(name).map(|limits| (name.clone(), limits))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("asset does not advertise a supported representation")
+            })?;
         if !self
             .hello
             .capabilities
             .iter()
-            .any(|c| c == "iconAssetsBgra8")
+            .any(|c| c == limits.capability())
         {
-            bail!("service did not negotiate iconAssetsBgra8");
-        }
-        if !asset.representations.iter().any(|r| r == "bgra8") {
-            bail!("asset does not advertise bgra8");
+            bail!(
+                "service did not negotiate the {} capability",
+                limits.capability()
+            );
         }
         let id = next_id();
         let request = RpcRequest::new(
@@ -199,7 +209,7 @@ impl Client {
             serde_json::to_value(GetAssetParams {
                 asset_id: asset.id.clone(),
                 revision: asset.revision.clone(),
-                representation: "bgra8".into(),
+                representation: representation.clone(),
             })?,
         );
         if let Err(error) = send(&mut self.stream, &request) {
@@ -219,8 +229,8 @@ impl Client {
         let result = (|| -> Result<AssetData> {
             let metadata: AssetMetadata =
                 serde_json::from_value(response.result.expect("validated response has result"))?;
-            validate_metadata(&metadata, asset)?;
-            let bytes = framing::read_bounded_frame(&mut self.stream, MAX_ASSET_BYTES)?;
+            validate_metadata(&metadata, asset, &representation, limits)?;
+            let bytes = framing::read_bounded_frame(&mut self.stream, limits.max_bytes)?;
             if bytes.len() != metadata.byte_length {
                 bail!("asset frame length does not match metadata");
             }
@@ -233,16 +243,21 @@ impl Client {
     }
 }
 
-fn validate_metadata(metadata: &AssetMetadata, asset: &AssetRef) -> Result<()> {
+fn validate_metadata(
+    metadata: &AssetMetadata,
+    asset: &AssetRef,
+    representation: &str,
+    limits: AssetLimits,
+) -> Result<()> {
     if metadata.asset_id != asset.id
         || metadata.revision != asset.revision
-        || metadata.representation != "bgra8"
+        || metadata.representation != representation
         || metadata.alpha_mode != "straight"
         || metadata.row_order != "topToBottom"
         || metadata.width == 0
         || metadata.height == 0
-        || metadata.width > MAX_ICON_EDGE
-        || metadata.height > MAX_ICON_EDGE
+        || metadata.width > limits.max_edge
+        || metadata.height > limits.max_edge
     {
         bail!("invalid asset metadata identity or format");
     }
@@ -253,7 +268,7 @@ fn validate_metadata(metadata: &AssetMetadata, asset: &AssetRef) -> Result<()> {
     let length = (stride as usize)
         .checked_mul(metadata.height as usize)
         .ok_or_else(|| anyhow::anyhow!("invalid asset size"))?;
-    if metadata.stride != stride || metadata.byte_length != length || length > MAX_ASSET_BYTES {
+    if metadata.stride != stride || metadata.byte_length != length || length > limits.max_bytes {
         bail!("invalid asset metadata dimensions or length");
     }
     Ok(())
@@ -812,6 +827,7 @@ mod tests {
             action_ref: "ref-1".into(),
             operation_id: "op-1".into(),
             confirmed: true,
+            input: Default::default(),
         };
         client.invoke(&params).unwrap();
         assert!(

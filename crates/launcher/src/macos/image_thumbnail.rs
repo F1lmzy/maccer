@@ -373,6 +373,17 @@ pub(crate) fn thumbnail_pixels(
     path: &Path,
     token: &CancellationToken,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    thumbnail_pixels_sized(path, PREVIEW_MAX_PIXEL_SIZE as u32, token)
+}
+
+/// The same decode with an explicit long-edge budget. A caller that transfers
+/// the pixels over the protocol must stay inside its own frame limit.
+pub(crate) fn thumbnail_pixels_sized(
+    path: &Path,
+    max_edge: u32,
+    token: &CancellationToken,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let max_edge = max_edge.min(PREVIEW_MAX_PIXEL_SIZE as u32) as i64;
     let slot = StageTimer::start(PIPELINE_RAW_PIXELS, "decode_slot_wait");
     let _permit = DECODERS.acquire(token)?;
     slot.finish();
@@ -440,7 +451,7 @@ pub(crate) fn thumbnail_pixels(
             ),
             (
                 key(kCGImageSourceThumbnailMaxPixelSize),
-                CFNumber::from(PREVIEW_MAX_PIXEL_SIZE).as_CFType(),
+                CFNumber::from(max_edge).as_CFType(),
             ),
         ]);
         let image_ref =
@@ -457,7 +468,9 @@ pub(crate) fn thumbnail_pixels(
         let mut draw = StageTimer::start(PIPELINE_RAW_PIXELS, "bgra_draw");
         let width = CGImageGetWidth(image.as_CFTypeRef());
         let height = CGImageGetHeight(image.as_CFTypeRef());
-        ensure!(width > 0 && height > 0 && width <= 800 && height <= 800);
+        ensure!(
+            width > 0 && height > 0 && width <= max_edge as usize && height <= max_edge as usize
+        );
         let row_bytes = width.checked_mul(4).context("image row is too wide")?;
         let byte_len = row_bytes
             .checked_mul(height)

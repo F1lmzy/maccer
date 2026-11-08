@@ -30,6 +30,9 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const EVENT_CAPACITY: usize = 256;
 const ICON_CAPACITY: usize = 512;
+/// Wallpaper previews are ~590 KiB each, so the preview cache is sized by
+/// memory rather than by count: twelve of them is about 7 MiB.
+const PREVIEW_CAPACITY: usize = 12;
 const ICON_WORKERS: usize = 4;
 
 pub mod connection;
@@ -46,26 +49,63 @@ pub struct MaccerIconPixels {
 }
 
 #[derive(Clone)]
-struct PixelIcon {
-    bgra: Vec<u8>,
-    width: u32,
-    height: u32,
+pub(crate) struct PixelIcon {
+    pub(crate) bgra: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// The two asset size classes one connection keeps. Icons and wallpaper
+/// previews never share a budget or a token namespace.
+#[derive(Clone)]
+pub(crate) struct AssetCaches {
+    pub(crate) icons: Arc<AssetCache>,
+    pub(crate) previews: Arc<AssetCache>,
+}
+impl AssetCaches {
+    pub(crate) fn new() -> Self {
+        Self {
+            icons: Arc::new(AssetCache::icons()),
+            previews: Arc::new(AssetCache::previews()),
+        }
+    }
 }
 
 #[derive(Default)]
-struct IconCacheState {
+struct AssetCacheState {
     next_token: u64,
     by_key: HashMap<String, (String, PixelIcon)>,
     by_token: HashMap<String, PixelIcon>,
     insertion_order: VecDeque<String>,
 }
 
-#[derive(Default)]
-struct IconCache(Mutex<IconCacheState>);
+/// Bounded BGRA cache for one asset size class. Icons and wallpaper previews
+/// use separate instances so a strip of large images can never evict app icons.
+pub(crate) struct AssetCache {
+    max_edge: u32,
+    capacity: usize,
+    state: Mutex<AssetCacheState>,
+}
 
-impl IconCache {
-    fn token(&self, key: &str) -> Option<String> {
-        self.0
+impl AssetCache {
+    pub(crate) fn icons() -> Self {
+        Self::new(crate::protocol::MAX_ICON_EDGE, ICON_CAPACITY)
+    }
+
+    pub(crate) fn previews() -> Self {
+        Self::new(crate::protocol::MAX_PREVIEW_EDGE, PREVIEW_CAPACITY)
+    }
+
+    fn new(max_edge: u32, capacity: usize) -> Self {
+        Self {
+            max_edge,
+            capacity,
+            state: Mutex::new(AssetCacheState::default()),
+        }
+    }
+
+    pub(crate) fn token(&self, key: &str) -> Option<String> {
+        self.state
             .lock()
             .ok()?
             .by_key
@@ -73,20 +113,20 @@ impl IconCache {
             .map(|(token, _)| token.clone())
     }
 
-    fn insert(&self, key: String, pixels: PixelIcon) -> Option<String> {
+    pub(crate) fn insert(&self, key: String, pixels: PixelIcon) -> Option<String> {
         if pixels.width == 0
             || pixels.height == 0
-            || pixels.width > 64
-            || pixels.height > 64
+            || pixels.width > self.max_edge
+            || pixels.height > self.max_edge
             || pixels.bgra.len() != pixels.width as usize * pixels.height as usize * 4
         {
             return None;
         }
-        let mut state = self.0.lock().ok()?;
+        let mut state = self.state.lock().ok()?;
         if let Some((token, _)) = state.by_key.get(&key) {
             return Some(token.clone());
         }
-        while state.by_key.len() >= ICON_CAPACITY {
+        while state.by_key.len() >= self.capacity {
             let old_key = state.insertion_order.pop_front()?;
             if let Some((old_token, _)) = state.by_key.remove(&old_key) {
                 state.by_token.remove(&old_token);
@@ -102,8 +142,8 @@ impl IconCache {
         Some(token)
     }
 
-    fn pixels(&self, token: &str) -> Option<PixelIcon> {
-        self.0.lock().ok()?.by_token.get(token).cloned()
+    pub(crate) fn pixels(&self, token: &str) -> Option<PixelIcon> {
+        self.state.lock().ok()?.by_token.get(token).cloned()
     }
 }
 
@@ -146,7 +186,7 @@ fn send_current_icon_event(
 }
 
 fn prepare_icon_request(
-    cache: &IconCache,
+    cache: &AssetCache,
     pending: &Mutex<HashSet<(u64, String)>>,
     request: u64,
     provider: &str,
@@ -191,6 +231,10 @@ enum Command {
         action: String,
         #[serde(default)]
         confirmed: bool,
+        /// Values collected for the action's published input field, keyed by
+        /// that field's id. Absent for an ordinary action.
+        #[serde(default)]
+        input: std::collections::BTreeMap<String, String>,
     },
     Cancel,
     Home {
@@ -226,7 +270,7 @@ struct AgentContext {
     clipboard: Option<Arc<crate::providers::clipboard::ClipboardProvider>>,
     latest_request: Arc<AtomicU64>,
     icon_sender: async_channel::Sender<IconRequest>,
-    icon_cache: Arc<IconCache>,
+    icon_cache: Arc<AssetCache>,
     icon_pending: Arc<Mutex<HashSet<(u64, String)>>>,
 }
 
@@ -241,7 +285,7 @@ pub struct MaccerAgent {
     latest_request: Arc<AtomicU64>,
     result_request: Arc<AtomicU64>,
     destroyed: Arc<std::sync::atomic::AtomicBool>,
-    icon_cache: Arc<IconCache>,
+    icon_cache: Arc<AssetCache>,
     icon_sender: async_channel::Sender<IconRequest>,
     clipboard_change_count: Option<i64>,
     last_clipboard_poll: std::time::Instant,
@@ -888,7 +932,7 @@ fn make_agent(
     let destroyed_for_thread = destroyed.clone();
     let ready_shortcut_error = shortcut_error.clone();
     let (icon_sender, icon_receiver) = async_channel::bounded::<IconRequest>(ICON_CAPACITY);
-    let icon_cache = Arc::new(IconCache::default());
+    let icon_cache = Arc::new(AssetCache::icons());
     let icon_pending = Arc::new(Mutex::new(HashSet::<(u64, String)>::new()));
     let icon_cache_for_context = icon_cache.clone();
     let icon_sender_for_agent = icon_sender.clone();
@@ -1160,9 +1204,8 @@ pub unsafe extern "C" fn maccer_agent_connect(socket_path: *const c_char) -> *mu
         }
 
         let (events, receiver) = mpsc::sync_channel(EVENT_CAPACITY);
-        let icon_cache = Arc::new(IconCache::default());
-        let ipc =
-            service_client::IpcHandle::start(&path, events.clone(), icon_cache.clone()).ok()?;
+        let caches = AssetCaches::new();
+        let ipc = service_client::IpcHandle::start(&path, events.clone(), caches.clone()).ok()?;
         let (icon_sender, _icon_receiver) = async_channel::bounded::<IconRequest>(1);
         Some(Box::into_raw(Box::new(MaccerAgent {
             receiver,
@@ -1175,7 +1218,7 @@ pub unsafe extern "C" fn maccer_agent_connect(socket_path: *const c_char) -> *mu
             latest_request: Arc::new(AtomicU64::new(0)),
             result_request: Arc::new(AtomicU64::new(0)),
             destroyed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            icon_cache,
+            icon_cache: caches.icons,
             icon_sender,
             clipboard_change_count: None,
             last_clipboard_poll: std::time::Instant::now(),
@@ -1275,6 +1318,7 @@ pub unsafe extern "C" fn maccer_agent_send(
                     id,
                     action,
                     confirmed,
+                    input,
                 } => service_client::IpcCommand::Activate {
                     request,
                     search_request,
@@ -1282,6 +1326,7 @@ pub unsafe extern "C" fn maccer_agent_send(
                     id,
                     action,
                     confirmed,
+                    input,
                 },
                 Command::Cancel => service_client::IpcCommand::Cancel,
                 Command::Home { request } => service_client::IpcCommand::Home { request },
@@ -1380,7 +1425,10 @@ pub unsafe extern "C" fn maccer_agent_send(
                 provider,
                 id,
                 action,
+                // Embedded providers publish no input field, so a value here is
+                // only meaningful on the service path.
                 confirmed: _,
+                input: _,
             } => {
                 if request <= agent.latest_request.load(Ordering::Acquire) {
                     return ptr::null_mut();
@@ -1654,7 +1702,7 @@ mod tests {
 
     #[test]
     fn each_request_can_wait_for_an_icon_while_an_older_request_is_resolving() {
-        let cache = Arc::new(IconCache::default());
+        let cache = Arc::new(AssetCache::icons());
         let pending = Mutex::new(HashSet::new());
         let path = std::path::PathBuf::from("/Applications/Safari.app");
         let first = prepare_icon_request(&cache, &pending, 1, "apps", "safari", &path, false);
@@ -1754,7 +1802,7 @@ mod tests {
 
     #[test]
     fn icon_cache_is_bounded_and_never_reuses_tokens() {
-        let cache = IconCache::default();
+        let cache = AssetCache::icons();
         let pixels = PixelIcon {
             bgra: vec![1, 2, 3, 4],
             width: 1,
@@ -1767,7 +1815,7 @@ mod tests {
                 .unwrap();
             assert!(tokens.insert(token));
         }
-        let state = cache.0.lock().unwrap();
+        let state = cache.state.lock().unwrap();
         assert_eq!(state.by_key.len(), ICON_CAPACITY);
         assert_eq!(state.by_token.len(), ICON_CAPACITY);
         assert_eq!(tokens.len(), ICON_CAPACITY + 2);

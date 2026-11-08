@@ -9,11 +9,12 @@ Maccer runs one independent background service with either GPUI or Pill/QML as i
 | Applications | Discovery, fuzzy search, Open/Reveal, native icons and metadata previews |
 | Web search | Configured engines, Google by default, encoded URLs and Copy Search URL |
 | Clipboard | RAM-only text capture, scoped search, previews, Copy, Pin/Unpin, Delete and Clear History |
-| Themes | Shared active palette, catalog search, palette previews and explicitly confirmed Apply |
+| Themes | Shared active palette, catalog search with each pack's wallpapers, palette previews, explicitly confirmed Apply, and its own Install/Uninstall options that ask for a repository link or a pack to remove |
+| Wallpapers | `/walls` filmstrip of the active theme's wallpapers with thumbnails, and a one-step Set wallpaper action |
 | Files, calculator, shell | Embedded mode only |
-| Direct Paste, wallpaper changes, plugins | Not available through the service |
+| Direct Paste, plugins | Not available through the service |
 
-Home is a searchable backend view. An empty query lists enabled providers; selecting one enters its scope. Clipboard contents never appear in mixed home search. Both frontends retain displayed results, icons and preview geometry while a replacement query loads, but immediately invalidate old actions, details and staged confirmations.
+Home is a searchable backend view. An empty query lists enabled providers; selecting one enters its scope. Typing a provider's name or id keeps that provider row first. Other provider matches come from descriptions, so they only appear when no search result matched. Clipboard contents never appear in mixed home search. Both frontends retain displayed results, icons and preview geometry while a replacement query loads, but immediately invalidate old actions, details and staged confirmations. Reopening the GPUI launcher paints its last home menu immediately while the backend refreshes it, and always leaves any previous provider scope.
 
 ## Build
 
@@ -32,7 +33,7 @@ cd /path/to/mac-qml-bar
 MACCER_SOURCE=/path/to/maccer ./scripts/build.sh
 ```
 
-Theme integration requires a compatible mac-themer installation providing `catalog --json` and guarded `apply SLUG --expected-palette JSON --json`. It is maintained separately and is not bundled here. `MACTHEMER_BIN` names the directory containing `mac-themer`, not the executable itself. Without that override, helper resolution uses `MACTHEMER_HOME` or the user's home plus `.local/bin`. Set `MACTHEMER_STATE` on the backend to override the published palette directory.
+Theme integration requires a compatible mac-themer installation providing `catalog --json`, guarded `apply SLUG --expected-palette JSON --json`, and for installation `theme-install URL --json` and `theme-uninstall SLUG --json`. It is maintained separately and is not bundled here. `MACTHEMER_BIN` names the directory containing `mac-themer`, not the executable itself. Without that override, helper resolution uses `MACTHEMER_HOME` or the user's home plus `.local/bin`. Set `MACTHEMER_STATE` on the backend to override the published palette directory.
 
 ## Select a frontend and start the backend
 
@@ -104,9 +105,25 @@ Direct Paste is deliberately absent until previous-application handoff is verifi
 
 The backend watches mac-themer's published state, validates bounded palettes and retains last-good colors on invalid replacements. Catalog reads have a three-second deadline, two-MiB output cap and 128-theme limit. Selection previews do not change active colors.
 
-Apply requires an explicit snapshot-bound confirmation in either frontend and service-enforced consent. Accepted operations run once independently of query changes or frontend disconnect. A shared executor permits one Apply at a time, with a 30-second helper deadline and 64 KiB output cap. The expected palette and catalog revision are revalidated. Wallpaper remains unchanged, and helper errors warn about possible partial effects.
+The catalog also publishes each pack's wallpapers as path-free identities. They are validated, take part in the catalog revision, and travel with the theme row, so a frontend can show what Apply will set without reading the pack.
+
+Apply requires an explicit snapshot-bound confirmation in either frontend and service-enforced consent. Accepted operations run once independently of query changes or frontend disconnect. A shared executor permits one Apply at a time, with a 30-second helper deadline and 64 KiB output cap. The expected palette, the wallpaper identity and the catalog revision are revalidated. Apply names the theme's first wallpaper, and the result reports whether the desktop picture changed; wallpaper failure is reported separately from a partial theme apply, and helper errors warn about possible partial effects.
+
+The Themes scope publishes two commands of its own: "Install a theme from GitHub…" and "Uninstall a theme…". They belong to the page, not to a row, so they never take a frame in the strip: ⌘K in the Themes scope lists them under the selected palette's own Apply, and with nothing installed — an empty collection has no cards at all — that panel is where Install still lives. Choosing one opens a dialog the *provider* describes: a text field for the repository link, or a list of the installed packs to remove. Removing carries a confirmation prompt, and the chosen pack is only sent after that consent. The GPUI frontend implements a text field and a choice list and nothing else — the field id, its label, its placeholder, its choices and the submit button all come from the provider, so a new option needs no frontend change. A failed option is reported on a status line above the strip, because a strip has no result list to hang one on. Pill does not draw the field yet: its rows carry the same record, but invoking one without a value is refused with a message rather than silently running.
+
+Packs can also be acquired from a repository without going through a row, which is a mutation outside the action table because it needs an input no retained action carries: a URL. `themes.install` takes one whole `https://github.com/<owner>/<repo>` URL, with `all` for a repository that states several themes and `force` to replace a pack mac-themer did not install itself; `themes.uninstall` takes one exact catalog slug. The service revalidates both and refuses any other host, scheme, port, credentials, query or path depth before a helper runs, and mac-themer's clone refuses every transport but https. Installation keeps the repository's `colors.toml` and `backgrounds/` and drops everything else; nothing from a repository is executed. Install has a 120-second deadline, removal 30 seconds, one single-flight lock and a 64 KiB output cap, and the catalog is reloaded before the reply so the new pack is searchable at once. A failed install may have fetched a repository but never publishes a half-made pack; a removal refuses the active pack.
 
 Do not retry an uncertain operation after disconnect or restart. Deduplication is session-local, not durable. Apply is not transactional, concurrent external tools are not locked out, and concurrent theme-pack replacement after validation remains a producer write-boundary risk. The helper can outlive a daemon crash; its timeout requires a living supervisor. Native desktop Apply acceptance remains manual.
+
+## Wallpaper picker
+
+Type `/walls` (or the configured prefix) to browse the wallpapers of the theme the desktop is currently wearing. Switching theme switches the strip; a pack with no wallpapers says so instead of showing an empty row. The backend publishes one result per wallpaper with a lazily decoded `previewBgra8` thumbnail, in catalog order; the frontend draws exactly five frames — the focused one enlarged, two shrinking neighbours on each side, butt-joined so the row reads as one continuous strip.
+
+The strip rotates without end: every frame has two neighbours on each side, and stepping past the last wallpaper wraps to the first and keeps travelling the same way instead of rewinding. Left/right (plain arrows, as well as `alt-left`/`alt-right`, up/down, the wheel, or a click) moves the focus, and Enter sets that wallpaper. The picker is scoped to the active theme because a wallpaper outside it would contradict the palette in effect. Setting a picture is one deliberate step — the user picked the tile — so it carries no confirmation prompt, unlike theme Apply which rewrites files and reloads applications. It runs `mac-themer wallpaper SLUG --id ID --json` under the same single-flight lock and reports a failed picture separately from a rejected identity.
+
+The backend resolves a wallpaper's private path the way mac-themer's own `paths.py` does: `MACTHEMER_THEMES`, then `MACTHEMER_REPO` plus `/themes`, then the checkout the installed `mac-themer` symlink points into. Every component of a published identity is revalidated and the resolved file must stay inside that pack's `backgrounds` directory. Paths never reach a frontend; only opaque asset references do. If the pack directory cannot be found the picker still lists wallpapers, with a status line instead of thumbnails.
+
+Thumbnails are decoded once per file revision and cached on both sides. The first browse of a fresh catalog pays that decode cost on the session that requests them, so a very large collection can feel slow until the cache is warm. Video and animated wallpapers are not supported; only the still image is shown.
 
 ## Verification and remaining limits
 

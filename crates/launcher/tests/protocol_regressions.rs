@@ -85,7 +85,7 @@ fn asset_metadata_contract_is_bounded_and_params_are_strict() {
     use launcher_agent::protocol::{
         AssetMetadata, GetAssetParams, MAX_ASSET_BYTES, MAX_ICON_EDGE, PROTOCOL_MINOR,
     };
-    assert_eq!(PROTOCOL_MINOR, 5);
+    assert_eq!(PROTOCOL_MINOR, 10);
     assert_eq!(MAX_ASSET_BYTES, 16_384);
     assert_eq!(MAX_ICON_EDGE, 64);
     let params: GetAssetParams = serde_json::from_value(
@@ -175,7 +175,7 @@ fn frontend_poll_contract_is_typed_strict_and_camel_case() {
     use launcher_agent::protocol::{
         FrontendKind, FrontendPollParams, FrontendPollResult, PROTOCOL_MINOR,
     };
-    assert_eq!(PROTOCOL_MINOR, 5);
+    assert_eq!(PROTOCOL_MINOR, 10);
     let params = FrontendPollParams {
         kind: FrontendKind::Gpui,
         ack: Some("show-1".into()),
@@ -222,7 +222,7 @@ fn frontend_poll_contract_is_typed_strict_and_camel_case() {
 #[test]
 fn confirmation_transport_is_additive_and_defaults_to_unconfirmed() {
     use launcher_agent::protocol::{ActionDescriptor, InvokeActionParams, PROTOCOL_MINOR};
-    assert_eq!(PROTOCOL_MINOR, 5);
+    assert_eq!(PROTOCOL_MINOR, 10);
     // Old clients omit `confirmed`, which must decode as an unconfirmed request.
     let params: InvokeActionParams = serde_json::from_value(serde_json::json!({
         "viewId":"view-1", "revision":"2", "actionRef":"ref-1", "operationId":"op-1"
@@ -257,6 +257,7 @@ fn confirmation_transport_is_additive_and_defaults_to_unconfirmed() {
         is_primary: true,
         kind: "invoke".into(),
         confirmation: None,
+        input: None,
     };
     assert!(
         serde_json::to_value(&plain)

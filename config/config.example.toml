@@ -88,13 +88,23 @@ max_results = 50
 max_entries = 200
 
 # Shared-service only. Browsing/preview never applies a theme. Live Apply
-# requires explicit confirmation and leaves wallpaper unchanged. Disable this
-# provider to avoid starting either catalog or mutation helpers.
+# requires explicit confirmation and also sets the theme's first wallpaper;
+# disable this provider to avoid starting either catalog or mutation helpers.
 [providers.themes]
 enabled = true
 prefix = "/themes"
 priority = 50
 default_search = true
+max_results = 50
+
+# Shared-service only. A browsable wallpaper picker: `/walls` opens a filmstrip
+# of the active theme's wallpapers, and Enter sets one without changing the
+# theme. Never part of mixed search.
+[providers.wallpapers]
+enabled = true
+prefix = "/walls"
+priority = 40
+default_search = false
 max_results = 50
 
 [providers.web]
@@ -106,6 +116,19 @@ max_results = 2
 
 [web]
 default_engine = "google"
+
+# Web results open in a native panel inside the launcher. Set
+# inline_preview = false to always hand them to the default browser.
+#
+# prewarm starts WebKit as soon as a web result is selected, which removes
+# process start-up from the moment you press Enter. It costs its resident
+# memory only while such a result is selected.
+#
+# idle_release_seconds is how long a hidden page is kept for an instant
+# re-open before its document is released. 0 keeps it until maccer exits.
+inline_preview = true
+prewarm = true
+idle_release_seconds = 300
 
 # Omit the [[web.engines]] tables to keep the built-in Google and DuckDuckGo
 # engines. Defining any engine replaces the whole built-in list, and

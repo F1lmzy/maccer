@@ -1,4 +1,4 @@
-use crate::agent::{IconCache, PixelIcon, event_error};
+use crate::agent::{PixelIcon, event_error};
 use crate::client::Client;
 use crate::protocol::{
     AssetRef, ContentBlock, GetDetailsParams, Icon, InvokeActionParams, Presentation, Route,
@@ -20,6 +20,9 @@ use std::{
 const COMMAND_CAPACITY: usize = 16;
 const RESULT_LIMIT: usize = 100;
 const MAX_ICONS_PER_VIEW: usize = 8;
+/// A wallpaper strip can show a dozen tiles, and each preview is fetched once
+/// per revision, so this cap is deliberately larger than the icon one.
+const MAX_PREVIEWS_PER_VIEW: usize = 24;
 /// Read-only active theme state is polled at most this often. Bounded so a
 /// steady stream of searches cannot starve state, and cheap because the
 /// service answers from an in-memory snapshot.
@@ -30,6 +33,12 @@ pub(crate) enum IpcCommand {
         request: u64,
         query: String,
     },
+    /// Open a fresh home view even if the actor currently holds a provider
+    /// view. This is a search, not a bare navigation outcome, so the frontend
+    /// gets the home snapshot directly instead of issuing a second request.
+    HomeSearch {
+        request: u64,
+    },
     Activate {
         request: u64,
         search_request: u64,
@@ -37,6 +46,8 @@ pub(crate) enum IpcCommand {
         id: String,
         action: String,
         confirmed: bool,
+        /// Values the frontend collected for the action's published input.
+        input: std::collections::BTreeMap<String, String>,
     },
     Cancel,
     Home {
@@ -64,7 +75,7 @@ impl IpcHandle {
     pub(crate) fn start(
         path: &Path,
         events: SyncSender<Value>,
-        icon_cache: Arc<IconCache>,
+        caches: crate::agent::AssetCaches,
     ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let latest_request = Arc::new(AtomicU64::new(0));
@@ -81,7 +92,7 @@ impl IpcHandle {
                     path,
                     receiver,
                     events,
-                    icon_cache,
+                    caches,
                     worker_latest,
                     worker_details,
                     worker_destroyed,
@@ -106,6 +117,7 @@ impl IpcHandle {
         }
         match &command {
             IpcCommand::Search { request, .. }
+            | IpcCommand::HomeSearch { request }
             | IpcCommand::Activate { request, .. }
             | IpcCommand::Refresh { request, .. } => {
                 let previous = self.latest_request.load(Ordering::Acquire);
@@ -146,11 +158,15 @@ impl IpcHandle {
     }
 }
 
+/// One asset a delivered snapshot advertised, queued for the actor to fetch.
 struct PendingIcon {
     request: u64,
     provider: String,
     id: String,
     asset: AssetRef,
+    /// Wallpaper thumbnails are delivered under their own source prefix and
+    /// live in the preview cache, never in the 64px icon cache.
+    preview: bool,
 }
 
 /// Active theme state publication. State is independent of the search/action
@@ -210,7 +226,7 @@ fn run(
     path: std::path::PathBuf,
     receiver: mpsc::Receiver<IpcCommand>,
     events: SyncSender<Value>,
-    cache: Arc<IconCache>,
+    caches: crate::agent::AssetCaches,
     latest: Arc<AtomicU64>,
     latest_details: Arc<AtomicU64>,
     destroyed: Arc<AtomicBool>,
@@ -223,6 +239,7 @@ fn run(
             while !destroyed.load(Ordering::Acquire) {
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(IpcCommand::Search { request, .. })
+                    | Ok(IpcCommand::HomeSearch { request })
                     | Ok(IpcCommand::Activate { request, .. })
                     | Ok(IpcCommand::Refresh { request, .. }) => {
                         event_if_current(&events, &destroyed, &latest, request, message.clone())
@@ -307,6 +324,21 @@ fn run(
                 if destroyed.load(Ordering::Acquire) {
                     break;
                 }
+                let selected = match selected {
+                    IpcCommand::HomeSearch { request } => {
+                        // Drop any provider route/view before the shared search
+                        // path opens the home view. Reusing the previous view
+                        // would re-query a provider with an empty query.
+                        route = Route::Home;
+                        view = None;
+                        snapshot_request = None;
+                        IpcCommand::Search {
+                            request,
+                            query: String::new(),
+                        }
+                    }
+                    selected => selected,
+                };
                 match selected {
                     IpcCommand::Search { request, query } => {
                         recovery_attempted = false;
@@ -336,7 +368,7 @@ fn run(
                                         format!("{}: {}", error.provider_id, error.message)
                                     })
                                     .collect();
-                                let event = json!({"type":"results","request":request,"items":rows,"complete":true,"errors":errors,"route":route_json(&route)});
+                                let event = json!({"type":"results","request":request,"layout":snapshot_layout(&snapshot),"items":rows,"complete":true,"errors":errors,"route":route_json(&route),"scopeActions":snapshot.scope_actions});
                                 if send_current_event(&events, &destroyed, &latest, request, event)
                                 {
                                     // Only authorize activation from a snapshot that
@@ -432,7 +464,7 @@ fn run(
                                             "{}:{}",
                                             image.metadata.asset_id, image.metadata.revision
                                         );
-                                        if let Some(token) = cache.insert(
+                                        if let Some(token) = caches.icons.insert(
                                             key,
                                             PixelIcon {
                                                 bgra: image.bytes,
@@ -534,7 +566,7 @@ fn run(
                                         format!("{}: {}", error.provider_id, error.message)
                                     })
                                     .collect();
-                                let event = json!({"type":"results","request":request,"items":rows,"complete":true,"errors":errors,"route":route_json(&snapshot.route),"recovery":true});
+                                let event = json!({"type":"results","request":request,"layout":snapshot_layout(&snapshot),"items":rows,"complete":true,"errors":errors,"route":route_json(&snapshot.route),"recovery":true,"scopeActions":snapshot.scope_actions});
                                 if send_current_event(&events, &destroyed, &latest, request, event)
                                 {
                                     recovery_attempted = true;
@@ -552,6 +584,9 @@ fn run(
                                 format!("{error:#}"),
                             ),
                         }
+                    }
+                    IpcCommand::HomeSearch { .. } => {
+                        unreachable!("home search is normalized above")
                     }
                     IpcCommand::Home { request } => {
                         route = Route::Home;
@@ -577,6 +612,7 @@ fn run(
                         id,
                         action,
                         confirmed,
+                        input,
                     } => {
                         // An accepted activation is a pending mutation. Newer input
                         // suppresses its UI outcome, not the already-selected action.
@@ -618,8 +654,25 @@ fn run(
                             );
                             continue;
                         };
-                        let Some(descriptor) = item.actions.iter().find(|entry| entry.id == action)
-                        else {
+                        // A scope command is authorized for the whole view rather
+                        // than for a row, so it carries its own reference.
+                        let action_ref = item
+                            .actions
+                            .iter()
+                            .find(|entry| entry.id == action)
+                            .map(|descriptor| descriptor.action_ref.clone())
+                            .or_else(|| {
+                                snapshot
+                                    .scope_actions
+                                    .iter()
+                                    .find(|entry| {
+                                        entry.provider_id == provider
+                                            && entry.id == id
+                                            && entry.action_id == action
+                                    })
+                                    .map(|entry| entry.action_ref.clone())
+                            });
+                        let Some(action_ref) = action_ref else {
                             event_if_current(
                                 &events,
                                 &destroyed,
@@ -629,18 +682,19 @@ fn run(
                             );
                             continue;
                         };
-                        let focus_transferred = provider == "apps"
-                            && matches!(descriptor.id.as_str(), "open" | "reveal");
+                        let focus_transferred =
+                            provider == "apps" && matches!(action.as_str(), "open" | "reveal");
                         let params = InvokeActionParams {
                             view_id: snapshot.view_id.clone(),
                             revision: snapshot.revision.clone(),
-                            action_ref: descriptor.action_ref.clone(),
+                            action_ref,
                             operation_id: format!(
                                 "agent-{}-{}",
                                 client.hello().session_id,
                                 request
                             ),
                             confirmed,
+                            input,
                         };
                         // Once sent, never retry this mutation. Disconnect/error can mean
                         // the service performed it but the response was lost.
@@ -747,6 +801,11 @@ fn run(
                     {
                         let key =
                             format!("{}:{}", asset.metadata.asset_id, asset.metadata.revision);
+                        let cache = if icon.preview {
+                            &caches.previews
+                        } else {
+                            &caches.icons
+                        };
                         let token = cache.insert(
                             key,
                             PixelIcon {
@@ -756,7 +815,12 @@ fn run(
                             },
                         );
                         if let Some(token) = token {
-                            let _ = events.try_send(json!({"type":"icon","request":icon.request,"provider":icon.provider,"id":icon.id,"source":format!("image://maccer-icons/{token}")}));
+                            let (kind, prefix) = if icon.preview {
+                                ("preview", "maccer-previews")
+                            } else {
+                                ("icon", "maccer-icons")
+                            };
+                            let _ = events.try_send(json!({"type":kind,"request":icon.request,"provider":icon.provider,"id":icon.id,"source":format!("image://{prefix}/{token}")}));
                         }
                     }
                     Err(error) => {
@@ -783,13 +847,24 @@ fn run(
     }
 }
 
+/// The shape a frontend should use for the delivered snapshot. Providers own
+/// this hint; anything unrecognised falls back to the ordinary list.
+fn snapshot_layout(snapshot: &ViewSnapshot) -> &str {
+    snapshot
+        .sections
+        .iter()
+        .find_map(|section| section.layout_hint.as_deref())
+        .filter(|hint| *hint == "filmstrip")
+        .unwrap_or("list")
+}
+
 fn project(
     snapshot: &ViewSnapshot,
     request: u64,
     fetch_icons: bool,
 ) -> (Vec<Value>, Vec<PendingIcon>) {
     let mut rows = Vec::new();
-    let mut icons = Vec::new();
+    let mut icons: Vec<PendingIcon> = Vec::new();
     for item in snapshot.sections.iter().flat_map(|section| &section.items) {
         let (icon_source, icon_text) = match &item.icon {
             Some(Icon::Glyph {
@@ -800,16 +875,28 @@ fn project(
                 asset,
                 fallback_text,
             }) => {
-                if fetch_icons
-                    && icons.len() < MAX_ICONS_PER_VIEW
-                    && asset.representations.iter().any(|r| r == "bgra8")
-                {
-                    icons.push(PendingIcon {
-                        request,
-                        provider: item.provider_id.clone(),
-                        id: item.id.clone(),
-                        asset: asset.clone(),
-                    });
+                if fetch_icons {
+                    let preview = asset
+                        .representations
+                        .iter()
+                        .any(|name| name == crate::protocol::REPRESENTATION_PREVIEW);
+                    let icon = asset
+                        .representations
+                        .iter()
+                        .any(|name| name == crate::protocol::REPRESENTATION_ICON);
+                    let queued = icons.iter().filter(|queued| queued.preview).count();
+                    let icons_queued = icons.len() - queued;
+                    if (preview && queued < MAX_PREVIEWS_PER_VIEW)
+                        || (icon && icons_queued < MAX_ICONS_PER_VIEW)
+                    {
+                        icons.push(PendingIcon {
+                            request,
+                            provider: item.provider_id.clone(),
+                            id: item.id.clone(),
+                            asset: asset.clone(),
+                            preview,
+                        });
+                    }
                 }
                 (String::new(), fallback_text.clone())
             }
@@ -825,6 +912,11 @@ fn project(
                 let mut value = json!({"id":action.id,"title":action.title});
                 if let Some(confirmation) = &action.confirmation {
                     value["confirmation"] = json!(confirmation);
+                }
+                // The field spec travels with the action so the frontend can
+                // draw the provider's dialog without knowing the provider.
+                if let Some(input) = &action.input {
+                    value["input"] = serde_json::to_value(input).unwrap_or(Value::Null);
                 }
                 value
             })

@@ -22,6 +22,11 @@ struct Running {
 }
 impl Running {
     fn start(body: &str) -> Self {
+        Self::start_with(body, &[])
+    }
+    /// `wallpapers` are published for the target pack, so the helper then
+    /// insists that the service named the first of them on the command line.
+    fn start_with(body: &str, wallpapers: &[&str]) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("mc-apply-")
             .tempdir_in("/tmp")
@@ -40,14 +45,28 @@ impl Running {
         palette.slug = "owned-target".into();
         palette.name = "Owned Target".into();
         palette.palette.insert("accent".into(), "#123456".into());
+        let catalog = match wallpapers.split_first() {
+            None => ThemeCatalog::from_palettes(vec![palette]).unwrap(),
+            Some(_) => ThemeCatalog::from_catalog(
+                vec![palette],
+                [(
+                    "owned-target".to_owned(),
+                    wallpapers.iter().map(|id| (*id).to_owned()).collect(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+        };
         let helper = dir.path().join("helper");
         let script = format!(
-            "#!/bin/sh\n[ \"$#\" = 5 ] && [ \"$1\" = apply ] && [ \"$2\" = owned-target ] && [ \"$3\" = --expected-palette ] && [ \"$5\" = --json ] || exit 9\nprintf 'apply\\n' >> \"${{0%/*}}/calls\"\n{body}\n"
+            "#!/bin/sh\n[ \"$1\" = apply ] && [ \"$2\" = owned-target ] && [ \"$3\" = --expected-palette ] && {}\nprintf 'apply\\n' >> \"${{0%/*}}/calls\"\n{body}\n",
+            argument_guard(wallpapers)
         );
         std::fs::write(&helper, script).unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let provider = Arc::new(ThemeServiceProvider::with_apply(
-            ThemeCatalog::from_palettes(vec![palette]).unwrap(),
+            catalog,
             ThemeApply::new(helper),
         ));
         let service = Service::with_state(
@@ -83,6 +102,16 @@ impl Drop for Running {
         self.worker.take().unwrap().join().unwrap().unwrap();
     }
 }
+/// The shell half of the producer contract: the exact argument list the service
+/// is allowed to build, with and without a wallpaper.
+fn argument_guard(wallpapers: &[&str]) -> String {
+    match wallpapers.split_first() {
+        None => "[ \"$#\" = 5 ] && [ \"$5\" = --json ]".to_owned(),
+        Some((first, _)) => format!(
+            "[ \"$#\" = 7 ] && [ \"$5\" = --background ] && [ \"$6\" = {first} ] && [ \"$7\" = --json ]"
+        ),
+    }
+}
 const SUCCESS: &str =
     "printf '{\"schema\":1,\"status\":\"applied\",\"theme\":\"owned-target\",\"warnings\":[]}'";
 fn open(client: &mut Client) -> ViewSnapshot {
@@ -103,6 +132,7 @@ fn params(view: &ViewSnapshot, op: &str, confirmed: bool) -> InvokeActionParams 
         action_ref: view.sections[0].items[0].actions[0].action_ref.clone(),
         operation_id: op.into(),
         confirmed,
+        input: Default::default(),
     }
 }
 fn code(error: &anyhow::Error) -> &str {
@@ -154,6 +184,55 @@ fn actual_theme_apply_requires_confirmation_executes_once_and_updates_independen
             .is_some_and(|p| p.slug == "owned-target" && p.palette["accent"] == "#123456")
     });
     assert!(!running.dir.path().join("background").exists());
+}
+
+#[test]
+fn a_theme_apply_that_names_a_wallpaper_sets_it_and_reports_it() {
+    let running = Running::start_with(
+        "printf '%s' \"$4\" > \"${0%/*}/state/current.json\"\n\
+         printf '%s' '{\"schema\":1,\"status\":\"applied\",\"theme\":\"owned-target\",\"wallpaper\":\"1-totoro.webp\",\"warnings\":[]}'",
+        &["1-totoro.webp", "2-waves.webp"],
+    );
+    let mut client = running.client();
+    let view = open(&mut client);
+    let item = &view.sections[0].items[0];
+    // The prompt names the wallpaper the apply will set, not just the theme.
+    let prompt = item.actions[0].confirmation.as_ref().unwrap();
+    assert!(
+        prompt.contains("sets the desktop wallpaper to \"Totoro\""),
+        "{prompt}"
+    );
+    assert!(matches!(
+        &item.data,
+        Some(launcher_agent::protocol::DomainData::ThemeSummary { wallpapers, .. })
+            if wallpapers.len() == 2 && wallpapers[1].label == "Waves"
+    ));
+
+    let result = client.invoke(&params(&view, "wallpaper", true)).unwrap();
+    let wire = serde_json::to_string(&result).unwrap();
+    assert!(wire.contains("Wallpaper set to Totoro"), "{wire}");
+    assert_eq!(running.count(), 1);
+}
+
+#[test]
+fn a_wallpaper_failure_is_reported_without_denying_the_theme_change() {
+    let running = Running::start_with(
+        "printf '%s' \"$4\" > \"${0%/*}/state/current.json\"\n\
+         printf '%s' '{\"schema\":1,\"status\":\"applied\",\"theme\":\"owned-target\",\"wallpaper\":null,\"warnings\":[\"wallpaperFailed\"]}'",
+        &["1-totoro.webp"],
+    );
+    let mut client = running.client();
+    let view = open(&mut client);
+    let result = client
+        .invoke(&params(&view, "wallpaper-failed", true))
+        .unwrap();
+    let wire = serde_json::to_string(&result).unwrap();
+    assert!(wire.contains("wallpaper could not be changed"), "{wire}");
+    assert!(
+        !wire.contains("/Users/") && !wire.contains("backgrounds"),
+        "{wire}"
+    );
+    assert_eq!(running.count(), 1);
 }
 
 #[test]

@@ -234,6 +234,125 @@
         }
       ]
     },
+    "scopeAction": {
+      "description": "A provider-published command for the whole scope: an action, not a result. A frontend lists it in its action panel beside the selected row's actions and invokes it with its own actionRef.",
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "actionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "actionRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "confirmation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "input": {
+          "$ref": "#/$defs/actionInput"
+        }
+      },
+      "required": [
+        "providerId",
+        "id",
+        "actionId",
+        "actionRef",
+        "title"
+      ],
+      "additionalProperties": false
+    },
+    "actionInput": {
+      "description": "A provider-published field the frontend must collect before it can invoke an action. The provider owns the wording, the field id and the choices; the frontend only knows a text box from a choice list and returns the value as input on actions.invoke.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "select"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "placeholder": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "submitLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/actionInputOption"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "label",
+        "submitLabel"
+      ],
+      "additionalProperties": false
+    },
+    "actionInputOption": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "additionalProperties": false
+    },
     "action": {
       "type": "object",
       "properties": {
@@ -258,6 +377,9 @@
         "confirmation": {
           "type": "string",
           "minLength": 1
+        },
+        "input": {
+          "$ref": "#/$defs/actionInput"
         }
       },
       "required": [
@@ -349,6 +471,27 @@
             },
             "variant": {
               "type": "string"
+            },
+            "wallpapers": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {"$ref": "#/$defs/themeWallpaper"}
+            },
+            "card": {
+              "type": "object",
+              "properties": {
+                "background": {"type": "string", "maxLength": 9},
+                "foreground": {"type": "string", "maxLength": 9},
+                "accent": {"type": "string", "maxLength": 9},
+                "swatches": {
+                  "type": "array",
+                  "maxItems": 6,
+                  "items": {"type": "string", "maxLength": 9}
+                },
+                "applied": {"type": "boolean"}
+              },
+              "required": ["background", "foreground", "accent", "swatches"],
+              "additionalProperties": false
             }
           },
           "required": [
@@ -380,6 +523,28 @@
             "schemaVersion",
             "themeSlug",
             "wallpaperId"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "webLink"
+            },
+            "schemaVersion": {
+              "const": 1
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "type",
+            "schemaVersion",
+            "url"
           ],
           "additionalProperties": true
         },
@@ -574,6 +739,12 @@
             "$ref": "#/$defs/section"
           }
         },
+        "scopeActions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scopeAction"
+          }
+        },
         "complete": {
           "type": "boolean"
         },
@@ -693,6 +864,18 @@
         },
         "confirmed": {
           "type": "boolean"
+        },
+        "input": {
+          "type": "object",
+          "maxProperties": 4,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
         }
       },
       "required": [
@@ -747,6 +930,12 @@
         },
         {
           "$ref": "#/$defs/requestThemeState"
+        },
+        {
+          "$ref": "#/$defs/requestThemeInstall"
+        },
+        {
+          "$ref": "#/$defs/requestThemeUninstall"
         },
         {
           "$ref": "#/$defs/requestFrontendPoll"
@@ -913,6 +1102,28 @@
         "id": {"type": "string", "minLength": 1, "maxLength": 128},
         "method": {"const": "frontend.poll"},
         "params": {"$ref": "#/$defs/frontendPollParams"}
+      },
+      "required": ["jsonrpc", "id", "method", "params"],
+      "additionalProperties": false
+    },
+    "requestThemeInstall": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {"const": "2.0"},
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "method": {"const": "themes.install"},
+        "params": {"$ref": "#/$defs/themeInstallParams"}
+      },
+      "required": ["jsonrpc", "id", "method", "params"],
+      "additionalProperties": false
+    },
+    "requestThemeUninstall": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {"const": "2.0"},
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "method": {"const": "themes.uninstall"},
+        "params": {"$ref": "#/$defs/themeUninstallParams"}
       },
       "required": ["jsonrpc", "id", "method", "params"],
       "additionalProperties": false
@@ -1224,6 +1435,16 @@
       "required": ["viewId", "revision", "providerId", "itemId", "content"],
       "additionalProperties": false
     },
+    "themeWallpaper": {
+      "description": "One wallpaper a pack ships, published as an identity a frontend can show and send back. Never a path.",
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "label": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["id", "label"],
+      "additionalProperties": false
+    },
     "themePalette": {
       "type": "object",
       "properties": {
@@ -1254,6 +1475,62 @@
         }
       },
       "required": ["schema", "slug", "name", "variant", "alpha_byte", "palette", "tokens", "border", "bar"],
+      "additionalProperties": true
+    },
+    "themeInstallParams": {
+      "description": "Install one theme pack from a Git repository. url is a whole repository URL, never a path, a branch or a command: the producer revalidates it and refuses every transport but https. all installs every theme a collection repository states; force replaces a pack the producer did not install itself.",
+      "type": "object",
+      "properties": {
+        "url": {"type": "string", "minLength": 1, "maxLength": 512},
+        "all": {"type": "boolean"},
+        "force": {"type": "boolean"}
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "themeUninstallParams": {
+      "description": "Remove one installed pack by the exact slug a catalog entry published.",
+      "type": "object",
+      "properties": {
+        "slug": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$"}
+      },
+      "required": ["slug"],
+      "additionalProperties": false
+    },
+    "themePackSummary": {
+      "type": "object",
+      "properties": {
+        "slug": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "wallpapers": {"type": "integer", "minimum": 0},
+        "replaced": {"type": "boolean"}
+      },
+      "required": ["slug", "name", "wallpapers"],
+      "additionalProperties": true
+    },
+    "themeInstallResult": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "status": {"const": "installed"},
+        "packs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/themePackSummary"}
+        }
+      },
+      "required": ["schemaVersion", "status", "packs"],
+      "additionalProperties": true
+    },
+    "themeUninstallResult": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "status": {"const": "removed"},
+        "slug": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$"}
+      },
+      "required": ["schemaVersion", "status", "slug"],
       "additionalProperties": true
     },
     "themeStateError": {

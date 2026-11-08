@@ -63,6 +63,7 @@ fn main() {
             launcher_agent::ui::LauncherOptions {
                 width: 680.,
                 max_results: 8,
+                ..Default::default()
             },
             cx,
         )

@@ -33,6 +33,7 @@ impl Provider for FixtureProvider {
             return Ok(vec![]);
         }
         let title = match self.id {
+            "apps" if q.text.trim().eq_ignore_ascii_case("weather") => "Weather",
             "apps" => "Safari",
             "calculator" => "2",
             "web" => "Search the web",
@@ -149,6 +150,11 @@ impl ServiceProvider for FixtureProvider {
                     schema_version: 1,
                     slug: "catppuccin".into(),
                     variant: "dark".into(),
+                    wallpapers: ["1-totoro.webp", "2-waves.webp"]
+                        .into_iter()
+                        .filter_map(crate::protocol::ThemeWallpaper::new)
+                        .collect(),
+                    card: None,
                 });
                 content.push(ContentBlock::ColorPalette {
                     colors: vec![

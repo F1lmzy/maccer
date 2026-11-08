@@ -105,6 +105,46 @@ fn home_query_finds_menu_and_mixed_results_but_not_clipboard_contents() {
     assert!(view.to_string().contains("Safari"));
 }
 #[test]
+fn home_prioritises_results_over_weak_provider_matches() {
+    let service = Service::fixture().unwrap();
+    let mut s = initialized(&service);
+    let view = call(
+        &mut s,
+        "2",
+        "views.open",
+        json!({"query":"weather","limit":20}),
+    );
+    let sections = view["sections"].as_array().unwrap();
+    assert_eq!(sections[0]["id"], "results");
+    assert_eq!(sections[0]["items"][0]["title"], "Weather");
+    assert!(
+        sections.iter().all(|section| section["id"] != "providers"),
+        "weak provider rows must not outrank results: {view}"
+    );
+}
+
+#[test]
+fn home_keeps_a_directly_named_provider_first() {
+    let service = Service::fixture().unwrap();
+    let mut s = initialized(&service);
+    let view = call(
+        &mut s,
+        "2",
+        "views.open",
+        json!({"query":"themes","limit":20}),
+    );
+    let sections = view["sections"].as_array().unwrap();
+    assert_eq!(sections[0]["id"], "providers");
+    let ids: Vec<_> = sections[0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["themes"]);
+}
+
+#[test]
 fn sessions_are_isolated_and_stale_actions_are_rejected() {
     let service = Service::fixture().unwrap();
     let mut a = initialized(&service);

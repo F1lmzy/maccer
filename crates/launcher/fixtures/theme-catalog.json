@@ -273,5 +273,33 @@
         "yellow": "#e0af68"
       }
     }
-  ]
+  ],
+  "wallpapers": {
+    "catppuccin": [
+      "1-totoro.webp",
+      "2-waves.webp",
+      "3-blue-eye.webp"
+    ],
+    "gruvbox": [
+      "1-the-backwater.jpg",
+      "2-flower-basket.webp",
+      "3-village-square.jpg",
+      "4-idyllic-procession.jpg",
+      "5-leaves.jpg"
+    ],
+    "osaka-jade": [
+      "1-glowing-city.webp",
+      "2-shaded-entrance.webp",
+      "3-mountain-moon.webp"
+    ],
+    "tokyo-night": [
+      "0-winding-road.webp",
+      "1-quattro.webp",
+      "2-swirl-buck.webp",
+      "3-sunset-lake.webp",
+      "4-omakub.webp",
+      "5-oma-cityscape.jpg",
+      "6-oma.webp"
+    ]
+  }
 }
